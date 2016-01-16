@@ -412,6 +412,8 @@ func runDaemon(args *docopt.Args) {
 
 	resurrect()
 
+	go NewMonitor(host.discMan, externalIP).Run()
+
 	log.Info("blocking main goroutine")
 	<-make(chan struct{})
 }
