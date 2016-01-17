@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,7 +48,6 @@ options:
   --nsumount=PATH        path to flynn-nsumount binary [default: /usr/local/bin/flynn-nsumount]
   --log-dir=DIR          directory to store job logs [default: /var/log/flynn]
   --discovery=TOKEN      join cluster with discovery token
-  --peer-ips=IPLIST      join existing cluster using IPs
   --bridge-name=NAME     network bridge name [default: flynnbr0]
   --no-resurrect         disable cluster resurrection
 	`)
@@ -154,11 +152,6 @@ func runDaemon(args *docopt.Args) {
 	logDir := args.String["--log-dir"]
 	discoveryToken := args.String["--discovery"]
 	bridgeName := args.String["--bridge-name"]
-
-	var peerIPs []string
-	if args.String["--peer-ips"] != "" {
-		peerIPs = strings.Split(args.String["--peer-ips"], ",")
-	}
 
 	if hostID == "" {
 		hostID = strings.Replace(hostname, "-", "", -1)
@@ -375,12 +368,6 @@ func runDaemon(args *docopt.Args) {
 		}
 		stopJobs()
 	})
-	shutdown.BeforeExit(func() {
-		log.Info("marking jobs for resurrection")
-		if err := state.MarkForResurrection(); err != nil {
-			log.Error("error marking jobs for resurrection", "err", err)
-		}
-	})
 
 	// configure network and discoverd if config set in host status
 	if config := host.status.Network; config != nil {
@@ -423,33 +410,7 @@ func runDaemon(args *docopt.Args) {
 		}
 	}
 
-	if discoveryToken != "" {
-		log.Info("getting cluster peer IPs")
-		instances, err := discovery.GetCluster(discoveryToken)
-		if err != nil {
-			// TODO(titanous): retry?
-			log.Error("error getting discovery cluster", "err", err)
-			shutdown.Fatal(err)
-		}
-		peerIPs = make([]string, 0, len(instances))
-		for _, inst := range instances {
-			u, err := url.Parse(inst.URL)
-			if err != nil {
-				continue
-			}
-			ip, _, err := net.SplitHostPort(u.Host)
-			if err != nil || ip == externalIP {
-				continue
-			}
-			peerIPs = append(peerIPs, ip)
-		}
-		log.Info("got cluster peer IPs", "peers", peerIPs)
-	}
-	log.Info("connecting to cluster peers")
-	if err := discoverdManager.ConnectPeer(peerIPs); err != nil && !args.Bool["--no-resurrect"] {
-		log.Info("no cluster peers available, resurrecting jobs")
-		resurrect()
-	}
+	resurrect()
 
 	log.Info("blocking main goroutine")
 	<-make(chan struct{})
