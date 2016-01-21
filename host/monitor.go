@@ -25,6 +25,7 @@ type Monitor struct {
 	c          *cluster.Client
 	l          log15.Logger
 	hostCount  int
+	deadline   time.Time
 }
 
 func NewMonitor(dm *DiscoverdManager, addr string) *Monitor {
@@ -106,7 +107,9 @@ func (m *Monitor) Run() {
 			continue
 		default:
 		}
+		// TODO(jpg): Use ticker here
 		if m.isLeader {
+			var faulted bool
 			m.l.Info("we are the leader")
 			hosts, err := m.c.Hosts()
 			if err != nil || len(hosts) < m.hostCount {
@@ -115,61 +118,69 @@ func (m *Monitor) Run() {
 				continue
 			}
 			m.l.Info("required hosts online, proceding to check cluster")
-			f := fixer.NewClusterFixer(hosts, m.c, m.l)
-			if err := f.FixFlannel(); err != nil {
-				m.l.Error("error fixing flannel, retrying")
-				time.Sleep(10 * time.Second)
-				continue
-			}
 
 			m.l.Info("checking the controller api")
 			controllerService := discoverd.NewService("controller")
 			controllerInstances, _ := controllerService.Instances()
 			if len(controllerInstances) > 0 {
 				m.l.Info("found running controller api instances", "n", len(controllerInstances))
-				if err := f.FixController(controllerInstances, false); err != nil {
-					// TODO: give this a deadline, after a certain point of waiting we will kill the schedulers and fix everything ourselves
-					m.l.Error("error fixing controller, will retry until deadline is reached then attempt hard repair", "err", err)
-					// XXX: goes straight to hard repair, we should retry until deadline instead
-					if err := f.KillSchedulers(); err != nil {
-						m.l.Error("error killing schedulers, retrying", "err", err)
-						time.Sleep(10 * time.Second)
-						continue
-					}
-				}
-			}
-
-			if err := f.FixPostgres(); err != nil {
-				m.l.Error("error when fixing postgres, retrying", "err", err)
-				time.Sleep(10 * time.Second)
-				continue
-			}
-
-			m.l.Info("checking for running controller API")
-			controllerInstances, _ = controllerService.Instances()
-			if len(controllerInstances) == 0 {
-				if err := f.KillSchedulers(); err != nil {
-					m.l.Error("error killing schedulers, retrying", "err", err)
-					time.Sleep(10 * time.Second)
-					continue
-				}
-				controllerInstances, err = f.StartAppJob("controller", "web", "controller")
-				if err != nil {
-					m.l.Error("error starting controller api, retrying", "err", err)
-					time.Sleep(10 * time.Second)
-					continue
-				}
 			} else {
-				m.l.Info("found running controller API instances", "n", len(controllerInstances))
+				m.l.Error("did not find any controller api instances")
+				faulted = true
 			}
-			if err := f.FixController(controllerInstances, true); err != nil {
-				m.l.Error("error fixing controller, retrying", "err", err)
-				time.Sleep(10 * time.Second)
-				continue
+
+			if _, err := discoverd.NewService("controller-scheduler").Leader(); err != nil && !discoverd.IsNotFound(err) {
+				m.l.Error("error getting scheduler leader")
+			} else if err == nil {
+				m.l.Info("scheduler is up")
+			} else {
+				m.l.Error("scheduler is not up")
+				faulted = true
 			}
-			m.l.Info("cluster currently healthy")
+
+			if faulted && m.deadline.IsZero() {
+				m.l.Error("cluster is unhealthy, setting fault")
+				m.deadline = time.Now().Add(60 * time.Second)
+			} else if !faulted && !m.deadline.IsZero() {
+				m.l.Info("cluster currently healthy, clearing fault")
+				m.deadline = time.Time{}
+			}
+
+			if !m.deadline.IsZero() && time.Now().After(m.deadline) {
+				m.l.Error("fault deadline reached")
+				m.Repair()
+			}
 		}
 		m.l.Info("no more to do right now, sleeping")
 		time.Sleep(10 * time.Second)
 	}
+}
+
+func (m *Monitor) Repair() error {
+	m.l.Info("initiating cluster repair")
+	hosts, err := m.c.Hosts()
+	if err != nil {
+		return err
+	}
+	f := fixer.NewClusterFixer(hosts, m.c, m.l)
+	// killing the schedulers to prevent interference
+	f.KillSchedulers()
+	// ensure postgres is working
+	f.FixPostgres()
+	// ensure controller api is working
+	controllerService := discoverd.NewService("controller")
+	controllerInstances, _ := controllerService.Instances()
+	if len(controllerInstances) == 0 {
+		controllerInstances, err = f.StartAppJob("controller", "web", "controller")
+		if err != nil {
+			return err
+		}
+	}
+	// fix any formations and start the scheduler again
+	if err := f.FixController(controllerInstances, true); err != nil {
+		return err
+	}
+	// zero out the deadline timer
+	m.deadline = time.Time{}
+	return nil
 }

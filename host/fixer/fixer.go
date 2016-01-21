@@ -78,7 +78,7 @@ func (f *ClusterFixer) Run(args *docopt.Args, c *cluster.Client) error {
 	}
 	f.l.Info("found expected hosts", "n", len(f.hosts))
 
-	if err := f.fixDiscoverd(); err != nil {
+	if err := f.FixDiscoverd(); err != nil {
 		return err
 	}
 	if err := f.FixFlannel(); err != nil {
@@ -166,7 +166,7 @@ func (f *ClusterFixer) StartAppJob(app, typ, service string) ([]*discoverd.Insta
 	return discoverd.GetInstances(service, time.Minute)
 }
 
-func (f *ClusterFixer) fixDiscoverd() error {
+func (f *ClusterFixer) FixDiscoverd() error {
 	f.l.Info("ensuring discoverd is running on all hosts")
 	releases := f.FindAppReleaseJobs("discoverd", "app")
 	if len(releases) == 0 {
@@ -316,25 +316,32 @@ func (f *ClusterFixer) FixController(instances []*discoverd.Instance, startSched
 	}
 
 	if startScheduler {
-		if _, err := discoverd.NewService("controller-scheduler").Leader(); err != nil && !discoverd.IsNotFound(err) {
-			return fmt.Errorf("error getting scheduler leader: %s", err)
-		} else if err == nil {
-			f.l.Info("scheduler looks up, moving on")
-			return nil
-		}
-		f.l.Info("scheduler is not up, attempting to fix")
-
-		// start scheduler
-		ef, err := utils.ExpandFormation(client, controllerFormation)
-		if err != nil {
+		if err := f.StartScheduler(client, controllerFormation); err != nil {
 			return err
 		}
-		schedulerJob := utils.JobConfig(ef, "scheduler", f.hosts[0].ID(), "")
-		if err := f.hosts[0].AddJob(schedulerJob); err != nil {
-			return fmt.Errorf("error starting scheduler job on %s: %s", f.hosts[0].ID(), err)
-		}
-		f.l.Info("started scheduler job")
 	}
+	return nil
+}
+
+func (f *ClusterFixer) StartScheduler(client *controller.Client, cf *ct.Formation) error {
+	if _, err := discoverd.NewService("controller-scheduler").Leader(); err != nil && !discoverd.IsNotFound(err) {
+		return fmt.Errorf("error getting scheduler leader: %s", err)
+	} else if err == nil {
+		f.l.Info("scheduler looks up, moving on")
+		return nil
+	}
+	f.l.Info("scheduler is not up, attempting to fix")
+
+	// start scheduler
+	ef, err := utils.ExpandFormation(client, cf)
+	if err != nil {
+		return err
+	}
+	schedulerJob := utils.JobConfig(ef, "scheduler", f.hosts[0].ID(), "")
+	if err := f.hosts[0].AddJob(schedulerJob); err != nil {
+		return fmt.Errorf("error starting scheduler job on %s: %s", f.hosts[0].ID(), err)
+	}
+	f.l.Info("started scheduler job")
 	return nil
 }
 
