@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ably-forks/flynn/pkg/random"
@@ -35,6 +37,11 @@ var (
 
 	dialer backendDialer = &net.Dialer{
 		Timeout:   1 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	tlsDialer = &net.Dialer{
+		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 )
@@ -145,7 +152,14 @@ func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, str
 			return nil, "", errCanceled
 		default:
 		}
-		conn, err := dialer.Dial("tcp", addr)
+
+		var conn net.Conn
+		var err error
+		if strings.HasPrefix(addr, "https://") {
+			conn, err = tls.DialWithDialer(tlsDialer, "tcp", strings.TrimPrefix(addr, "https://"), nil)
+		} else {
+			conn, err = dialer.Dial("tcp", addr)
+		}
 		if err == nil {
 			return conn, addr, nil
 		}
