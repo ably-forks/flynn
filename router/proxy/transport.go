@@ -43,7 +43,7 @@ var (
 )
 
 // BackendListFunc returns a slice of backend hosts (hostname:port).
-type BackendListFunc func() []string
+type BackendListFunc func(*http.Request) []string
 
 type transport struct {
 	getBackends BackendListFunc
@@ -52,8 +52,8 @@ type transport struct {
 	useStickySessions bool
 }
 
-func (t *transport) getOrderedBackends(stickyBackend string) []string {
-	backends := t.getBackends()
+func (t *transport) getOrderedBackends(stickyBackend string, req *http.Request) []string {
+	backends := t.getBackends(req)
 	shuffle(backends)
 
 	if stickyBackend != "" {
@@ -84,7 +84,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	defer req.Body.(*fakeCloseReadCloser).RealClose()
 
 	stickyBackend := t.getStickyBackend(req)
-	backends := t.getOrderedBackends(stickyBackend)
+	backends := t.getOrderedBackends(stickyBackend, req)
 	for _, backend := range backends {
 		req.URL.Host = backend
 		res, err := httpTransport.RoundTrip(req)
@@ -101,14 +101,14 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (t *transport) Connect(ctx context.Context) (net.Conn, error) {
-	backends := t.getOrderedBackends("")
+	backends := t.getOrderedBackends("", nil)
 	conn, _, err := dialTCP(ctx, backends)
 	return conn, err
 }
 
 func (t *transport) UpgradeHTTP(req *http.Request) (*http.Response, net.Conn, error) {
 	stickyBackend := t.getStickyBackend(req)
-	backends := t.getOrderedBackends(stickyBackend)
+	backends := t.getOrderedBackends(stickyBackend, req)
 	upconn, addr, err := dialTCP(context.Background(), backends)
 	if err != nil {
 		return nil, nil, err
