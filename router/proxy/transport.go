@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/crypto/nacl/secretbox"
@@ -31,6 +33,11 @@ var (
 
 	dialer backendDialer = &net.Dialer{
 		Timeout:   1 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	tlsDialer = &net.Dialer{
+		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 )
@@ -131,7 +138,14 @@ func dialTCP(ctx context.Context, addrs []string) (net.Conn, string, error) {
 		default:
 		}
 
-		if conn, err := dialer.Dial("tcp", addr); err == nil {
+		var conn net.Conn
+		var err error
+		if strings.HasPrefix(addr, "https://") {
+			conn, err = tls.DialWithDialer(tlsDialer, "tcp", strings.TrimPrefix(addr, "https://"), nil)
+		} else {
+			conn, err = dialer.Dial("tcp", addr)
+		}
+		if err == nil {
 			return conn, addr, nil
 		}
 	}
