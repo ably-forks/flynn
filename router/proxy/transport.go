@@ -47,7 +47,7 @@ var (
 )
 
 // BackendListFunc returns a slice of backend hosts (hostname:port).
-type BackendListFunc func() []string
+type BackendListFunc func(*http.Request) []string
 
 type transport struct {
 	getBackends BackendListFunc
@@ -56,8 +56,8 @@ type transport struct {
 	useStickySessions bool
 }
 
-func (t *transport) getOrderedBackends(stickyBackend string) []string {
-	backends := t.getBackends()
+func (t *transport) getOrderedBackends(stickyBackend string, req *http.Request) []string {
+	backends := t.getBackends(req)
 	shuffle(backends)
 
 	if stickyBackend != "" {
@@ -91,7 +91,7 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 	req.Cancel = ctx.Done()
 
 	stickyBackend := t.getStickyBackend(req)
-	backends := t.getOrderedBackends(stickyBackend)
+	backends := t.getOrderedBackends(stickyBackend, req)
 	for i, backend := range backends {
 		req.URL.Host = backend
 		res, err := httpTransport.RoundTrip(req)
@@ -110,7 +110,7 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 }
 
 func (t *transport) Connect(ctx context.Context, l log15.Logger) (net.Conn, error) {
-	backends := t.getOrderedBackends("")
+	backends := t.getOrderedBackends("", nil)
 	conn, _, err := dialTCP(ctx, l, backends)
 	if err != nil {
 		l.Error("connection failed", "num_backends", len(backends))
@@ -120,7 +120,7 @@ func (t *transport) Connect(ctx context.Context, l log15.Logger) (net.Conn, erro
 
 func (t *transport) UpgradeHTTP(req *http.Request, l log15.Logger) (*http.Response, net.Conn, error) {
 	stickyBackend := t.getStickyBackend(req)
-	backends := t.getOrderedBackends(stickyBackend)
+	backends := t.getOrderedBackends(stickyBackend, req)
 	upconn, addr, err := dialTCP(context.Background(), l, backends)
 	if err != nil {
 		l.Error("dial failed", "status", "503", "num_backends", len(backends))
