@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/sirenia/state"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

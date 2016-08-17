@@ -9,7 +9,7 @@ import (
 	"path"
 	"sync"
 
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 )
 
 type ClusterBackupReceiver struct {

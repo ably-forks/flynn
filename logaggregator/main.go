@@ -5,9 +5,9 @@ import (
 	"net"
 	"os"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/logaggregator/client"
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/logaggregator/client"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 
 	"gopkg.in/inconshreveable/log15.v2"
 )

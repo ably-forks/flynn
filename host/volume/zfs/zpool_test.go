@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"path"
 
-	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/testutils"
+	"github.com/ably-forks/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/testutils"
 	. "github.com/flynn/go-check"
 	gzfs "github.com/mistifyio/go-zfs"
 )

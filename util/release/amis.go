@@ -8,7 +8,7 @@ import (
 
 	"github.com/awslabs/aws-sdk-go/aws"
 	"github.com/awslabs/aws-sdk-go/gen/ec2"
-	"github.com/flynn/flynn/util/release/types"
+	"github.com/ably-forks/flynn/util/release/types"
 	"github.com/flynn/go-docopt"
 )
 

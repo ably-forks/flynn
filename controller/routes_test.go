@@ -5,12 +5,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/stream"
-	routerc "github.com/flynn/flynn/router/client"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/stream"
+	routerc "github.com/ably-forks/flynn/router/client"
+	"github.com/ably-forks/flynn/router/types"
 	. "github.com/flynn/go-check"
 )
 

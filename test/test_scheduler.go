@@ -6,12 +6,12 @@ import (
 	"strings"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
-	logaggc "github.com/flynn/flynn/logaggregator/client"
-	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/typeconv"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
+	logaggc "github.com/ably-forks/flynn/logaggregator/client"
+	"github.com/ably-forks/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 	c "github.com/flynn/go-check"
 )
 

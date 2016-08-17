@@ -4,9 +4,9 @@ import (
 	"errors"
 	"time"
 
-	discoverd "github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/shutdown"
-	"github.com/flynn/flynn/pkg/stream"
+	discoverd "github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/pkg/stream"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

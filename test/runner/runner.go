@@ -27,17 +27,17 @@ import (
 	"github.com/awslabs/aws-sdk-go/aws"
 	"github.com/awslabs/aws-sdk-go/gen/s3"
 	"github.com/boltdb/bolt"
-	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/iotool"
-	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/shutdown"
-	"github.com/flynn/flynn/pkg/sse"
-	"github.com/flynn/flynn/pkg/stream"
-	"github.com/flynn/flynn/pkg/tlsconfig"
-	"github.com/flynn/flynn/pkg/typeconv"
-	"github.com/flynn/flynn/test/arg"
-	"github.com/flynn/flynn/test/buildlog"
-	"github.com/flynn/flynn/test/cluster"
+	"github.com/ably-forks/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/iotool"
+	"github.com/ably-forks/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/pkg/sse"
+	"github.com/ably-forks/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/pkg/tlsconfig"
+	"github.com/ably-forks/flynn/pkg/typeconv"
+	"github.com/ably-forks/flynn/test/arg"
+	"github.com/ably-forks/flynn/test/buildlog"
+	"github.com/ably-forks/flynn/test/cluster"
 	"github.com/flynn/tail"
 	"github.com/julienschmidt/httprouter"
 	"github.com/thoj/go-ircevent"
@@ -321,7 +321,7 @@ done
 
 echo "nameserver ${ip}" | sudo tee /etc/resolv.conf
 
-cd ~/go/src/github.com/flynn/flynn
+cd ~/go/src/github.com/ably-forks/flynn
 
 script/configure-docker "{{ .Cluster.ClusterDomain }}"
 
@@ -815,7 +815,7 @@ func (r *Runner) explainBuild(w http.ResponseWriter, req *http.Request, ps httpr
 	}
 	build.Reason = req.FormValue("reason")
 	build.IssueLink = req.FormValue("issue-link")
-	if build.IssueLink != "" && !strings.HasPrefix(build.IssueLink, "https://github.com/flynn/flynn/issues/") {
+	if build.IssueLink != "" && !strings.HasPrefix(build.IssueLink, "https://github.com/ably-forks/flynn/issues/") {
 		http.Error(w, fmt.Sprintf("Invalid GitHub issue link: %q\n", build.IssueLink), 400)
 		return
 	}

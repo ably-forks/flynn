@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/dialer"
-	"github.com/flynn/flynn/router/types"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/dialer"
+	"github.com/ably-forks/flynn/router/types"
 	c "github.com/flynn/go-check"
 )
 

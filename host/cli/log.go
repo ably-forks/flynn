@@ -8,8 +8,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/cluster"
 	"github.com/flynn/go-docopt"
 )
 

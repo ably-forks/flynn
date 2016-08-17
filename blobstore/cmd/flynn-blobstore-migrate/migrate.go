@@ -7,8 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/flynn/flynn/blobstore/data"
-	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/blobstore/data"
+	"github.com/ably-forks/flynn/pkg/postgres"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/flynn/flynn/util/release/types"
+	"github.com/ably-forks/flynn/util/release/types"
 	"github.com/flynn/go-docopt"
 )
 

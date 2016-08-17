@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/flynn/flynn/pkg/testutils"
+	"github.com/ably-forks/flynn/pkg/testutils"
 	. "github.com/flynn/go-check"
 )
 

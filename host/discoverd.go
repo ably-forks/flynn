@@ -7,10 +7,10 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/logmux"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/logmux"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 )
 
 func NewDiscoverdManager(backend Backend, mux *logmux.Mux, hostID, publishAddr string, tags map[string]string) *DiscoverdManager {

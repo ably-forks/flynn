@@ -12,16 +12,16 @@ import (
 	"strconv"
 	"time"
 
-	cc "github.com/flynn/flynn/controller/client"
-	"github.com/flynn/flynn/controller/client/v1"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
-	g "github.com/flynn/flynn/pkg/examplegenerator"
-	"github.com/flynn/flynn/pkg/httprecorder"
-	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/resource"
-	"github.com/flynn/flynn/router/types"
+	cc "github.com/ably-forks/flynn/controller/client"
+	"github.com/ably-forks/flynn/controller/client/v1"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
+	g "github.com/ably-forks/flynn/pkg/examplegenerator"
+	"github.com/ably-forks/flynn/pkg/httprecorder"
+	"github.com/ably-forks/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/resource"
+	"github.com/ably-forks/flynn/router/types"
 )
 
 type generator struct {

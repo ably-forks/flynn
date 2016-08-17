@@ -3,7 +3,7 @@ package bootstrap
 import (
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 )
 
 type DeployAppAction struct {

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/sirenia/state"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	. "github.com/flynn/go-check"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"

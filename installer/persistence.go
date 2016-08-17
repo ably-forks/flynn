@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 
 	_ "github.com/cznic/ql/driver"
-	"github.com/flynn/flynn/cli/config"
-	"github.com/flynn/flynn/pkg/sshkeygen"
+	"github.com/ably-forks/flynn/cli/config"
+	"github.com/ably-forks/flynn/pkg/sshkeygen"
 )
 
 var keysDir, dbPath string

@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
 )
 
 func ParseMessage(data []byte) (*rfc5424.Message, *HostCursor, error) {

@@ -13,8 +13,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/stream"
 )
 
 type DialFunc func(network, addr string) (net.Conn, error)

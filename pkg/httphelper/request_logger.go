@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/pkg/ctxhelper"
+	"github.com/ably-forks/flynn/pkg/ctxhelper"
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/stream"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/cluster"
 )
 
 type WaitHostsAction struct{}

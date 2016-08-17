@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/digitalocean/godo"
-	"github.com/flynn/flynn/pkg/sshkeygen"
+	"github.com/ably-forks/flynn/pkg/sshkeygen"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/oauth2"
 )

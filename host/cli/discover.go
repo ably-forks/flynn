@@ -6,8 +6,8 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/cluster"
 	"github.com/flynn/go-docopt"
 )
 

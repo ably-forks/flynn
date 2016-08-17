@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/flynn/flynn/host/types"
+	"github.com/ably-forks/flynn/host/types"
 )
 
 // ErrWouldWait is returned when the Attach should not wait, but the job is not

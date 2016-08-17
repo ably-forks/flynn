@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 )
 
 func main() {

@@ -14,11 +14,11 @@ import (
 	"strings"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/httpclient"
-	"github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/stream"
-	"github.com/flynn/flynn/router/types"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/httpclient"
+	"github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/router/types"
 )
 
 // Client is a client for the v1 of the controller API.

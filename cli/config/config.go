@@ -11,7 +11,7 @@ import (
 	"runtime"
 
 	"github.com/BurntSushi/toml"
-	"github.com/flynn/flynn/controller/client"
+	"github.com/ably-forks/flynn/controller/client"
 	"github.com/mitchellh/go-homedir"
 )
 

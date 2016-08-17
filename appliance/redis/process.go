@@ -16,7 +16,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 	"github.com/garyburd/redigo/redis"
 	"gopkg.in/inconshreveable/log15.v2"
 )

@@ -4,7 +4,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/flynn/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/attempt"
 )
 
 var Default = net.Dialer{

@@ -11,9 +11,9 @@ import (
 	"github.com/awslabs/aws-sdk-go/gen/ec2"
 	"github.com/cznic/ql"
 	"github.com/digitalocean/godo"
-	"github.com/flynn/flynn/pkg/azure"
-	"github.com/flynn/flynn/pkg/knownhosts"
-	"github.com/flynn/flynn/pkg/sshkeygen"
+	"github.com/ably-forks/flynn/pkg/azure"
+	"github.com/ably-forks/flynn/pkg/knownhosts"
+	"github.com/ably-forks/flynn/pkg/sshkeygen"
 	"golang.org/x/crypto/ssh"
 )
 

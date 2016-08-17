@@ -9,13 +9,13 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/flynn/flynn/controller/client/v1"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/dialer"
-	"github.com/flynn/flynn/pkg/httpclient"
-	"github.com/flynn/flynn/pkg/pinned"
-	"github.com/flynn/flynn/pkg/stream"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/controller/client/v1"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/dialer"
+	"github.com/ably-forks/flynn/pkg/httpclient"
+	"github.com/ably-forks/flynn/pkg/pinned"
+	"github.com/ably-forks/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/router/types"
 )
 
 type Client interface {

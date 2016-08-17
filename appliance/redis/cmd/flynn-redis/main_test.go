@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"testing"
 
-	main "github.com/flynn/flynn/appliance/redis/cmd/flynn-redis"
-	"github.com/flynn/flynn/discoverd/client"
+	main "github.com/ably-forks/flynn/appliance/redis/cmd/flynn-redis"
+	"github.com/ably-forks/flynn/discoverd/client"
 )
 
 // Ensure the program can register with discoverd.

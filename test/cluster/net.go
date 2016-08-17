@@ -12,8 +12,8 @@ import (
 
 	"github.com/docker/libcontainer/netlink"
 	"github.com/docker/libnetwork/ipallocator"
-	"github.com/flynn/flynn/pkg/iptables"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/iptables"
+	"github.com/ably-forks/flynn/pkg/random"
 )
 
 type Bridge struct {
@@ -42,7 +42,7 @@ func createBridge(name, network, natIface string) (*Bridge, error) {
 	}
 
 	// We need to explicitly assign the MAC address to avoid it changing to a lower value
-	// See: https://github.com/flynn/flynn/issues/223
+	// See: https://github.com/ably-forks/flynn/issues/223
 	b := random.Bytes(5)
 	mac := fmt.Sprintf("fe:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4])
 	if err := netlink.NetworkSetMacAddress(iface, mac); err != nil {

@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/cache"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/status"
+	"github.com/ably-forks/flynn/discoverd/cache"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/status"
 )
 
 func main() {

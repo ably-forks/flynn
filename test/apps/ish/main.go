@@ -8,8 +8,8 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 )
 
 /*

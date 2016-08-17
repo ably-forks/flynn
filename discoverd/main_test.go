@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/flynn/flynn/discoverd"
+	"github.com/ably-forks/flynn/discoverd"
 )
 
 // Ensures the CLI flags can be parsed.

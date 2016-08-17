@@ -7,10 +7,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/host/resource"
-	"github.com/flynn/flynn/pkg/typeconv"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/host/resource"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 	"github.com/flynn/go-docopt"
 )
 

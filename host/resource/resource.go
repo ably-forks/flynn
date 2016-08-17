@@ -5,7 +5,7 @@ import (
 	"strconv"
 
 	"github.com/docker/go-units"
-	"github.com/flynn/flynn/pkg/typeconv"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 )
 
 type Spec struct {

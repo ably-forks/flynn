@@ -6,10 +6,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/flynn/flynn/logaggregator/client"
-	"github.com/flynn/flynn/logaggregator/utils"
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
-	"github.com/flynn/flynn/pkg/syslog/rfc6587"
+	"github.com/ably-forks/flynn/logaggregator/client"
+	"github.com/ably-forks/flynn/logaggregator/utils"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc6587"
 	. "github.com/flynn/go-check"
 )
 

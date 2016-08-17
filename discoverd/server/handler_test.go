@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	discoverd "github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/discoverd/server"
-	"github.com/flynn/flynn/pkg/stream"
+	discoverd "github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/discoverd/server"
+	"github.com/ably-forks/flynn/pkg/stream"
 )
 
 // Ensure the handler can register a service.

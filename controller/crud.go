@@ -4,9 +4,9 @@ import (
 	"net/http"
 	"reflect"
 
-	"github.com/flynn/flynn/controller/schema"
-	"github.com/flynn/flynn/pkg/ctxhelper"
-	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/controller/schema"
+	"github.com/ably-forks/flynn/pkg/ctxhelper"
+	"github.com/ably-forks/flynn/pkg/httphelper"
 	"github.com/julienschmidt/httprouter"
 	"golang.org/x/net/context"
 )

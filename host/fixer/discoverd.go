@@ -3,8 +3,8 @@ package fixer
 import (
 	"fmt"
 
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/cluster"
 )
 
 func (f *ClusterFixer) FixDiscoverd() error {

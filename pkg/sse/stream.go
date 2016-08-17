@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	hh "github.com/flynn/flynn/pkg/httphelper"
+	hh "github.com/ably-forks/flynn/pkg/httphelper"
 	log "gopkg.in/inconshreveable/log15.v2"
 )
 

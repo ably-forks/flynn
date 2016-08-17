@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/docker/go-units"
-	"github.com/flynn/flynn/pkg/typeconv"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 	. "github.com/flynn/go-check"
 )
 

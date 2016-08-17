@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/dialer"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/dialer"
+	"github.com/ably-forks/flynn/pkg/stream"
 )
 
 // NewClient uses the default discoverd configuration to create a cluster

@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/flynn/flynn/pinkerton"
+	"github.com/ably-forks/flynn/pinkerton"
 	"github.com/flynn/go-docopt"
 	tuf "github.com/flynn/go-tuf/client"
 )

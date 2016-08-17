@@ -9,9 +9,9 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/host/types"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/host/types"
 	"github.com/flynn/go-docopt"
 )
 

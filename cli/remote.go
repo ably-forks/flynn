@@ -4,7 +4,7 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/flynn/flynn/controller/client"
+	"github.com/ably-forks/flynn/controller/client"
 	"github.com/flynn/go-docopt"
 )
 

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/cluster"
 	"github.com/flynn/go-docopt"
 )
 

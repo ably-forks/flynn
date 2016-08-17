@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/flynn/flynn/controller/client"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/controller/client"
+	"github.com/ably-forks/flynn/router/types"
 	"github.com/flynn/go-docopt"
 )
 

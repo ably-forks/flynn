@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/pkg/version"
 	"github.com/flynn/go-docopt"
 )
 

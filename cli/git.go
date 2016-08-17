@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	cfg "github.com/flynn/flynn/cli/config"
+	cfg "github.com/ably-forks/flynn/cli/config"
 	"github.com/flynn/go-docopt"
 )
 

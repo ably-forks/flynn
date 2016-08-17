@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/flynn/pkg/mux"
+	"github.com/ably-forks/flynn/pkg/mux"
 )
 
 // Ensure the muxer can split a listener's connections across multiple listeners.

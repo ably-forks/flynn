@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/flynn/flynn/pkg/dialer"
-	"github.com/flynn/flynn/pkg/httpclient"
-	"github.com/flynn/flynn/pkg/stream"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/pkg/dialer"
+	"github.com/ably-forks/flynn/pkg/httpclient"
+	"github.com/ably-forks/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/router/types"
 )
 
 // ErrNotFound is returned when no route was found.

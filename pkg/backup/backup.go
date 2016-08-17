@@ -5,8 +5,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
 )
 
 func Run(client controller.Client, out io.Writer, progress ProgressBar) error {

@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"os"
 
-	g "github.com/flynn/flynn/pkg/examplegenerator"
-	"github.com/flynn/flynn/pkg/httprecorder"
-	rc "github.com/flynn/flynn/router/client"
-	rt "github.com/flynn/flynn/router/types"
+	g "github.com/ably-forks/flynn/pkg/examplegenerator"
+	"github.com/ably-forks/flynn/pkg/httprecorder"
+	rc "github.com/ably-forks/flynn/router/client"
+	rt "github.com/ably-forks/flynn/router/types"
 )
 
 type generator struct {

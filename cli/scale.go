@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/controller/utils"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/controller/utils"
 	"github.com/flynn/go-docopt"
 )
 

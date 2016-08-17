@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/discoverd/server"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/discoverd/server"
+	"github.com/ably-forks/flynn/pkg/stream"
 )
 
 // Ensure the store can open and close.

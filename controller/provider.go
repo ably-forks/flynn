@@ -3,8 +3,8 @@ package main
 import (
 	"errors"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/postgres"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/postgres"
 	"github.com/jackc/pgx"
 )
 

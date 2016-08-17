@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/cznic/ql"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/random"
 )
 
 func (prompt *Prompt) Resolve(res *Prompt) error {

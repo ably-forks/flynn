@@ -213,7 +213,7 @@ func parseArgv(tokens *tokenList, options *patternList, optionsFirst bool, pat *
 	// This is a HACK that skips the command in:
 	// (*docopt.pattern)(0x208333dc0)(required(required(command(foo, false), ...)))
 	// when parsing with optionsFirst set. For more details see
-	// https://github.com/flynn/flynn/pull/193
+	// https://github.com/ably-forks/flynn/pull/193
 	skipArg := optionsFirst && pat != nil &&
 		pat.t == patternRequired && len(pat.children) == 1 &&
 		pat.children[0].t == patternRequired && len(pat.children[0].children) > 0 &&

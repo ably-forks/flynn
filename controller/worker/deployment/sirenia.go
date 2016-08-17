@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/sirenia/client"
-	"github.com/flynn/flynn/pkg/sirenia/state"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/sirenia/client"
+	"github.com/ably-forks/flynn/pkg/sirenia/state"
 )
 
 func (d *DeployJob) deploySirenia() (err error) {

@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	main "github.com/flynn/flynn/appliance/redis/cmd/flynn-redis-api"
+	main "github.com/ably-forks/flynn/appliance/redis/cmd/flynn-redis-api"
 )
 
 // Main is a test wrapper for main.Main.

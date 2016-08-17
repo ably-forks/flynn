@@ -1,9 +1,9 @@
 package main
 
 import (
-	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/postgres"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/pkg/random"
 
 	. "github.com/flynn/go-check"
 )

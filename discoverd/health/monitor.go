@@ -3,7 +3,7 @@ package health
 import (
 	"time"
 
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/pkg/stream"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

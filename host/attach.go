@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/flynn/flynn/host/types"
+	"github.com/ably-forks/flynn/host/types"
 	"github.com/julienschmidt/httprouter"
 	"gopkg.in/inconshreveable/log15.v2"
 )

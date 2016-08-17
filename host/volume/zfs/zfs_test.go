@@ -6,8 +6,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/flynn/flynn/host/volume"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/host/volume"
+	"github.com/ably-forks/flynn/pkg/random"
 	. "github.com/flynn/go-check"
 	gzfs "github.com/mistifyio/go-zfs"
 )

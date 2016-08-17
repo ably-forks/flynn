@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/cluster"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/cluster"
 	c "github.com/flynn/go-check"
 )
 

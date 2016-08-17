@@ -6,9 +6,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/flynn/flynn/blobstore/backend"
-	"github.com/flynn/flynn/blobstore/data"
-	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/blobstore/backend"
+	"github.com/ably-forks/flynn/blobstore/data"
+	"github.com/ably-forks/flynn/pkg/postgres"
 	"github.com/jackc/pgx"
 )
 

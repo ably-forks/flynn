@@ -16,9 +16,9 @@ import (
 	"github.com/awslabs/aws-sdk-go/gen/cloudformation"
 	"github.com/awslabs/aws-sdk-go/gen/ec2"
 	"github.com/awslabs/aws-sdk-go/gen/route53"
-	"github.com/flynn/flynn/pkg/awsutil"
-	"github.com/flynn/flynn/pkg/sshkeygen"
-	"github.com/flynn/flynn/util/release/types"
+	"github.com/ably-forks/flynn/pkg/awsutil"
+	"github.com/ably-forks/flynn/pkg/sshkeygen"
+	"github.com/ably-forks/flynn/util/release/types"
 )
 
 var DisallowedEC2InstanceTypes = []string{"t1.micro", "t2.micro", "t2.small", "m1.small"}

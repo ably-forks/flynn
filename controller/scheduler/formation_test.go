@@ -1,7 +1,7 @@
 package main
 
 import (
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 	. "github.com/flynn/go-check"
 )
 

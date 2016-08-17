@@ -8,7 +8,7 @@ import (
 	"path"
 	"path/filepath"
 
-	"github.com/flynn/flynn/pkg/tufutil"
+	"github.com/ably-forks/flynn/pkg/tufutil"
 	tuf "github.com/flynn/go-tuf/client"
 )
 

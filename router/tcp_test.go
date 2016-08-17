@@ -7,9 +7,9 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/discoverd/testutil"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/discoverd/testutil"
+	"github.com/ably-forks/flynn/router/types"
 	. "github.com/flynn/go-check"
 )
 

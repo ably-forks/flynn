@@ -6,7 +6,7 @@ import (
 	"os/exec"
 
 	"github.com/flynn/docker-utils/registry"
-	"github.com/flynn/flynn/pkg/cliutil"
+	"github.com/ably-forks/flynn/pkg/cliutil"
 	"github.com/flynn/go-docopt"
 )
 

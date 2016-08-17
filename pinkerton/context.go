@@ -22,9 +22,9 @@ import (
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/docker/pkg/term"
 	"github.com/docker/docker/registry"
-	"github.com/flynn/flynn/pinkerton/layer"
-	"github.com/flynn/flynn/pkg/tufutil"
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/pinkerton/layer"
+	"github.com/ably-forks/flynn/pkg/tufutil"
+	"github.com/ably-forks/flynn/pkg/version"
 	tuf "github.com/flynn/go-tuf/client"
 )
 

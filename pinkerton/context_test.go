@@ -13,7 +13,7 @@ import (
 	"github.com/docker/distribution/context"
 	"github.com/docker/distribution/registry/handlers"
 	_ "github.com/docker/distribution/registry/storage/driver/filesystem"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/random"
 )
 
 const (

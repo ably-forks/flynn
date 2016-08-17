@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/random"
 	. "github.com/flynn/go-check"
 	"golang.org/x/crypto/ssh"
 )

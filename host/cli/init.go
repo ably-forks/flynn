@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
-	"github.com/flynn/flynn/bootstrap/discovery"
-	"github.com/flynn/flynn/host/config"
+	"github.com/ably-forks/flynn/bootstrap/discovery"
+	"github.com/ably-forks/flynn/host/config"
 	"github.com/flynn/go-docopt"
 )
 

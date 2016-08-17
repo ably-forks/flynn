@@ -5,7 +5,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
 )
 
 // Buffer is a linked list that holds rfc5424.Messages. The Buffer's entire

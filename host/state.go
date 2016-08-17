@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/cluster"
 )
 
 // TODO: prune old jobs?

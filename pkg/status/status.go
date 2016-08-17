@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/pkg/version"
 )
 
 /*

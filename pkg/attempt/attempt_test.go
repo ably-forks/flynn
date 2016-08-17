@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/attempt"
 	. "github.com/flynn/go-check"
 )
 

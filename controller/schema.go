@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/pkg/postgres"
 )
 
 var migrations *postgres.Migrations

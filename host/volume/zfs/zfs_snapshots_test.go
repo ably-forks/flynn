@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/flynn/flynn/pkg/testutils"
+	"github.com/ably-forks/flynn/pkg/testutils"
 	. "github.com/flynn/go-check"
 )
 

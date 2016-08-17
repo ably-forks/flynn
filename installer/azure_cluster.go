@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/pkg/azure"
-	"github.com/flynn/flynn/pkg/sshkeygen"
+	"github.com/ably-forks/flynn/pkg/azure"
+	"github.com/ably-forks/flynn/pkg/sshkeygen"
 	"github.com/flynn/oauth2"
 	"golang.org/x/net/context"
 )

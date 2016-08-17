@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/postgres"
-	"github.com/flynn/flynn/pkg/random"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/pkg/random"
 	"github.com/jackc/pgx"
 )
 

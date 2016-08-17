@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/pkg/version"
 	"golang.org/x/crypto/ssh"
 )
 

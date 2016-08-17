@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/flynn/flynn/logaggregator/utils"
-	"github.com/flynn/flynn/pkg/dialer"
-	"github.com/flynn/flynn/pkg/httpclient"
+	"github.com/ably-forks/flynn/logaggregator/utils"
+	"github.com/ably-forks/flynn/pkg/dialer"
+	"github.com/ably-forks/flynn/pkg/httpclient"
 )
 
 // ErrNotFound is returned when a resource is not found (HTTP status 404).

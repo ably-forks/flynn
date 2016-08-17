@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/status"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/status"
 	c "github.com/flynn/go-check"
 )
 

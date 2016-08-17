@@ -1,8 +1,8 @@
 package main
 
 import (
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/controller/utils"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/controller/utils"
 )
 
 type Formations map[utils.FormationKey]*Formation

@@ -1,6 +1,6 @@
 package deployment
 
-import ct "github.com/flynn/flynn/controller/types"
+import ct "github.com/ably-forks/flynn/controller/types"
 
 func (d *DeployJob) deployAllAtOnce() error {
 	log := d.logger.New("fn", "deployAllAtOnce")

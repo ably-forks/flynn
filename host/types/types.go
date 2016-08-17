@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/flynn/flynn/host/resource"
+	"github.com/ably-forks/flynn/host/resource"
 )
 
 // TagPrefix is the prefix added to tags in discoverd instance metadata

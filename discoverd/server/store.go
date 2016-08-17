@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	hh "github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/discoverd/client"
+	hh "github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/stream"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
 	"gopkg.in/inconshreveable/log15.v2"

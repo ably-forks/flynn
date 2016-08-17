@@ -3,7 +3,7 @@ package cli
 import (
 	"fmt"
 
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/pkg/version"
 )
 
 func init() {

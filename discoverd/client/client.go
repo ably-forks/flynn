@@ -12,10 +12,10 @@ import (
 	"strings"
 	"sync"
 
-	dt "github.com/flynn/flynn/discoverd/types"
-	"github.com/flynn/flynn/pkg/httpclient"
-	hh "github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/stream"
+	dt "github.com/ably-forks/flynn/discoverd/types"
+	"github.com/ably-forks/flynn/pkg/httpclient"
+	hh "github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/stream"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/fixer"
-	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/fixer"
+	"github.com/ably-forks/flynn/pkg/cluster"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

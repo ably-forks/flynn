@@ -14,10 +14,10 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/cli/config"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/test/buildlog"
+	"github.com/ably-forks/flynn/cli/config"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/random"
+	"github.com/ably-forks/flynn/test/buildlog"
 )
 
 type ClusterType uint8
@@ -387,10 +387,10 @@ var flynnBuildScript = template.Must(template.New("flynn-build").Parse(`
 set -e -x
 
 export GOPATH=~/go
-flynn=$GOPATH/src/github.com/flynn/flynn
+flynn=$GOPATH/src/github.com/ably-forks/flynn
 
 if [ ! -d $flynn ]; then
-  git clone https://github.com/flynn/flynn $flynn
+  git clone https://github.com/ably-forks/flynn $flynn
 fi
 
 cd $flynn
@@ -442,7 +442,7 @@ var flynnUnitTestScript = `
 set -e -x
 
 export GOPATH=~/go
-flynn=$GOPATH/src/github.com/flynn/flynn
+flynn=$GOPATH/src/github.com/ably-forks/flynn
 cd $flynn
 
 if [[ -f test/scripts/test-unit.sh ]]; then

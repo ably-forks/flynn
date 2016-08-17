@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/random"
 )
 
 // ExtractHostID returns the host ID component of a job ID, returning an error

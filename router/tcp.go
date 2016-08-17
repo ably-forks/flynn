@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/cache"
-	"github.com/flynn/flynn/pkg/connutil"
-	"github.com/flynn/flynn/router/proxy"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/discoverd/cache"
+	"github.com/ably-forks/flynn/pkg/connutil"
+	"github.com/ably-forks/flynn/router/proxy"
+	"github.com/ably-forks/flynn/router/types"
 	"golang.org/x/net/context"
 )
 

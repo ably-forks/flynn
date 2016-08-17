@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/cupcake/jsonschema"
-	"github.com/flynn/flynn/cli/config"
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/exec"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/cli/config"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/exec"
+	"github.com/ably-forks/flynn/pkg/random"
 	c "github.com/flynn/go-check"
 )
 
@@ -411,7 +411,7 @@ func (s *ControllerSuite) TestAppDeleteCleanup(t *c.C) {
 	t.Assert(r.git("push", "flynn", "master"), Succeeds)
 }
 
-// https://github.com/flynn/flynn/issues/2257
+// https://github.com/ably-forks/flynn/issues/2257
 func (s *ControllerSuite) TestResourceProvisionRecreatedApp(t *c.C) {
 	app := "app-recreate-" + random.String(8)
 	client := s.controllerClient(t)

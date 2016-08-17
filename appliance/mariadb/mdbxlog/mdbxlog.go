@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/flynn/flynn/pkg/sirenia/xlog"
+	"github.com/ably-forks/flynn/pkg/sirenia/xlog"
 )
 
 // XLog implements a string serializable, comparable transaction log position.

@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/attempt"
 )
 
 func RunDiscoverdServer(t TestingT, port string) (string, func()) {

@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/shutdown"
 )
 
 var (

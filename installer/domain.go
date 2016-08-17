@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/flynn/flynn/pkg/httpclient"
+	"github.com/ably-forks/flynn/pkg/httpclient"
 )
 
 func AllocateDomain() (*Domain, error) {

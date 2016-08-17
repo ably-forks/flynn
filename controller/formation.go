@@ -7,12 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/controller/schema"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/ctxhelper"
-	"github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/postgres"
-	"github.com/flynn/flynn/pkg/sse"
+	"github.com/ably-forks/flynn/controller/schema"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/ctxhelper"
+	"github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/pkg/sse"
 	"github.com/jackc/pgx"
 	"golang.org/x/net/context"
 )
@@ -23,7 +23,7 @@ type formationKey struct {
 
 // we are wrapping the client specified channel to send formation updates in order to safely interrupt
 // `sendUpdateSince` goroutine if an unsubscribe happens before it is completed. otherwise we can get
-// a panic due to sending to a closed channel. See https://github.com/flynn/flynn/issues/2175 for more
+// a panic due to sending to a closed channel. See https://github.com/ably-forks/flynn/issues/2175 for more
 // details on this subject.
 type FormationSubscription struct {
 	mtx sync.RWMutex

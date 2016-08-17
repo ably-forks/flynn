@@ -3,9 +3,9 @@ package main
 import (
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
 	c "github.com/flynn/go-check"
 )
 

@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/flynn/flynn/appliance/mariadb"
-	ct "github.com/flynn/flynn/controller/types"
+	"github.com/ably-forks/flynn/appliance/mariadb"
+	ct "github.com/ably-forks/flynn/controller/types"
 	c "github.com/flynn/go-check"
 	_ "github.com/go-sql-driver/mysql"
 )

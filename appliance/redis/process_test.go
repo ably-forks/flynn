@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/flynn/appliance/redis"
+	"github.com/ably-forks/flynn/appliance/redis"
 )
 
 // Ensure process can start and stop successfully.

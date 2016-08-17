@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

@@ -13,12 +13,12 @@ import (
 	"github.com/docker/distribution/manifest"
 	"github.com/docker/distribution/registry/handlers"
 	"github.com/docker/distribution/registry/middleware/repository"
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/docker-receive/blobstore"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/status"
-	"github.com/flynn/flynn/pkg/version"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/docker-receive/blobstore"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/status"
+	"github.com/ably-forks/flynn/pkg/version"
 )
 
 // main is a modified version of the registry main function:

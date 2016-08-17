@@ -4,7 +4,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/pkg/postgres"
 	"github.com/jackc/pgx"
 )
 

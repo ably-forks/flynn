@@ -4,8 +4,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/flynn/flynn/logaggregator/buffer"
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/logaggregator/buffer"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
 )
 
 var errBufferFull = errors.New("feed buffer full")

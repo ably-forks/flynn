@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/flynn/flynn/controller/utils"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/stream"
+	"github.com/ably-forks/flynn/controller/utils"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/stream"
 )
 
 func NewFakeCluster() *FakeCluster {

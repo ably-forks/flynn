@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
 )
 
 type Filter interface {

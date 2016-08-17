@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/cluster"
-	hh "github.com/flynn/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/host/types"
+	"github.com/ably-forks/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/cluster"
+	hh "github.com/ably-forks/flynn/pkg/httphelper"
 )
 
 type Config struct {

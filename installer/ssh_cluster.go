@@ -18,9 +18,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/flynn/flynn/cli/config"
-	"github.com/flynn/flynn/pkg/httphelper"
-	"github.com/flynn/flynn/pkg/knownhosts"
+	"github.com/ably-forks/flynn/cli/config"
+	"github.com/ably-forks/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/knownhosts"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"

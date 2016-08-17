@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/pkg/postgres"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/pkg/postgres"
 	c "github.com/flynn/go-check"
 )
 
@@ -16,7 +16,7 @@ type PostgresSuite struct {
 
 var _ = c.ConcurrentSuite(&PostgresSuite{})
 
-// Check postgres config to avoid regressing on https://github.com/flynn/flynn/issues/101
+// Check postgres config to avoid regressing on https://github.com/ably-forks/flynn/issues/101
 func (s *PostgresSuite) TestSSLRenegotiationLimit(t *c.C) {
 	query := flynn(t, "/", "-a", "controller", "pg", "psql", "--", "-c", "SHOW ssl_renegotiation_limit")
 	t.Assert(query, SuccessfulOutputContains, "ssl_renegotiation_limit \n-------------------------\n 0\n(1 row)")

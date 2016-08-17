@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	logaggc "github.com/flynn/flynn/logaggregator/client"
-	"github.com/flynn/flynn/pkg/typeconv"
+	ct "github.com/ably-forks/flynn/controller/types"
+	logaggc "github.com/ably-forks/flynn/logaggregator/client"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 
 	. "github.com/flynn/go-check"
 )

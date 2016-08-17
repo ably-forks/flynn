@@ -4,7 +4,7 @@ import (
 	"log"
 	"net/http"
 
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 )
 
 var ErrInvalidLoginToken = ct.ValidationError{Field: "token", Message: "Incorrect token"}

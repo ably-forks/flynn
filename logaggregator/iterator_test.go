@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
 
 	. "github.com/flynn/go-check"
 )

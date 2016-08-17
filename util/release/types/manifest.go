@@ -113,7 +113,7 @@ type VagrantManifest struct {
 // The number of versions in the manifest is capped at the value of maxVersions.
 func (m *VagrantManifest) Add(version string, provider *VagrantProvider) {
 	// strip the leading "v" from the version as Vagrant only supports
-	// versions like X.Y.Z, see https://github.com/flynn/flynn/issues/2230
+	// versions like X.Y.Z, see https://github.com/ably-forks/flynn/issues/2230
 	version = strings.TrimPrefix(version, "v")
 
 	versions := make(sortVersions, 0, len(m.Versions)+1)

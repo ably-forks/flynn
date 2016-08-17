@@ -15,12 +15,12 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/bootstrap/discovery"
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/cluster"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/bootstrap/discovery"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/cluster"
+	"github.com/ably-forks/flynn/pkg/random"
 )
 
 type State struct {

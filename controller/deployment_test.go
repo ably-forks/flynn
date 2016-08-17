@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"time"
 
-	ct "github.com/flynn/flynn/controller/types"
-	hh "github.com/flynn/flynn/pkg/httphelper"
+	ct "github.com/ably-forks/flynn/controller/types"
+	hh "github.com/ably-forks/flynn/pkg/httphelper"
 	. "github.com/flynn/go-check"
 )
 

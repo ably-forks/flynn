@@ -4,7 +4,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/flynn/flynn/host/types"
+	"github.com/ably-forks/flynn/host/types"
 )
 
 type AttachRequest struct {

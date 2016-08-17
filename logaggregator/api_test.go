@@ -9,9 +9,9 @@ import (
 	"io/ioutil"
 	"time"
 
-	"github.com/flynn/flynn/logaggregator/client"
-	"github.com/flynn/flynn/pkg/syslog/rfc5424"
-	"github.com/flynn/flynn/pkg/typeconv"
+	"github.com/ably-forks/flynn/logaggregator/client"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc5424"
+	"github.com/ably-forks/flynn/pkg/typeconv"
 	. "github.com/flynn/go-check"
 )
 

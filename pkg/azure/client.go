@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/ably-forks/flynn/pkg/httphelper"
 	"github.com/flynn/oauth2"
 )
 

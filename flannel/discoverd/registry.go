@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/flannel/subnet"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/flannel/subnet"
 )
 
 // Network is stored in service metadata and contains both the config and list

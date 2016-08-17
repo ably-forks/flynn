@@ -8,11 +8,11 @@ import (
 	"os"
 	"sync"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/logaggregator/snapshot"
-	"github.com/flynn/flynn/logaggregator/utils"
-	"github.com/flynn/flynn/pkg/keepalive"
-	"github.com/flynn/flynn/pkg/syslog/rfc6587"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/logaggregator/snapshot"
+	"github.com/ably-forks/flynn/logaggregator/utils"
+	"github.com/ably-forks/flynn/pkg/keepalive"
+	"github.com/ably-forks/flynn/pkg/syslog/rfc6587"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/flynn/flynn/controller/client"
-	sirenia "github.com/flynn/flynn/pkg/sirenia/client"
+	"github.com/ably-forks/flynn/controller/client"
+	sirenia "github.com/ably-forks/flynn/pkg/sirenia/client"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

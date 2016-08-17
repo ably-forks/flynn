@@ -11,11 +11,11 @@ import (
 	"strings"
 	"text/template"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/host/types"
-	tc "github.com/flynn/flynn/test/cluster"
-	"github.com/flynn/flynn/updater/types"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/host/types"
+	tc "github.com/ably-forks/flynn/test/cluster"
+	"github.com/ably-forks/flynn/updater/types"
 	c "github.com/flynn/go-check"
 )
 
@@ -38,7 +38,7 @@ export TUF_SNAPSHOT_PASSPHRASE="flynn-test"
 export TUF_TIMESTAMP_PASSPHRASE="flynn-test"
 
 export GOPATH=~/go
-src="${GOPATH}/src/github.com/flynn/flynn"
+src="${GOPATH}/src/github.com/ably-forks/flynn"
 
 # send all output to stderr so only version.json is output to stdout
 (
@@ -48,10 +48,10 @@ src="${GOPATH}/src/github.com/flynn/flynn"
   # ideally we would use tup to do this, but it hangs waiting on the
   # FUSE socket after building, so for now we do it manually.
   #
-  # See https://github.com/flynn/flynn/issues/949
+  # See https://github.com/ably-forks/flynn/issues/949
   pushd "${src}" >/dev/null
   sed "s/{{TUF-ROOT-KEYS}}/$(tuf --dir test/release root-keys)/g" host/cli/root_keys.go.tmpl > host/cli/root_keys.go
-  vpkg="github.com/flynn/flynn/pkg/version"
+  vpkg="github.com/ably-forks/flynn/pkg/version"
   go build -o host/bin/flynn-host -ldflags="-X ${vpkg}.commit notdev -X ${vpkg}.branch dev -X ${vpkg}.tag v20160711.0-test -X ${vpkg}.dirty false" ./host
   gzip -9 --keep --force host/bin/flynn-host
   sed "s/{{FLYNN-HOST-CHECKSUM}}/$(sha512sum host/bin/flynn-host.gz | cut -d " " -f 1)/g" script/install-flynn.tmpl > script/install-flynn
@@ -95,7 +95,7 @@ bash -e /tmp/install-flynn -r "http://{{ .Blobstore }}"
 
 var updateScript = template.Must(template.New("update-script").Parse(`
 timeout --signal=QUIT --kill-after=10 10m bash -ex <<-SCRIPT
-cd ~/go/src/github.com/flynn/flynn
+cd ~/go/src/github.com/ably-forks/flynn
 tuf --dir test/release root-keys | tuf-client init --store /tmp/tuf.db http://{{ .Blobstore }}/tuf
 echo stable | sudo tee /etc/flynn/channel.txt
 flynn-host update --repository http://{{ .Blobstore }}/tuf --tuf-db /tmp/tuf.db

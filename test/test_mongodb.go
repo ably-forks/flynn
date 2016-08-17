@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	ct "github.com/flynn/flynn/controller/types"
+	ct "github.com/ably-forks/flynn/controller/types"
 	c "github.com/flynn/go-check"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"

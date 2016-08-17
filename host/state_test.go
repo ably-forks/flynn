@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/flynn/flynn/host/types"
+	"github.com/ably-forks/flynn/host/types"
 	. "github.com/flynn/go-check"
 )
 

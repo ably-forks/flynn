@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/flynn/flynn/installer"
+	"github.com/ably-forks/flynn/installer"
 	"github.com/flynn/go-docopt"
 )
 

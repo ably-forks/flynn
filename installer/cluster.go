@@ -16,12 +16,12 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/bootstrap/discovery"
-	cfg "github.com/flynn/flynn/cli/config"
-	cc "github.com/flynn/flynn/controller/client"
-	"github.com/flynn/flynn/controller/client/v1"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/router/types"
+	"github.com/ably-forks/flynn/bootstrap/discovery"
+	cfg "github.com/ably-forks/flynn/cli/config"
+	cc "github.com/ably-forks/flynn/controller/client"
+	"github.com/ably-forks/flynn/controller/client/v1"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/router/types"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -781,7 +781,7 @@ func (c *BaseCluster) migrateDomain(dm *ct.DomainMigration, t *TargetServer) (*c
 	}
 }
 
-// Workaround for https://github.com/flynn/flynn/issues/2987
+// Workaround for https://github.com/ably-forks/flynn/issues/2987
 // Make sure system apps are using correct cert
 func (c *BaseCluster) migrateDomainWorkaroundIssue2987(dm *ct.DomainMigration, t *TargetServer) error {
 	client, err := cc.NewClientWithHTTP(fmt.Sprintf("http://%s", t.IP), c.ControllerKey, &http.Client{Transport: &http.Transport{Dial: t.SSHClient.Dial}})

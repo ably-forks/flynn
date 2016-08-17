@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/controller/client"
-	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/discoverd/client"
-	sc "github.com/flynn/flynn/pkg/sirenia/client"
-	"github.com/flynn/flynn/pkg/sirenia/state"
+	"github.com/ably-forks/flynn/controller/client"
+	ct "github.com/ably-forks/flynn/controller/types"
+	"github.com/ably-forks/flynn/discoverd/client"
+	sc "github.com/ably-forks/flynn/pkg/sirenia/client"
+	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	c "github.com/flynn/go-check"
 )
 

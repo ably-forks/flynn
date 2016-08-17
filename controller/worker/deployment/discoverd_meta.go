@@ -1,8 +1,8 @@
 package deployment
 
 import (
-	ct "github.com/flynn/flynn/controller/types"
-	dd "github.com/flynn/flynn/discoverd/deployment"
+	ct "github.com/ably-forks/flynn/controller/types"
+	dd "github.com/ably-forks/flynn/discoverd/deployment"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 

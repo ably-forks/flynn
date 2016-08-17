@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/random"
+	"github.com/ably-forks/flynn/pkg/attempt"
+	"github.com/ably-forks/flynn/pkg/random"
 	"golang.org/x/crypto/ssh"
 )
 

@@ -7,9 +7,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/flynn/flynn/discoverd/client"
-	"github.com/flynn/flynn/pkg/httpclient"
-	tc "github.com/flynn/flynn/test/cluster"
+	"github.com/ably-forks/flynn/discoverd/client"
+	"github.com/ably-forks/flynn/pkg/httpclient"
+	tc "github.com/ably-forks/flynn/test/cluster"
 )
 
 type Client struct {

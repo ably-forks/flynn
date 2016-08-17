@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/flynn/flynn/blobstore/backend"
-	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/ably-forks/flynn/blobstore/backend"
+	"github.com/ably-forks/flynn/pkg/postgres"
 	"github.com/jackc/pgx"
 	"github.com/stevvooe/resumable"
 	"github.com/stevvooe/resumable/sha512"
