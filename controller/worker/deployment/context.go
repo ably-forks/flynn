@@ -10,7 +10,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/attempt"
 	"github.com/ably-forks/flynn/pkg/postgres"
 	"github.com/flynn/que-go"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 type context struct {

@@ -31,7 +31,7 @@ import (
 	"github.com/ably-forks/flynn/discoverd/client"
 	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	"github.com/ably-forks/flynn/pkg/sirenia/xlog"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 //TODO(jpg) There isn't really a reason for the simulator to use the postgres xlog

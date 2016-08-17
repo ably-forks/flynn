@@ -22,7 +22,7 @@ import (
 	"github.com/flynn/oauth2"
 	"github.com/julienschmidt/httprouter"
 	"github.com/pkg/browser"
-	log "gopkg.in/inconshreveable/log15.v2"
+	log "github.com/inconshreveable/log15"
 )
 
 type assetManifest struct {

@@ -15,7 +15,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/shutdown"
 	"github.com/ably-forks/flynn/router/schema"
 	"github.com/ably-forks/flynn/router/types"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 var logger = log15.New("app", "router")

@@ -6,7 +6,7 @@ import (
 
 	"github.com/ably-forks/flynn/controller/client"
 	sirenia "github.com/ably-forks/flynn/pkg/sirenia/client"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 // ScaleUp scales up a dormant Sirenia cluster

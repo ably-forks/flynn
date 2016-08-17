@@ -10,7 +10,7 @@ import (
 	"github.com/ably-forks/flynn/controller/utils"
 	"github.com/ably-forks/flynn/host/types"
 	"github.com/ably-forks/flynn/pkg/stream"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 type Host struct {

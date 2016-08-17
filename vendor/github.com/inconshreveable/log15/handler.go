@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"gopkg.in/inconshreveable/log15.v2/stack"
+	"github.com/inconshreveable/log15/stack"
 )
 
 // A Logger prints its log records by writing to a Handler.

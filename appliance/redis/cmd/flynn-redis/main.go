@@ -15,7 +15,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/keepalive"
 	"github.com/ably-forks/flynn/pkg/random"
 	"github.com/ably-forks/flynn/pkg/shutdown"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 const (

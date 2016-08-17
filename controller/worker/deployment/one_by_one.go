@@ -5,7 +5,7 @@ import (
 	"sort"
 
 	ct "github.com/ably-forks/flynn/controller/types"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 type WaitJobsFn func(releaseID string, expected ct.JobEvents, log log15.Logger) error

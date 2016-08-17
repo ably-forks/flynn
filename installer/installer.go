@@ -12,7 +12,7 @@ import (
 	"github.com/digitalocean/godo"
 	"github.com/ably-forks/flynn/pkg/httphelper"
 	"github.com/ably-forks/flynn/pkg/shutdown"
-	log "gopkg.in/inconshreveable/log15.v2"
+	log "github.com/inconshreveable/log15"
 )
 
 var ClusterNotFoundError = errors.New("Cluster not found")

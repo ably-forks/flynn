@@ -7,7 +7,7 @@ import (
 	discoverd "github.com/ably-forks/flynn/discoverd/client"
 	"github.com/ably-forks/flynn/pkg/shutdown"
 	"github.com/ably-forks/flynn/pkg/stream"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 const serviceName = "cluster-monitor"

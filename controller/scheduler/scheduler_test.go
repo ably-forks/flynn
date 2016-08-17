@@ -14,7 +14,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/random"
 	"github.com/ably-forks/flynn/pkg/typeconv"
 	. "github.com/flynn/go-check"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 func Test(t *testing.T) { TestingT(t) }

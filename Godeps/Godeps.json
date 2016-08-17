@@ -1189,17 +1189,17 @@
 			"Rev": "d8b0b1d421aa1cbf392c05869f8abbc669bb7066"
 		},
 		{
-			"ImportPath": "gopkg.in/inconshreveable/log15.v2",
+			"ImportPath": "github.com/inconshreveable/log15",
 			"Comment": "v2.7",
 			"Rev": "7cf5571b3b32a7c7b5605dc5ed8ad8fdbb2135f0"
 		},
 		{
-			"ImportPath": "gopkg.in/inconshreveable/log15.v2/stack",
+			"ImportPath": "github.com/inconshreveable/log15/stack",
 			"Comment": "v2.7",
 			"Rev": "7cf5571b3b32a7c7b5605dc5ed8ad8fdbb2135f0"
 		},
 		{
-			"ImportPath": "gopkg.in/inconshreveable/log15.v2/term",
+			"ImportPath": "github.com/inconshreveable/log15/term",
 			"Comment": "v2.7",
 			"Rev": "7cf5571b3b32a7c7b5605dc5ed8ad8fdbb2135f0"
 		},

@@ -17,7 +17,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/shutdown"
 	"github.com/ably-forks/flynn/pkg/status"
 	"github.com/flynn/que-go"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 const workerCount = 10

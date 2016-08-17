@@ -20,7 +20,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/sirenia/client"
 	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	"github.com/ably-forks/flynn/pkg/sirenia/xlog"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )

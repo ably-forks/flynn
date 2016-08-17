@@ -203,7 +203,7 @@ Logging
 
 pgx defines a simple logger interface. Connections optionally accept a logger
 that satisfies this interface. The log15 package
-(http://gopkg.in/inconshreveable/log15.v2) satisfies this interface and it is
+(http://github.com/inconshreveable/log15) satisfies this interface and it is
 simple to define adapters for other loggers. Set LogLevel to control logging
 verbosity.
 */

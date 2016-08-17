@@ -7,7 +7,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/httphelper"
 	"github.com/ably-forks/flynn/pkg/status"
 	"github.com/julienschmidt/httprouter"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 // Handler represents an HTTP handler for the redis process.

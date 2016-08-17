@@ -3,7 +3,7 @@ package deployment
 import (
 	ct "github.com/ably-forks/flynn/controller/types"
 	dd "github.com/ably-forks/flynn/discoverd/deployment"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 // deployDiscoverMeta does a one-by-one deployment but uses discoverd.Deployment

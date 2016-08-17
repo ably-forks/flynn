@@ -16,7 +16,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/httpclient"
 	hh "github.com/ably-forks/flynn/pkg/httphelper"
 	"github.com/ably-forks/flynn/pkg/stream"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 var ErrTimedOut = errors.New("discoverd: timed out waiting for instances")

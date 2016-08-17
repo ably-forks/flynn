@@ -22,7 +22,7 @@ import (
 
 	"github.com/ably-forks/flynn/discoverd/client"
 	"github.com/ably-forks/flynn/pkg/sirenia/xlog"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 type State struct {

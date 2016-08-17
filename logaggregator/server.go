@@ -13,7 +13,7 @@ import (
 	"github.com/ably-forks/flynn/logaggregator/utils"
 	"github.com/ably-forks/flynn/pkg/keepalive"
 	"github.com/ably-forks/flynn/pkg/syslog/rfc6587"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 type Server struct {

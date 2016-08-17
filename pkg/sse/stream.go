@@ -9,7 +9,7 @@ import (
 	"time"
 
 	hh "github.com/ably-forks/flynn/pkg/httphelper"
-	log "gopkg.in/inconshreveable/log15.v2"
+	log "github.com/inconshreveable/log15"
 )
 
 type identifier interface {

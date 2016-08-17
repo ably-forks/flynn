@@ -9,7 +9,7 @@ import (
 	"github.com/ably-forks/flynn/pkg/sirenia/state"
 	"github.com/ably-forks/flynn/pkg/status"
 	"github.com/julienschmidt/httprouter"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 func ServeHTTP(pg *Postgres, peer *state.Peer, hb discoverd.Heartbeater, log log15.Logger) error {
