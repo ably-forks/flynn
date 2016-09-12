@@ -23,7 +23,8 @@ type backendDialer interface {
 }
 
 var (
-	errNoBackends = errors.New("router: no backends available")
+	errNoBackends = proxyError{errors.New("router: no backends available")}
+	errTimeout    = proxyError{errors.New("router: timeout from all backends")}
 	errCanceled   = errors.New("router: backend connection canceled")
 
 	httpTransport = &http.Transport{
@@ -45,6 +46,15 @@ var (
 		KeepAlive: 30 * time.Second,
 	}
 )
+
+type proxyError struct {
+	error
+}
+
+func IsProxyError(err error) bool {
+	_, ok := err.(proxyError)
+	return ok
+}
 
 // BackendListFunc returns a slice of backend hosts (hostname:port).
 type BackendListFunc func(*http.Request) []string
@@ -92,6 +102,7 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 
 	stickyBackend := t.getStickyBackend(req)
 	backends := t.getOrderedBackends(stickyBackend, req)
+	allTimeout := len(backends) > 0
 	for i, backend := range backends {
 		req.URL.Host = backend
 		res, err := httpTransport.RoundTrip(req)
@@ -99,14 +110,17 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 			t.setStickyBackend(res, stickyBackend)
 			return res, nil
 		}
-		if _, ok := err.(dialErr); !ok {
-			l.Error("unretriable request error", "backend", backend, "err", err, "attempt", i)
-			return nil, err
+		if allTimeout && !strings.Contains(err.Error(), "timeout") {
+			allTimeout = false
 		}
 		l.Error("retriable dial error", "backend", backend, "err", err, "attempt", i)
 	}
-	l.Error("request failed", "status", "503", "num_backends", len(backends))
-	return nil, errNoBackends
+	status, err := 503, errNoBackends
+	if allTimeout {
+		status, err = 504, errTimeout
+	}
+	l.Error("request failed", "status", status, "num_backends", len(backends))
+	return nil, err
 }
 
 func (t *transport) Connect(ctx context.Context, l log15.Logger) (net.Conn, error) {
@@ -123,7 +137,11 @@ func (t *transport) UpgradeHTTP(req *http.Request, l log15.Logger) (*http.Respon
 	backends := t.getOrderedBackends(stickyBackend, req)
 	upconn, addr, err := dialTCP(context.Background(), l, backends)
 	if err != nil {
-		l.Error("dial failed", "status", "503", "num_backends", len(backends))
+		status := http.StatusServiceUnavailable
+		if err == errTimeout {
+			status = http.StatusGatewayTimeout
+		}
+		l.Error("dial failed", "status", status, "num_backends", len(backends))
 		return nil, nil, err
 	}
 	conn := &streamConn{bufio.NewReader(upconn), upconn}
@@ -146,6 +164,8 @@ func (t *transport) UpgradeHTTP(req *http.Request, l log15.Logger) (*http.Respon
 
 func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, string, error) {
 	donec := ctx.Done()
+
+	allTimeout := len(addrs) > 0
 	for i, addr := range addrs {
 		select {
 		case <-donec:
@@ -163,9 +183,16 @@ func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, str
 		if err == nil {
 			return conn, addr, nil
 		}
+		if allTimeout && !strings.Contains("timeout", err.Error()) {
+			allTimeout = false
+		}
 		l.Error("retriable dial error", "backend", addr, "err", err, "attempt", i)
 	}
-	return nil, "", errNoBackends
+	err := errNoBackends
+	if allTimeout {
+		err = errTimeout
+	}
+	return nil, "", err
 }
 
 func customDial(network, addr string) (net.Conn, error) {

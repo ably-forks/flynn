@@ -36,7 +36,16 @@ var (
 	}
 
 	serviceUnavailable = []byte("Service Unavailable\n")
+	gatewayTimeout     = []byte("Gateway Timeout\n")
 )
+
+// A ProxyErrorer is a ResponseWriter passed to ReverseProxy.ServeHTTP which
+// wants to be notified of proxying errors instead of just receiving them
+// as a HTTP status and body.
+type ProxyErrorer interface {
+	http.ResponseWriter
+	ProxyError(error)
+}
 
 // ReverseProxy is an HTTP Handler that takes an incoming request and
 // sends it to another server, proxying the response back to the
@@ -118,8 +127,16 @@ func (p *ReverseProxy) ServeHTTP(ctx context.Context, rw http.ResponseWriter, re
 
 	res, err := transport.RoundTrip(ctx, outreq, l)
 	if err != nil {
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		rw.Write(serviceUnavailable)
+		if v, ok := rw.(ProxyErrorer); ok {
+			v.ProxyError(err)
+		}
+		if err == errTimeout {
+			rw.WriteHeader(http.StatusGatewayTimeout)
+			rw.Write(gatewayTimeout)
+		} else {
+			rw.WriteHeader(http.StatusServiceUnavailable)
+			rw.Write(serviceUnavailable)
+		}
 		return
 	}
 	defer res.Body.Close()
@@ -167,6 +184,9 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 
 	res, uconn, err := transport.UpgradeHTTP(req, l)
 	if err != nil {
+		if v, ok := rw.(ProxyErrorer); ok {
+			v.ProxyError(err)
+		}
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		rw.Write(serviceUnavailable)
 		return
@@ -182,9 +202,16 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 
 	dconn, bufrw, err := rw.(http.Hijacker).Hijack()
 	if err != nil {
-		l.Error("error hijacking request", "err", err, "status", "503")
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		rw.Write(serviceUnavailable)
+		status, msg := http.StatusServiceUnavailable, serviceUnavailable
+		if err == errTimeout {
+			status, msg = http.StatusGatewayTimeout, gatewayTimeout
+		}
+		l.Error("error hijacking request", "err", err, "status", status)
+		if v, ok := rw.(ProxyErrorer); ok {
+			v.ProxyError(err)
+		}
+		rw.WriteHeader(status)
+		rw.Write(msg)
 		return
 	}
 	defer dconn.Close()
