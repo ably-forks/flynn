@@ -5,12 +5,17 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
-	"github.com/flynn/flynn/appliance/postgresql/state"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
+	sd "github.com/flynn/flynn/pkg/sirenia/discoverd"
+	"github.com/flynn/flynn/pkg/sirenia/state"
+	"gopkg.in/inconshreveable/log15.v2"
+)
+
+const (
+	pgIdKey = "POSTGRES_ID"
 )
 
 func main() {
@@ -43,7 +48,7 @@ func main() {
 	}
 	inst := &discoverd.Instance{
 		Addr: ":5432",
-		Meta: map[string]string{"POSTGRES_ID": id},
+		Meta: map[string]string{pgIdKey: id},
 	}
 	hb, err := discoverd.DefaultClient.RegisterInstance(serviceName, inst)
 	if err != nil {
@@ -57,17 +62,16 @@ func main() {
 		ID:           id,
 		Singleton:    singleton,
 		DataDir:      filepath.Join(dataDir, "db"),
-		BinDir:       "/usr/lib/postgresql/9.4/bin/",
+		BinDir:       "/usr/lib/postgresql/9.5/bin/",
 		Password:     password,
 		Logger:       log.New("component", "postgres"),
 		ExtWhitelist: true,
 		WaitUpstream: true,
-		// TODO(titanous) investigate this:
-		SHMType: "sysv", // the default on 9.4, 'posix' is not currently supported in our containers
+		SHMType:      "posix",
 	})
-	dd := NewDiscoverd(discoverd.DefaultClient.Service(serviceName), log.New("component", "discoverd"))
+	dd := sd.NewDiscoverd(discoverd.DefaultClient.Service(serviceName), log.New("component", "discoverd"))
 
-	peer := state.NewPeer(inst, id, singleton, dd, pg, log.New("component", "peer"))
+	peer := state.NewPeer(inst, id, pgIdKey, singleton, dd, pg, log.New("component", "peer"))
 	shutdown.BeforeExit(func() { peer.Close() })
 
 	go peer.Run()

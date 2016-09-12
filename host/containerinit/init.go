@@ -18,22 +18,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
-	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime/pprof"
 	"sync"
 	"syscall"
 	"time"
 
-	sigutil "github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/signal"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/libcontainer/netlink"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/libcontainer/user"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/kr/pty"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	sigutil "github.com/docker/docker/pkg/signal"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/discoverd/health"
 	"github.com/flynn/flynn/host/resource"
@@ -41,21 +40,24 @@ import (
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/rpcplus"
 	"github.com/flynn/flynn/pkg/rpcplus/fdrpc"
+	"github.com/kr/pty"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var logger log15.Logger
 
 type Config struct {
-	User      string
-	Gateway   string
-	WorkDir   string
-	IP        string
-	TTY       bool
-	OpenStdin bool
-	Env       map[string]string
-	Args      []string
-	Ports     []host.Port
-	Resources resource.Resources
+	User          string
+	Gateway       string
+	WorkDir       string
+	IP            string
+	TTY           bool
+	OpenStdin     bool
+	Env           map[string]string
+	Args          []string
+	Ports         []host.Port
+	Resources     resource.Resources
+	FileArtifacts []*host.Artifact
 }
 
 const SharedPath = "/.container-shared"
@@ -282,7 +284,7 @@ func (c *ContainerInit) StreamState(arg struct{}, stream rpcplus.Stream) error {
 		case change := <-ch:
 			select {
 			case stream.Send <- change:
-				log.Info("sent state change", "state", change.State, "err", change.Error, "exitStatus", change.ExitStatus)
+				log.Info("sent state change", "state", change.State)
 			case <-stream.Error:
 				return nil
 			}
@@ -294,7 +296,13 @@ func (c *ContainerInit) StreamState(arg struct{}, stream rpcplus.Stream) error {
 
 // Caller must hold lock
 func (c *ContainerInit) changeState(state State, err string, exitStatus int) {
-	logger.Info("changing state", "fn", "changeState", "state", state, "err", err, "exitStatus", exitStatus)
+	if err != "" {
+		logger.Info("changing state", "fn", "changeState", "state", state, "err", err)
+	} else if exitStatus != -1 {
+		logger.Info("changing state", "fn", "changeState", "state", state, "exitStatus", exitStatus)
+	} else {
+		logger.Info("changing state", "fn", "changeState", "state", state)
+	}
 
 	c.state = state
 	c.error = err
@@ -328,98 +336,28 @@ func runRPCServer() {
 	os.Exit(70)
 }
 
-func setupHostname(c *Config) error {
-	hostname := c.Env["HOSTNAME"]
-	if hostname == "" {
-		return nil
-	}
-	return syscall.Sethostname([]byte(hostname))
-}
-
-func setupNetworking(c *Config) error {
-	if c.IP == "" {
-		return nil
-	}
-
-	// loopback
-	iface, err := net.InterfaceByName("lo")
-	if err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-	if err := netlink.NetworkLinkUp(iface); err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-	if iface, err = net.InterfaceByName("eth0"); err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-	ip, ipNet, err := net.ParseCIDR(c.IP)
-	if err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-	if err := netlink.NetworkLinkAddIp(iface, ip, ipNet); err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-	if c.Gateway != "" {
-		if err := netlink.AddDefaultGw(c.Gateway, "eth0"); err != nil {
-			return fmt.Errorf("Unable to set up networking: %v", err)
-		}
-	}
-	if err := netlink.NetworkLinkUp(iface); err != nil {
-		return fmt.Errorf("Unable to set up networking: %v", err)
-	}
-
-	return nil
-}
-
-func getCredential(c *Config) (*syscall.Credential, error) {
-	if c.User == "" {
-		return nil, nil
-	}
-	users, err := user.ParsePasswdFileFilter("/etc/passwd", func(u user.User) bool {
-		return u.Name == c.User
-	})
-	if err != nil || len(users) == 0 {
-		if err == nil {
-			err = errors.New("unknown user")
-		}
-		return nil, fmt.Errorf("Unable to find user %v: %v", c.User, err)
-	}
-
-	return &syscall.Credential{Uid: uint32(users[0].Uid), Gid: uint32(users[0].Gid)}, nil
-}
-
 func setupCommon(c *Config, log log15.Logger) error {
-	if err := setupHostname(c); err != nil {
-		return err
+	// fetch file artifacts in parallel now that the network is configured
+	fetchErr := make(chan error)
+	for _, artifact := range c.FileArtifacts {
+		go func(artifact *host.Artifact) {
+			log.Info("fetching artifact", "uri", artifact.URI)
+			if err := fetchFileArtifact(artifact); err != nil {
+				log.Error("error fetching artifact", "uri", artifact.URI, "err", err)
+				fetchErr <- err
+				return
+			}
+			log.Info("finished fetching artifact", "uri", artifact.URI)
+			fetchErr <- nil
+		}(artifact)
 	}
-
-	if err := setupNetworking(c); err != nil {
-		return err
-	}
-
-	setupLimits(c, log)
-
-	return nil
-}
-
-const RLIMIT_NPROC = 6
-
-func setupLimits(c *Config, log log15.Logger) {
-	setrlimit := func(resource int, soft, hard int64) {
-		if err := syscall.Setrlimit(resource, &syscall.Rlimit{Max: uint64(hard), Cur: uint64(soft)}); err != nil {
-			log.Error("error setting rlimit", "err", err)
+	for range c.FileArtifacts {
+		if err := <-fetchErr; err != nil {
+			return err
 		}
 	}
 
-	if spec, ok := c.Resources[resource.TypeMaxFD]; ok && spec.Limit != nil && spec.Request != nil {
-		log.Info(fmt.Sprintf("setting max fd limit to %d / %d", *spec.Request, *spec.Limit))
-		setrlimit(syscall.RLIMIT_NOFILE, *spec.Request, *spec.Limit)
-	}
-
-	if spec, ok := c.Resources[resource.TypeMaxProcs]; ok && spec.Limit != nil && spec.Request != nil {
-		log.Info(fmt.Sprintf("setting max processes limit to %d / %d", *spec.Request, *spec.Limit))
-		setrlimit(RLIMIT_NPROC, *spec.Request, *spec.Limit)
-	}
+	return nil
 }
 
 func getCmdPath(c *Config) (string, error) {
@@ -445,6 +383,7 @@ func getCmdPath(c *Config) (string, error) {
 func monitor(port host.Port, container *ContainerInit, env map[string]string, log log15.Logger) (discoverd.Heartbeater, error) {
 	config := port.Service
 	client := discoverd.NewClientWithURL(env["DISCOVERD"])
+	client.Logger = logger.New("component", "discoverd")
 
 	if config.Create {
 		// TODO: maybe reuse maybeAddService() from the client
@@ -500,8 +439,10 @@ func monitor(port host.Port, container *ContainerInit, env map[string]string, lo
 		Monitor: health.Monitor{
 			Interval:  config.Check.Interval,
 			Threshold: config.Check.Threshold,
+			Logger:    log.New("component", "monitor"),
 		}.Run,
-		Check: check,
+		Check:  check,
+		Logger: log,
 	}
 
 	if config.Check.KillDown {
@@ -580,6 +521,30 @@ func babySit(process *os.Process) int {
 	return wstatus.ExitStatus()
 }
 
+// fetchFileArtifact fetches a file from an artifact URI and places it in
+// /artifacts
+func fetchFileArtifact(artifact *host.Artifact) error {
+	if err := os.MkdirAll("/artifacts", 0755); err != nil {
+		return err
+	}
+	path := filepath.Join("/artifacts", filepath.Base(artifact.URI))
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	res, err := http.Get(artifact.URI)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected HTTP status code: %s", res.Status)
+	}
+	_, err = io.Copy(file, res.Body)
+	return err
+}
+
 // Run as pid 1 and monitor the contained process to return its exit code.
 func containerInitApp(c *Config, logFile *os.File) error {
 	log := logger.New("fn", "containerInitApp")
@@ -641,6 +606,12 @@ func containerInitApp(c *Config, logFile *os.File) error {
 		cmd.Stderr, init.stderr, err = newSocketPair("stderr")
 		if err != nil {
 			log.Error("error creating stderr pipe", "err", err)
+			return err
+		}
+
+		log.Info("creating FD proxies")
+		if err := createFDProxies(cmd); err != nil {
+			log.Error("error creating FD proxies", "err", err)
 			return err
 		}
 
@@ -730,6 +701,49 @@ func newSocketPair(name string) (*os.File, *os.File, error) {
 	return os.NewFile(uintptr(pair[0]), name), os.NewFile(uintptr(pair[1]), name), nil
 }
 
+// createFDProxies creates pipes at /dev/stdout and /dev/stderr and copies data
+// written to them to the job's stdout and stderr streams respectively.
+//
+// This is necessary (rather than just symlinking those paths to /proc/self/fd/{1,2})
+// because the standard streams are sockets, and calling open(2) on a socket
+// leads to an ENXIO error (see http://marc.info/?l=ast-users&m=120978595414993).
+func createFDProxies(cmd *exec.Cmd) error {
+	for path, dst := range map[string]*os.File{
+		"/dev/stdout": cmd.Stdout.(*os.File),
+		"/dev/stderr": cmd.Stderr.(*os.File),
+	} {
+		os.Remove(path)
+		if err := syscall.Mkfifo(path, 0666); err != nil {
+			return err
+		}
+		pipe, err := os.OpenFile(path, os.O_RDWR, os.ModeNamedPipe)
+		if err != nil {
+			return err
+		}
+		go func(dst *os.File) {
+			defer pipe.Close()
+			for {
+				// copy data from the pipe to dst using splice(2) (rather than io.Copy)
+				// to avoid a needless copy through user space
+				n, err := syscall.Splice(int(pipe.Fd()), nil, int(dst.Fd()), nil, 65535, 0)
+				if err != nil || n == 0 {
+					return
+				}
+			}
+		}(dst)
+	}
+	return nil
+}
+
+// print a full goroutine stack trace to the log fd on SIGUSR2
+func debugStackPrinter(out io.Writer) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR2)
+	for range c {
+		pprof.Lookup("goroutine").WriteTo(out, 1)
+	}
+}
+
 // This code is run INSIDE the container and is responsible for setting
 // up the environment before running the actual process
 func Main() {
@@ -737,6 +751,7 @@ func Main() {
 	if err != nil {
 		os.Exit(70)
 	}
+	go debugStackPrinter(logW)
 
 	logger = log15.New("app", "containerinit")
 	logger.SetHandler(log15.StreamHandler(logW, log15.LogfmtFormat()))

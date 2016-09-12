@@ -2,14 +2,15 @@ package discoverd
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/flynn/flynn/pkg/attempt"
 	hh "github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/random"
 )
 
 // EnvInstanceMeta are environment variables which will be automatically added
@@ -28,13 +29,18 @@ type Heartbeater interface {
 	SetClient(*Client)
 }
 
+var runAttempts = attempt.Strategy{
+	Min:   5,
+	Total: 60 * time.Second,
+	Delay: 200 * time.Millisecond,
+}
+
 func (c *Client) maybeAddService(service string) error {
-	if err := c.AddService(service, nil); err != nil {
-		if !hh.IsObjectExistsError(err) {
-			return err
-		}
+	err := c.AddService(service, nil)
+	if hh.IsObjectExistsError(err) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 func (c *Client) AddServiceAndRegister(service, addr string) (Heartbeater, error) {
@@ -73,9 +79,16 @@ func (c *Client) RegisterInstance(service string, inst *Instance) (Heartbeater, 
 		inst.Meta[kv[0]] = kv[1]
 	}
 	h := newHeartbeater(c, service, inst)
-	firstErr := make(chan error)
-	go h.run(firstErr)
-	return h, <-firstErr
+	err := runAttempts.Run(func() error {
+		firstErr := make(chan error)
+		go h.run(firstErr)
+		return <-firstErr
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return h, nil
 }
 
 func newHeartbeater(c *Client, service string, inst *Instance) *heartbeater {
@@ -115,7 +128,7 @@ func (h *heartbeater) SetMeta(meta map[string]string) error {
 	h.Lock()
 	defer h.Unlock()
 	h.inst.Meta = meta
-	return h.client().c.Put(fmt.Sprintf("/services/%s/instances/%s", h.service, h.inst.ID), h.inst, nil)
+	return h.client().Put(fmt.Sprintf("/services/%s/instances/%s", h.service, h.inst.ID), h.inst, nil)
 }
 
 func (h *heartbeater) Addr() string {
@@ -132,6 +145,7 @@ func (h *heartbeater) client() *Client {
 
 const (
 	heartbeatInterval        = 5 * time.Second
+	heartbeatJitter          = 2 * time.Second
 	heartbeatFailingInterval = 200 * time.Millisecond
 )
 
@@ -140,7 +154,7 @@ func (h *heartbeater) run(firstErr chan<- error) {
 	register := func() error {
 		h.Lock()
 		defer h.Unlock()
-		return h.client().c.Put(path, h.inst, nil)
+		return h.client().Put(path, h.inst, nil)
 	}
 
 	err := register()
@@ -148,18 +162,18 @@ func (h *heartbeater) run(firstErr chan<- error) {
 	if err != nil {
 		return
 	}
-	timer := time.NewTimer(heartbeatInterval)
+	timer := time.NewTimer(nextHeartbeat())
 	for {
 		select {
 		case <-timer.C:
 			if err := register(); err != nil {
-				log.Printf("discoverd: heartbeat %s (%s) failed: %s", h.service, h.inst.Addr, err)
-				timer.Reset(heartbeatFailingInterval)
+				h.client().Logger.Error("heartbeat failed", "service", h.service, "addr", h.inst.Addr, "err", err)
+				timer.Reset(nextHeartbeatFailing())
 				break
 			}
-			timer.Reset(heartbeatInterval)
+			timer.Reset(nextHeartbeat())
 		case <-h.stop:
-			h.client().c.Delete(path)
+			h.client().Delete(path)
 			close(h.done)
 			return
 		}
@@ -171,4 +185,12 @@ func expandAddr(addr string) string {
 		return os.Getenv("EXTERNAL_IP") + addr
 	}
 	return addr
+}
+
+func nextHeartbeat() time.Duration {
+	return heartbeatInterval - time.Duration(random.Math.Int63n(int64(heartbeatJitter)))
+}
+
+func nextHeartbeatFailing() time.Duration {
+	return heartbeatFailingInterval + time.Duration(random.Math.Int63n(int64(heartbeatFailingInterval)))
 }

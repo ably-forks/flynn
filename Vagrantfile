@@ -29,6 +29,18 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.box_url = "https://dl.flynn.io/vagrant/flynn-base.json"
   config.vm.box_version = "> 0"
 
+  config.vm.synced_folder ".", "/home/vagrant/go/src/github.com/flynn/flynn", create: true, group: "vagrant", owner: "vagrant"
+
+  if Vagrant.has_plugin?("vagrant-vbguest")
+    # vagrant-vbguest can cause the VM to not start: https://github.com/flynn/flynn/issues/2874
+    config.vbguest.auto_update = false
+  end
+
+  # Override locale settings. Avoids host locale settings being sent via SSH
+  ENV['LC_ALL']="en_US.UTF-8"
+  ENV['LANG']="en_US.UTF-8"
+  ENV['LANGUAGE']="en_US.UTF-8"
+
   # VAGRANT_MEMORY          - instance memory, in MB
   # VAGRANT_CPUS            - instance virtual CPUs
   config.vm.provider "virtualbox" do |v, override|
@@ -87,8 +99,8 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.provision "shell", privileged: false, inline: <<-SCRIPT
     grep '^export GOPATH' ~/.bashrc || echo export GOPATH=~/go >> ~/.bashrc
     grep '^export DISCOVERD' ~/.bashrc || echo export DISCOVERD="192.0.2.200:1111" >> ~/.bashrc
-    grep '^export PATH' ~/.bashrc || echo export PATH=\\\$PATH:~/go/bin:~/go/src/github.com/flynn/flynn/discoverd/bin:/vagrant/script >> ~/.bashrc
-    GOPATH=~/go go get github.com/tools/godep
+    grep '^export GOROOT' ~/.bashrc || echo export GOROOT=~/go/src/github.com/flynn/flynn/util/_toolchain/go >> ~/.bashrc
+    grep '^export PATH' ~/.bashrc || echo export PATH=~/go/bin:~/go/src/github.com/flynn/flynn/util/_toolchain/go/bin:~/go/src/github.com/flynn/flynn/discoverd/bin:~/go/src/github.com/flynn/flynn/cli/bin:~/go/src/github.com/flynn/flynn/host/bin:~/go/src/github.com/flynn/flynn/script:\\\$PATH: >> ~/.bashrc
 
     # For script unit tests
     tmpdir=$(mktemp --directory)
@@ -98,12 +110,18 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     sudo curl -sLo "/usr/local/bin/jq" "http://stedolan.github.io/jq/download/linux64/jq"
     sudo chmod +x "/usr/local/bin/jq"
 
-    # For controller tests
-    curl --fail --silent https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-    sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ trusty-pgdg main" >> /etc/apt/sources.list.d/postgresql.list'
+    # Database dependencies - postgres, mariadb + percona xtrabackup, mongodb, redis
+    sudo apt-key adv --recv-keys --keyserver hkp://keyserver.ubuntu.com:80 ACCC4CF8 1BB943DB CD2EFD2A EA312927 C7917B12
+    sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ trusty-pgdg main" > /etc/apt/sources.list.d/postgresql.list'
+    sudo sh -c 'echo "deb http://mirrors.syringanetworks.net/mariadb/repo/10.1/ubuntu trusty main" > /etc/apt/sources.list.d/mariadb.list'
+    sudo sh -c 'echo "deb http://repo.percona.com/apt trusty main" > /etc/apt/sources.list.d/percona.list'
+    sudo sh -c 'echo "deb http://repo.mongodb.org/apt/ubuntu trusty/mongodb-org/3.2 multiverse" > /etc/apt/sources.list.d/mongodb.list'
+    sudo sh -c 'echo "deb http://ppa.launchpad.net/chris-lea/redis-server/ubuntu trusty main" > /etc/apt/sources.list.d/redis.list'
     sudo apt-get update
-    sudo apt-get install -y postgresql-9.4 postgresql-contrib-9.4
-    sudo -u postgres createuser --superuser vagrant
+    sudo sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-9.5 postgresql-contrib-9.5 mariadb-server percona-xtrabackup mongodb-org redis-server'
+
+    # Setup postgres for controller unit tests
+    sudo -u postgres createuser --superuser vagrant || true
     grep '^export PGHOST' ~/.bashrc || echo export PGHOST=/var/run/postgresql >> ~/.bashrc
 
     # For integration tests.
@@ -113,9 +131,12 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     git config --global user.email "flynn.dev@example.com"
     git config --global user.name "Flynn Dev"
 
-    mkdir -p ~/go/src/github.com/flynn
-    ln -s /vagrant ~/go/src/github.com/flynn/flynn
     grep ^cd ~/.bashrc || echo cd ~/go/src/github.com/flynn/flynn >> ~/.bashrc
+    sudo chown -R vagrant:vagrant ~/go
+
+    # enable docker
+    sudo rm -f /etc/init/docker.override
+    sudo start docker || true
   SCRIPT
 
   if File.exists?("script/custom-vagrant")

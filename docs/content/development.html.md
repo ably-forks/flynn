@@ -51,12 +51,12 @@ From now on, it is assumed that commands will be run inside the VM, unless other
 ## Making code changes
 
 The development VM is configured to share the Flynn source code from your machine and mount
-it at `/vagrant`, meaning you can edit files locally on your machine and those changes
+it inside the VM, meaning you can edit files locally on your machine and those changes
 will be visible inside the VM.
 
 Since Flynn is primarily written in Go, the source code needs to be inside a valid Go workspace.
-The development VM has a `GOPATH` of `$HOME/go` and the Flynn source code is symlinked from
-`/vagrant` to `$GOPATH/src/github.com/flynn/flynn`.
+The development VM has a `GOPATH` of `$HOME/go` and the Flynn source code is synchronized into
+`$GOPATH/src/github.com/flynn/flynn`.
 
 If you don't have a specific issue you are trying to fix, but are interested in contributing
 to the project, you should start by looking at GitHub issues labelled
@@ -104,8 +104,7 @@ than that of the `eth0` device, the script provides some options for doing so.
 See `script/bootstrap-flynn -h` for a full list of supported options.
 
 Once Flynn is running, you can add the cluster to the `flynn` CLI tool using the
-bootstrap output, and then try out your changes (e.g. by following [this guide]
-(https://github.com/flynn/flynn#trying-it-out)).
+bootstrap output, and then try out your changes.
 
 ## Debugging
 

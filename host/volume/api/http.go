@@ -6,12 +6,12 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
 	"github.com/flynn/flynn/host/volume"
 	"github.com/flynn/flynn/host/volume/manager"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/julienschmidt/httprouter"
 )
 
 const snapshotContentType = "application/vnd.zfs.snapshot-stream"
@@ -63,7 +63,7 @@ func (api *HTTPAPI) CreateProvider(w http.ResponseWriter, r *http.Request, ps ht
 
 	if err := api.vman.AddProvider(pspec.ID, provider); err != nil {
 		switch err {
-		case volumemanager.ProviderAlreadyExists:
+		case volumemanager.ErrProviderExists:
 			httphelper.ObjectExistsError(w, fmt.Sprintf("provider %q already exists", pspec.ID))
 			return
 		default:
@@ -79,9 +79,15 @@ func (api *HTTPAPI) Create(w http.ResponseWriter, r *http.Request, ps httprouter
 	providerID := ps.ByName("provider_id")
 
 	vol, err := api.vman.NewVolumeFromProvider(providerID)
-	if err == volumemanager.NoSuchProvider {
-		httphelper.ObjectNotFoundError(w, fmt.Sprintf("no volume provider with id %q", providerID))
-		return
+	if err != nil {
+		switch err {
+		case volumemanager.ErrNoSuchProvider:
+			httphelper.ObjectNotFoundError(w, fmt.Sprintf("no volume provider with id %q", providerID))
+			return
+		default:
+			httphelper.Error(w, err)
+			return
+		}
 	}
 
 	httphelper.JSON(w, 200, vol.Info())
@@ -112,7 +118,7 @@ func (api *HTTPAPI) Destroy(w http.ResponseWriter, r *http.Request, ps httproute
 	err := api.vman.DestroyVolume(volumeID)
 	if err != nil {
 		switch err {
-		case volumemanager.NoSuchVolume:
+		case volumemanager.ErrNoSuchVolume:
 			httphelper.ObjectNotFoundError(w, fmt.Sprintf("no volume with id %q", volumeID))
 			return
 		default:
@@ -129,7 +135,7 @@ func (api *HTTPAPI) Snapshot(w http.ResponseWriter, r *http.Request, ps httprout
 	snap, err := api.vman.CreateSnapshot(volumeID)
 	if err != nil {
 		switch err {
-		case volumemanager.NoSuchVolume:
+		case volumemanager.ErrNoSuchVolume:
 			httphelper.ObjectNotFoundError(w, fmt.Sprintf("no volume with id %q", volumeID))
 			return
 		default:
@@ -195,7 +201,7 @@ func (api *HTTPAPI) Send(w http.ResponseWriter, r *http.Request, ps httprouter.P
 	err := api.vman.SendSnapshot(volumeID, haves, w)
 	if err != nil {
 		switch err {
-		case volumemanager.NoSuchVolume:
+		case volumemanager.ErrNoSuchVolume:
 			httphelper.ObjectNotFoundError(w, fmt.Sprintf("no volume with id %q", volumeID))
 			return
 		default:

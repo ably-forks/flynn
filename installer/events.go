@@ -5,18 +5,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/cznic/ql"
+	"github.com/cznic/ql"
 	"github.com/flynn/flynn/pkg/random"
 )
 
-func (prompt *Prompt) Resolve(res *Prompt) {
+func (prompt *Prompt) Resolve(res *Prompt) error {
 	prompt.Resolved = true
 	prompt.resChan <- res
+	if prompt.Type == PromptTypeFile {
+		return <-prompt.errChan
+	}
+	return nil
 }
 
 func (event *Event) EventID() string {
@@ -29,10 +34,13 @@ type Subscription struct {
 	DoneChan    chan struct{}
 
 	isLocked      bool
+	isLockedMtx   sync.Mutex
 	sendEventsMtx sync.Mutex
 }
 
 func (sub *Subscription) SendEvents(i *Installer) {
+	sub.isLockedMtx.Lock()
+	defer sub.isLockedMtx.Unlock()
 	if sub.isLocked {
 		return
 	}
@@ -78,8 +86,8 @@ func (i *Installer) Unsubscribe(sub *Subscription) {
 
 func (i *Installer) processEvent(event *Event) bool {
 	var err error
-	if event.Type == "log" {
-		if c, err := i.FindBaseCluster(event.ClusterID); err != nil || (err == nil && c.State == "running") {
+	if event.Type == "log" || event.Type == "progress" {
+		if c, err := i.FindBaseCluster(event.ClusterID); err != nil || (err == nil && c.getState() == "running") {
 			return false
 		}
 	}
@@ -94,10 +102,12 @@ func (i *Installer) processEvent(event *Event) bool {
 	case "":
 	case "prompt":
 		p := &Prompt{}
-		if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&p.ID, &p.Type, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
+		var pType string
+		if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1 AND DeletedAt IS NULL`, event.ResourceID).Scan(&p.ID, &pType, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
 			i.logger.Debug(fmt.Sprintf("GetEventsSince Prompt Scan Error: %s", err.Error()))
 			return false
 		}
+		p.Type = PromptType(pType)
 		event.Resource = p
 	case "credential":
 		if event.Type == "new_credential" {
@@ -117,6 +127,8 @@ func (i *Installer) processEvent(event *Event) bool {
 }
 
 func (i *Installer) GetEventsSince(eventID string) []*Event {
+	i.eventsMtx.RLock()
+	defer i.eventsMtx.RUnlock()
 	events := make([]*Event, 0, len(i.events))
 	var ts time.Time
 	if eventID != "" {
@@ -184,7 +196,7 @@ func (i *Installer) SendEvent(event *Event) {
 		i.logger.Info(fmt.Sprintf("Event: %s: %s", event.Type, event.Description))
 	}
 
-	err := i.dbInsertItem("events", event)
+	err := i.dbInsertItem("events", event, nil)
 	if err != nil {
 		i.logger.Debug(fmt.Sprintf("SendEvent dbInsertItem error: %s", err.Error()))
 	}
@@ -193,9 +205,11 @@ func (i *Installer) SendEvent(event *Event) {
 	i.events = append(i.events, event)
 	i.eventsMtx.Unlock()
 
+	i.subscribeMtx.Lock()
 	for _, sub := range i.subscriptions {
 		go sub.SendEvents(i)
 	}
+	i.subscribeMtx.Unlock()
 }
 
 func (c *BaseCluster) findPrompt(id string) (*Prompt, error) {
@@ -206,9 +220,13 @@ func (c *BaseCluster) findPrompt(id string) (*Prompt, error) {
 }
 
 func (c *BaseCluster) sendPrompt(prompt *Prompt) *Prompt {
+	c.promptMtx.Lock()
+	defer c.promptMtx.Unlock()
 	c.pendingPrompt = prompt
 
-	if err := c.installer.dbInsertItem("prompts", prompt); err != nil {
+	if err := c.installer.dbInsertItem("prompts", prompt, map[string]interface{}{
+		"Type": "", // PromptType -> string
+	}); err != nil {
 		c.installer.logger.Debug(fmt.Sprintf("sendPrompt db insert error: %s", err.Error()))
 	}
 
@@ -235,7 +253,9 @@ func (c *BaseCluster) sendPrompt(prompt *Prompt) *Prompt {
 		Resource:  prompt,
 	})
 
-	return res
+	prompt.File = res.File
+	prompt.FileSize = res.FileSize
+	return prompt
 }
 
 func (c *BaseCluster) dbUpdatePrompt(prompt *Prompt) error {
@@ -245,11 +265,11 @@ func (c *BaseCluster) dbUpdatePrompt(prompt *Prompt) error {
 	return c.installer.txExec(`UPDATE prompts SET Resolved = $1, Yes = $2, Input = $3 WHERE ID == $4`, prompt.Resolved, prompt.Yes, prompt.Input, prompt.ID)
 }
 
-func (i *Installer) dbInsertItem(tableName string, item interface{}) error {
+func (i *Installer) dbInsertItem(tableName string, item interface{}, typeMap map[string]interface{}) error {
 	i.dbMtx.Lock()
 	defer i.dbMtx.Unlock()
 
-	fields, err := i.dbMarshalItem(tableName, item)
+	fields, err := i.dbMarshalItem(tableName, item, typeMap)
 	if err != nil {
 		return err
 	}
@@ -267,8 +287,9 @@ func (i *Installer) dbInsertItem(tableName string, item interface{}) error {
 	return i.txExec(list.String(), fields...)
 }
 
-func (c *BaseCluster) prompt(typ, msg string) *Prompt {
-	if c.State != "starting" && c.State != "deleting" {
+func (c *BaseCluster) prompt(typ PromptType, msg string) *Prompt {
+	state := c.getState()
+	if state != "starting" && state != "deleting" {
 		return &Prompt{}
 	}
 	res := c.sendPrompt(&Prompt{
@@ -276,13 +297,14 @@ func (c *BaseCluster) prompt(typ, msg string) *Prompt {
 		Type:    typ,
 		Message: msg,
 		resChan: make(chan *Prompt),
+		errChan: make(chan error),
 		cluster: c,
 	})
 	return res
 }
 
 func (c *BaseCluster) YesNoPrompt(msg string) bool {
-	res := c.prompt("yes_no", msg)
+	res := c.prompt(PromptTypeYesNo, msg)
 	return res.Yes
 }
 
@@ -302,28 +324,28 @@ func (c *BaseCluster) ChoicePrompt(choice Choice) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	res := c.prompt("choice", string(data))
+	res := c.prompt(PromptTypeChoice, string(data))
 	return res.Input, nil
 }
 
 func (c *BaseCluster) CredentialPrompt(msg string) string {
-	res := c.prompt("credential", msg)
+	res := c.prompt(PromptTypeCredential, msg)
 	return res.Input
 }
 
 func (c *BaseCluster) PromptInput(msg string) string {
-	res := c.prompt("input", msg)
+	res := c.prompt(PromptTypeInput, msg)
 	return res.Input
 }
 
 func (c *BaseCluster) PromptProtectedInput(msg string) string {
-	res := c.prompt("protected_input", msg)
+	res := c.prompt(PromptTypeProtectedInput, msg)
 	return res.Input
 }
 
-func (c *BaseCluster) PromptFileInput(msg string) string {
-	res := c.prompt("file", msg)
-	return res.Input
+func (c *BaseCluster) PromptFileInput(msg string) (int, io.Reader, chan<- error) {
+	res := c.prompt(PromptTypeFile, msg)
+	return res.FileSize, res.File, res.errChan
 }
 
 func (c *BaseCluster) sendEvent(event *Event) {
@@ -338,6 +360,24 @@ func (c *BaseCluster) SendLog(description string) {
 	})
 }
 
+type ProgressEvent struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Percent     int    `json:"percent"`
+}
+
+func (c *BaseCluster) SendProgress(event *ProgressEvent) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		panic(err)
+	}
+	c.sendEvent(&Event{
+		Type:        "progress",
+		ClusterID:   c.ID,
+		Description: string(data),
+	})
+}
+
 func (c *BaseCluster) SendError(err error) {
 	c.sendEvent(&Event{
 		Type:        "error",
@@ -347,7 +387,7 @@ func (c *BaseCluster) SendError(err error) {
 }
 
 func (c *BaseCluster) handleDone() {
-	if c.State != "running" {
+	if c.getState() != "running" {
 		return
 	}
 	c.sendEvent(&Event{

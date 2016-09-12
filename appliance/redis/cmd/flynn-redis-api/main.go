@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -8,9 +9,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
@@ -18,6 +18,8 @@ import (
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/resource"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/julienschmidt/httprouter"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -96,8 +98,7 @@ func (m *Main) ParseFlags(args []string) error {
 	if port := os.Getenv("PORT"); port != "" {
 		m.Addr = ":" + port
 	}
-
-	m.Handler.RedisImageURI = os.Getenv("REDIS_IMAGE_URI")
+	m.Handler.RedisImageID = os.Getenv("REDIS_IMAGE_ID")
 
 	// Connect to controller.
 	client, err := controller.NewClient("", os.Getenv("CONTROLLER_KEY"))
@@ -157,10 +158,9 @@ type Handler struct {
 	ServiceName string
 
 	// Key used to access the controller.
-	ControllerClient *controller.Client
+	ControllerClient controller.Client
 
-	// URI of the flynn/redis appliance.
-	RedisImageURI string
+	RedisImageID string
 
 	Logger log15.Logger
 }
@@ -181,13 +181,6 @@ func NewHandler() *Handler {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) { h.router.ServeHTTP(w, req) }
 
 func (h *Handler) servePostCluster(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
-	artifact := &ct.Artifact{Type: "docker", URI: h.RedisImageURI}
-	if err := h.ControllerClient.CreateArtifact(artifact); err != nil {
-		h.Logger.Error("error creating artifact:", "err", err)
-		httphelper.Error(w, err)
-		return
-	}
-
 	// Generate a password for the redis instance to use.
 	password := random.String(PasswordLength)
 
@@ -195,22 +188,22 @@ func (h *Handler) servePostCluster(w http.ResponseWriter, req *http.Request, _ h
 	serviceName := "redis-" + random.UUID()
 
 	release := &ct.Release{
-		ArtifactID: artifact.ID,
-		Meta:       make(map[string]string),
+		ArtifactIDs: []string{h.RedisImageID},
+		Meta:        make(map[string]string),
 		Processes: map[string]ct.ProcessType{
 			"redis": {
 				Ports: []ct.Port{
 					{Port: 6379, Proto: "tcp"},
 					{Port: 6380, Proto: "tcp"},
 				},
-				Data: true,
-				Cmd:  []string{"redis"},
-				Env: map[string]string{
-					"FLYNN_REDIS":    serviceName,
-					"REDIS_PASSWORD": password,
-				},
-				Service: "redis",
+				Data:    true,
+				Args:    []string{"/bin/start-flynn-redis", "redis"},
+				Service: serviceName,
 			},
+		},
+		Env: map[string]string{
+			"FLYNN_REDIS":    serviceName,
+			"REDIS_PASSWORD": password,
 		},
 	}
 
@@ -225,7 +218,7 @@ func (h *Handler) servePostCluster(w http.ResponseWriter, req *http.Request, _ h
 		return
 	}
 
-	h.Logger.Info("creating release", "artifact.id", artifact.ID)
+	h.Logger.Info("creating release", "artifact.id", h.RedisImageID)
 	if err := h.ControllerClient.CreateRelease(release); err != nil {
 		h.Logger.Error("error creating release", "err", err)
 		httphelper.Error(w, err)
@@ -246,13 +239,15 @@ func (h *Handler) servePostCluster(w http.ResponseWriter, req *http.Request, _ h
 	h.Logger.Info("formation", "formation", fmt.Sprintf("%#v", formation))
 
 	h.Logger.Info("deploying app release", "release.ID", release.ID)
-	if err := h.ControllerClient.DeployAppRelease(app.ID, release.ID); err != nil {
+	timeoutCh := make(chan struct{})
+	time.AfterFunc(5*time.Minute, func() { close(timeoutCh) })
+	if err := h.ControllerClient.DeployAppRelease(app.ID, release.ID, timeoutCh); err != nil {
 		h.Logger.Error("error deploying release", "err", err)
 		httphelper.Error(w, err)
 		return
 	}
 
-	host := fmt.Sprintf("%s.discoverd", app.Name)
+	host := fmt.Sprintf("leader.%s.discoverd", app.Name)
 	u := url.URL{
 		Scheme: "redis",
 		Host:   host + ":6379",
@@ -291,10 +286,10 @@ func (h *Handler) serveDeleteCluster(w http.ResponseWriter, req *http.Request, _
 	}
 
 	// Retrieve app name from env variable.
-	appName := release.Processes["redis"].Env["FLYNN_REDIS"]
+	appName := release.Env["FLYNN_REDIS"]
 	if appName == "" {
 		h.Logger.Error("unable to find app name", "release.id", releaseID)
-		httphelper.Error(w, err)
+		httphelper.Error(w, errors.New("unable to find app name"))
 		return
 	}
 	h.Logger.Info("found release app", "app.name", appName)

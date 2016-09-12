@@ -5,10 +5,9 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
-	cc "github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/random"
+	. "github.com/flynn/go-check"
 )
 
 func (s *S) TestEvents(c *C) {
@@ -81,7 +80,7 @@ func (s *S) TestStreamAppLifeCycleEvents(c *C) {
 	nextRelease := s.createTestRelease(c, &ct.Release{})
 
 	events := make(chan *ct.Event)
-	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{}, events)
+	stream, err := s.c.StreamEvents(ct.StreamEventsOptions{}, events)
 	c.Assert(err, IsNil)
 	defer stream.Close()
 
@@ -106,7 +105,6 @@ func (s *S) TestStreamAppLifeCycleEvents(c *C) {
 	assertAppEvent := func(e *ct.Event) *ct.App {
 		var eventApp *ct.App
 		c.Assert(json.Unmarshal(e.Data, &eventApp), IsNil)
-		c.Assert(e.AppID, Equals, app.ID)
 		c.Assert(e.ObjectType, Equals, ct.EventTypeApp)
 		c.Assert(e.ObjectID, Equals, app.ID)
 		c.Assert(eventApp, NotNil)
@@ -124,7 +122,6 @@ func (s *S) TestStreamAppLifeCycleEvents(c *C) {
 		func(e *ct.Event) {
 			var eventRelease *ct.AppRelease
 			c.Assert(json.Unmarshal(e.Data, &eventRelease), IsNil)
-			c.Assert(e.AppID, Equals, app.ID)
 			c.Assert(e.ObjectType, Equals, ct.EventTypeAppRelease)
 			c.Assert(e.ObjectID, Equals, release.ID)
 			c.Assert(eventRelease, NotNil)
@@ -144,7 +141,6 @@ func (s *S) TestStreamAppLifeCycleEvents(c *C) {
 		func(e *ct.Event) {
 			var eventRelease *ct.AppRelease
 			c.Assert(json.Unmarshal(e.Data, &eventRelease), IsNil)
-			c.Assert(e.AppID, Equals, app.ID)
 			c.Assert(e.ObjectType, Equals, ct.EventTypeAppRelease)
 			c.Assert(e.ObjectID, Equals, nextRelease.ID)
 			c.Assert(eventRelease, NotNil)
@@ -155,57 +151,69 @@ func (s *S) TestStreamAppLifeCycleEvents(c *C) {
 		},
 	}
 
+outer:
 	for i, fn := range eventAssertions {
-		select {
-		case e, ok := <-events:
-			if !ok {
-				c.Fatal("unexpected close of event stream")
+	inner:
+		for {
+			select {
+			case e, ok := <-events:
+				if !ok {
+					c.Fatal("unexpected close of event stream")
+				}
+				// ignore events for other apps
+				if e.AppID != app.ID {
+					continue inner
+				}
+				fn(e)
+				continue outer
+			case <-time.After(10 * time.Second):
+				c.Fatalf("Timed out waiting for event %d", i)
 			}
-			fn(e)
-		case <-time.After(10 * time.Second):
-			c.Fatalf("Timed out waiting for event %d", i)
 		}
 	}
 }
 
 func (s *S) TestStreamReleaseEvents(c *C) {
 	events := make(chan *ct.Event)
-	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{}, events)
+	stream, err := s.c.StreamEvents(ct.StreamEventsOptions{}, events)
 	c.Assert(err, IsNil)
 	defer stream.Close()
 
 	release := s.createTestRelease(c, &ct.Release{})
 
-	select {
-	case e, ok := <-events:
-		if !ok {
-			c.Fatal("unexpected close of event stream")
+	var gotRelease, gotArtifact bool
+	for i := 0; i < 2; i++ {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				c.Fatal("unexpected close of event stream")
+			}
+			switch e.ObjectType {
+			case ct.EventTypeArtifact:
+				var eventArtifact *ct.Artifact
+				c.Assert(json.Unmarshal(e.Data, &eventArtifact), IsNil)
+				c.Assert(e.AppID, Equals, "")
+				c.Assert(e.ObjectID, Equals, release.ImageArtifactID())
+				c.Assert(eventArtifact, NotNil)
+				c.Assert(eventArtifact.ID, Equals, release.ImageArtifactID())
+				gotArtifact = true
+			case ct.EventTypeRelease:
+				var eventRelease *ct.Release
+				c.Assert(json.Unmarshal(e.Data, &eventRelease), IsNil)
+				c.Assert(e.AppID, Equals, "")
+				c.Assert(e.ObjectID, Equals, release.ID)
+				c.Assert(eventRelease, DeepEquals, release)
+				gotRelease = true
+			default:
+				c.Errorf("unexpected event object %s", e.ObjectType)
+			}
+		case <-time.After(10 * time.Second):
+			c.Fatalf("Timed out waiting for event %d", i)
 		}
-		var eventArtifact *ct.Artifact
-		c.Assert(json.Unmarshal(e.Data, &eventArtifact), IsNil)
-		c.Assert(e.AppID, Equals, "")
-		c.Assert(e.ObjectType, Equals, ct.EventTypeArtifact)
-		c.Assert(e.ObjectID, Equals, release.ArtifactID)
-		c.Assert(eventArtifact, NotNil)
-		c.Assert(eventArtifact.ID, Equals, release.ArtifactID)
-	case <-time.After(10 * time.Second):
-		c.Fatal("Timed out waiting for artifact event")
 	}
 
-	select {
-	case e, ok := <-events:
-		if !ok {
-			c.Fatal("unexpected close of event stream")
-		}
-		var eventRelease *ct.Release
-		c.Assert(json.Unmarshal(e.Data, &eventRelease), IsNil)
-		c.Assert(e.AppID, Equals, "")
-		c.Assert(e.ObjectType, Equals, ct.EventTypeRelease)
-		c.Assert(e.ObjectID, Equals, release.ID)
-		c.Assert(eventRelease, DeepEquals, release)
-	case <-time.After(10 * time.Second):
-		c.Fatal("Timed out waiting for release event")
-	}
+	c.Assert(gotArtifact, Equals, true)
+	c.Assert(gotRelease, Equals, true)
 }
 
 func (s *S) TestStreamFormationEvents(c *C) {
@@ -215,7 +223,7 @@ func (s *S) TestStreamFormationEvents(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "stream-formation-test"})
 
 	events := make(chan *ct.Event)
-	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{
+	stream, err := s.c.StreamEvents(ct.StreamEventsOptions{
 		ObjectTypes: []ct.EventType{ct.EventTypeScale},
 	}, events)
 	c.Assert(err, IsNil)
@@ -290,7 +298,7 @@ func (s *S) TestStreamFormationEvents(c *C) {
 
 func (s *S) TestStreamProviderEvents(c *C) {
 	events := make(chan *ct.Event)
-	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{}, events)
+	stream, err := s.c.StreamEvents(ct.StreamEventsOptions{}, events)
 	c.Assert(err, IsNil)
 	defer stream.Close()
 
@@ -319,7 +327,7 @@ func (s *S) TestStreamResourceEvents(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "app4"})
 
 	events := make(chan *ct.Event)
-	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{
+	stream, err := s.c.StreamEvents(ct.StreamEventsOptions{
 		ObjectTypes: []ct.EventType{
 			ct.EventTypeResource,
 			ct.EventTypeResourceDeletion,
@@ -384,7 +392,7 @@ func (s *S) TestListEvents(c *C) {
 		Meta: newMeta,
 	}), IsNil)
 
-	events, err := s.c.ListEvents(cc.ListEventsOptions{
+	events, err := s.c.ListEvents(ct.ListEventsOptions{
 		ObjectTypes: []ct.EventType{ct.EventTypeApp, ct.EventTypeAppRelease},
 		AppID:       app.ID,
 	})
@@ -436,7 +444,7 @@ func (s *S) TestListEvents(c *C) {
 		fn(events[eventsLen-i-1])
 	}
 
-	eventsSlice, err := s.c.ListEvents(cc.ListEventsOptions{
+	eventsSlice, err := s.c.ListEvents(ct.ListEventsOptions{
 		ObjectTypes: []ct.EventType{ct.EventTypeApp, ct.EventTypeAppRelease},
 		BeforeID:    &events[0].ID,
 		SinceID:     &events[eventsLen-1].ID,
@@ -446,7 +454,7 @@ func (s *S) TestListEvents(c *C) {
 	c.Assert(eventsSlice[0].ID, Equals, events[1].ID)
 	c.Assert(eventsSlice[1].ID, Equals, events[2].ID)
 
-	eventsSlice, err = s.c.ListEvents(cc.ListEventsOptions{
+	eventsSlice, err = s.c.ListEvents(ct.ListEventsOptions{
 		ObjectTypes: []ct.EventType{ct.EventTypeApp, ct.EventTypeAppRelease},
 		BeforeID:    &events[0].ID,
 		SinceID:     &events[eventsLen-1].ID,
@@ -461,7 +469,7 @@ func (s *S) TestGetEvent(c *C) {
 	// ensure there's at least one event
 	_ = s.createTestRelease(c, &ct.Release{})
 
-	events, err := s.c.ListEvents(cc.ListEventsOptions{})
+	events, err := s.c.ListEvents(ct.ListEventsOptions{})
 	c.Assert(err, IsNil)
 	c.Assert(len(events), Not(Equals), 0)
 

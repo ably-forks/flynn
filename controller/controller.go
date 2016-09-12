@@ -13,11 +13,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/name"
 	"github.com/flynn/flynn/controller/schema"
 	ct "github.com/flynn/flynn/controller/types"
@@ -32,6 +27,10 @@ import (
 	"github.com/flynn/flynn/pkg/status"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	"github.com/flynn/que-go"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var logger = log15.New("component", "controller")
@@ -103,11 +102,12 @@ func main() {
 	})
 
 	handler := appHandler(handlerConfig{
-		db:   db,
-		cc:   utils.ClusterClientWrapper(cluster.NewClient()),
-		lc:   lc,
-		rc:   rc,
-		keys: strings.Split(os.Getenv("AUTH_KEY"), ","),
+		db:     db,
+		cc:     utils.ClusterClientWrapper(cluster.NewClient()),
+		lc:     lc,
+		rc:     rc,
+		keys:   strings.Split(os.Getenv("AUTH_KEY"), ","),
+		caCert: []byte(os.Getenv("CA_CERT")),
 	})
 	shutdown.Fatal(http.ListenAndServe(addr, handler))
 }
@@ -174,12 +174,12 @@ type logClient interface {
 }
 
 type handlerConfig struct {
-	db      *postgres.DB
-	cc      utils.ClusterClient
-	lc      logClient
-	rc      routerc.Client
-	pgxpool *pgx.ConnPool
-	keys    []string
+	db     *postgres.DB
+	cc     utils.ClusterClient
+	lc     logClient
+	rc     routerc.Client
+	keys   []string
+	caCert []byte
 }
 
 // NOTE: this is temporary until httphelper supports custom errors
@@ -208,11 +208,13 @@ func appHandler(c handlerConfig) http.Handler {
 	resourceRepo := NewResourceRepo(c.db)
 	appRepo := NewAppRepo(c.db, os.Getenv("DEFAULT_ROUTE_DOMAIN"), c.rc)
 	artifactRepo := NewArtifactRepo(c.db)
-	releaseRepo := NewReleaseRepo(c.db)
+	releaseRepo := NewReleaseRepo(c.db, artifactRepo, q)
 	jobRepo := NewJobRepo(c.db)
 	formationRepo := NewFormationRepo(c.db, appRepo, releaseRepo, artifactRepo)
+	releaseRepo.formations = formationRepo
 	deploymentRepo := NewDeploymentRepo(c.db)
 	eventRepo := NewEventRepo(c.db)
+	backupRepo := NewBackupRepo(c.db)
 
 	api := controllerAPI{
 		domainMigrationRepo: domainMigrationRepo,
@@ -225,11 +227,12 @@ func appHandler(c handlerConfig) http.Handler {
 		resourceRepo:        resourceRepo,
 		deploymentRepo:      deploymentRepo,
 		eventRepo:           eventRepo,
+		backupRepo:          backupRepo,
 		clusterClient:       c.cc,
 		logaggc:             c.lc,
 		routerc:             c.rc,
 		que:                 q,
-		caCert:              []byte(os.Getenv("CA_CERT")),
+		caCert:              c.caCert,
 		config:              c,
 	}
 
@@ -258,6 +261,8 @@ func appHandler(c handlerConfig) http.Handler {
 	httpRouter.POST("/apps/:apps_id", httphelper.WrapHandler(api.UpdateApp))
 	httpRouter.GET("/apps/:apps_id/log", httphelper.WrapHandler(api.appLookup(api.AppLog)))
 	httpRouter.DELETE("/apps/:apps_id", httphelper.WrapHandler(api.appLookup(api.DeleteApp)))
+	httpRouter.DELETE("/apps/:apps_id/releases/:releases_id", httphelper.WrapHandler(api.appLookup(api.DeleteRelease)))
+	httpRouter.POST("/apps/:apps_id/gc", httphelper.WrapHandler(api.appLookup(api.ScheduleAppGarbageCollection)))
 
 	httpRouter.PUT("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.PutFormation)))
 	httpRouter.GET("/apps/:apps_id/formations/:releases_id", httphelper.WrapHandler(api.appLookup(api.GetFormation)))
@@ -280,11 +285,14 @@ func appHandler(c handlerConfig) http.Handler {
 	httpRouter.GET("/apps/:apps_id/release", httphelper.WrapHandler(api.appLookup(api.GetAppRelease)))
 	httpRouter.GET("/apps/:apps_id/releases", httphelper.WrapHandler(api.appLookup(api.GetAppReleases)))
 
+	httpRouter.GET("/resources", httphelper.WrapHandler(api.GetResources))
 	httpRouter.POST("/providers/:providers_id/resources", httphelper.WrapHandler(api.ProvisionResource))
 	httpRouter.GET("/providers/:providers_id/resources", httphelper.WrapHandler(api.GetProviderResources))
 	httpRouter.GET("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.GetResource))
 	httpRouter.PUT("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.PutResource))
 	httpRouter.DELETE("/providers/:providers_id/resources/:resources_id", httphelper.WrapHandler(api.DeleteResource))
+	httpRouter.PUT("/providers/:providers_id/resources/:resources_id/apps/:app_id", httphelper.WrapHandler(api.AddResourceApp))
+	httpRouter.DELETE("/providers/:providers_id/resources/:resources_id/apps/:app_id", httphelper.WrapHandler(api.DeleteResourceApp))
 	httpRouter.GET("/apps/:apps_id/resources", httphelper.WrapHandler(api.appLookup(api.GetAppResources)))
 
 	httpRouter.POST("/apps/:apps_id/routes", httphelper.WrapHandler(api.appLookup(api.CreateRoute)))
@@ -304,11 +312,20 @@ func appHandler(c handlerConfig) http.Handler {
 
 func muxHandler(main http.Handler, authKeys []string) http.Handler {
 	return httphelper.CORSAllowAll.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if shutdown.IsActive() {
+			httphelper.ServiceUnavailableError(w, ErrShutdown.Error())
+			return
+		}
+
 		if r.URL.Path == "/ping" {
 			w.WriteHeader(200)
 			return
 		}
-		_, password, _ := utils.ParseBasicAuth(r.Header)
+		_, password, _ := r.BasicAuth()
+		if password == "" && r.URL.Path == "/ca-cert" {
+			main.ServeHTTP(w, r)
+			return
+		}
 		if password == "" && (strings.Contains(r.Header.Get("Accept"), "text/event-stream") || r.URL.Path == "/backup") {
 			password = r.URL.Query().Get("key")
 		}
@@ -338,6 +355,7 @@ type controllerAPI struct {
 	resourceRepo        *ResourceRepo
 	deploymentRepo      *DeploymentRepo
 	eventRepo           *EventRepo
+	backupRepo          *BackupRepo
 	clusterClient       utils.ClusterClient
 	logaggc             logClient
 	routerc             routerc.Client

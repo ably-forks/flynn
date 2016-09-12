@@ -2,17 +2,19 @@ package main
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	. "github.com/flynn/flynn/controller/testutils"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/controller/utils"
+	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/random"
-	"github.com/flynn/flynn/pkg/stream"
 	"github.com/flynn/flynn/pkg/typeconv"
+	. "github.com/flynn/go-check"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 func Test(t *testing.T) { TestingT(t) }
@@ -58,7 +60,7 @@ func (d *fakeDiscoverd) demote() {
 	d.leader <- false
 }
 
-func createTestScheduler(cluster utils.ClusterClient, discoverd Discoverd) *Scheduler {
+func createTestScheduler(cluster utils.ClusterClient, discoverd Discoverd, l log15.Logger) *Scheduler {
 	app := &ct.App{ID: testAppID, Name: testAppID}
 	artifact := &ct.Artifact{ID: testArtifactId}
 	processes := map[string]int{testJobType: testJobCount}
@@ -68,12 +70,12 @@ func createTestScheduler(cluster utils.ClusterClient, discoverd Discoverd) *Sche
 	cc.CreateArtifact(artifact)
 	cc.CreateRelease(release)
 	cc.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: processes})
-	return NewScheduler(cluster, cc, discoverd)
+	return NewScheduler(cluster, cc, discoverd, l)
 }
 
 func newTestHosts() map[string]*FakeHostClient {
 	return map[string]*FakeHostClient{
-		testHostID: NewFakeHostClient(testHostID),
+		testHostID: NewFakeHostClient(testHostID, false),
 	}
 }
 
@@ -86,94 +88,101 @@ func newTestCluster(hosts map[string]*FakeHostClient) *FakeCluster {
 	return cluster
 }
 
-func runTestScheduler(c *C, cluster utils.ClusterClient, isLeader bool) *TestScheduler {
+func newTestScheduler(c *C, cluster utils.ClusterClient, isLeader bool) *TestScheduler {
 	if cluster == nil {
 		cluster = newTestCluster(nil)
 	}
 	discoverd := newFakeDiscoverd(isLeader)
-	s := createTestScheduler(cluster, discoverd)
 
-	events := make(chan Event, eventBufferSize)
-	stream := s.Subscribe(events)
+	events := make(chan *log15.Record, eventBufferSize)
+	logger := log15.New()
+	logger.SetHandler(log15.MultiHandler(
+		log15.StdoutHandler,
+		log15.ChannelHandler(events),
+	))
+
+	s := createTestScheduler(cluster, discoverd, logger)
+	return &TestScheduler{s, c, events, discoverd}
+}
+
+func runTestScheduler(c *C, cluster utils.ClusterClient, isLeader bool) *TestScheduler {
+	s := newTestScheduler(c, cluster, isLeader)
 	go s.Run()
+	return s
+}
 
-	return &TestScheduler{s, c, events, stream, discoverd}
+type logEvent struct {
+	log15.Record
+}
+
+func (l *logEvent) Get(key string) interface{} {
+	for i := 0; i < len(l.Record.Ctx); i += 2 {
+		if k, ok := l.Record.Ctx[i].(string); ok && k == key {
+			return l.Record.Ctx[i+1]
+		}
+	}
+	return nil
 }
 
 type TestScheduler struct {
 	*Scheduler
 	c         *C
-	events    chan Event
-	stream    stream.Stream
+	events    chan *log15.Record
 	discoverd *fakeDiscoverd
 }
 
 func (s *TestScheduler) Stop() {
 	s.Scheduler.Stop()
-	s.stream.Close()
 }
 
 func (s *TestScheduler) waitRectify() utils.FormationKey {
-	event, err := s.waitForEvent(EventTypeRectify)
+	event, err := s.waitForEvent("rectified formation")
 	s.c.Assert(err, IsNil)
-	e, ok := event.(*RectifyEvent)
-	if !ok {
-		s.c.Fatalf("expected RectifyEvent, got %T", e)
-	}
-	s.c.Assert(e.FormationKey, NotNil)
-	return e.FormationKey
+	return event.Get("key").(utils.FormationKey)
 }
 
 func (s *TestScheduler) waitFormationChange() {
-	_, err := s.waitForEvent(EventTypeFormationChange)
+	_, err := s.waitForEvent("formation change handled")
 	s.c.Assert(err, IsNil)
 }
 
 func (s *TestScheduler) waitFormationSync() {
-	_, err := s.waitForEvent(EventTypeFormationSync)
+	_, err := s.waitForEvent("formations synced")
 	s.c.Assert(err, IsNil)
 }
 
 func (s *TestScheduler) waitJobStart() *Job {
-	return s.waitJobEvent(EventTypeJobStart)
+	return s.waitJobEvent("start")
 }
 
 func (s *TestScheduler) waitJobStop() *Job {
-	return s.waitJobEvent(EventTypeJobStop)
+	return s.waitJobEvent("stop")
 }
 
-func (s *TestScheduler) waitJobEvent(typ EventType) *Job {
-	event, err := s.waitForEvent(typ)
+func (s *TestScheduler) waitJobEvent(typ string) *Job {
+	event, err := s.waitForEvent(fmt.Sprintf("handled job %s event", typ))
 	s.c.Assert(err, IsNil)
-	e, ok := event.(*JobEvent)
-	if !ok {
-		s.c.Fatalf("expected JobEvent, got %T", e)
-	}
-	s.c.Assert(e.Job, NotNil)
-	return e.Job
+	return event.Get("job").(*Job)
 }
 
-func (s *TestScheduler) waitDurationForEvent(typ EventType, duration time.Duration) (Event, error) {
+func (s *TestScheduler) waitDurationForEvent(msg string, duration time.Duration) (*logEvent, error) {
 	for {
 		select {
 		case event, ok := <-s.events:
 			if !ok {
 				return nil, fmt.Errorf("unexpected close of scheduler event stream")
 			}
-			if event.Type() == typ {
-				if err := event.Err(); err != nil {
-					return event, fmt.Errorf("unexpected event error: %s", err)
-				}
-				return event, nil
+			if event.Msg == msg {
+				return &logEvent{*event}, nil
 			}
 		case <-time.After(duration):
-			return nil, fmt.Errorf("timed out waiting for %s event", typ)
+			return nil, fmt.Errorf("timed out waiting for event: %q", msg)
 		}
 	}
 }
 
-func (s *TestScheduler) waitForEvent(typ EventType) (Event, error) {
-	return s.waitDurationForEvent(typ, 2*time.Second)
+func (s *TestScheduler) waitForEvent(msg string) (*logEvent, error) {
+	return s.waitDurationForEvent(msg, 2*time.Second)
 }
 
 func (TestSuite) TestSingleJobStart(c *C) {
@@ -207,13 +216,12 @@ func (TestSuite) TestFormationChange(c *C) {
 	c.Assert(err, IsNil)
 	release, err := s.GetRelease(testReleaseID)
 	c.Assert(err, IsNil)
-	artifact, err := s.GetArtifact(release.ArtifactID)
+	artifact, err := s.GetArtifact(release.ImageArtifactID())
 	c.Assert(err, IsNil)
 
 	// Test scaling up an existing formation
 	c.Log("Test scaling up an existing formation. Wait for formation change and job start")
 	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: map[string]int{"web": 4}})
-	s.waitFormationChange()
 	for i := 0; i < 3; i++ {
 		job := s.waitJobStart()
 		c.Assert(job.Type, Equals, testJobType)
@@ -225,7 +233,6 @@ func (TestSuite) TestFormationChange(c *C) {
 	// Test scaling down an existing formation
 	c.Log("Test scaling down an existing formation. Wait for formation change and job stop")
 	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: map[string]int{"web": 1}})
-	s.waitFormationChange()
 	for i := 0; i < 3; i++ {
 		s.waitJobStop()
 	}
@@ -240,9 +247,8 @@ func (TestSuite) TestFormationChange(c *C) {
 	s.CreateRelease(release)
 	c.Assert(len(s.formations), Equals, 1)
 	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: processes})
-	s.waitFormationChange()
-	c.Assert(len(s.formations), Equals, 2)
 	job := s.waitJobStart()
+	c.Assert(len(s.formations), Equals, 2)
 	c.Assert(job.Type, Equals, testJobType)
 	c.Assert(job.AppID, Equals, app.ID)
 	c.Assert(job.ReleaseID, Equals, release.ID)
@@ -253,7 +259,7 @@ func (TestSuite) TestRectify(c *C) {
 	defer s.Stop()
 
 	// wait for the formation to cascade to the scheduler
-	key := s.waitRectify()
+	key := utils.FormationKey{AppID: testAppID, ReleaseID: testReleaseID}
 	job := s.waitJobStart()
 	jobs := make(map[string]*Job)
 	jobs[job.JobID] = job
@@ -273,7 +279,6 @@ func (TestSuite) TestRectify(c *C) {
 
 	// Verify that the scheduler stops the extra job
 	c.Log("Verify that the scheduler stops the extra job")
-	s.waitRectify()
 	job = s.waitJobStop()
 	c.Assert(job.JobID, Equals, config.ID)
 	delete(jobs, job.JobID)
@@ -285,7 +290,7 @@ func (TestSuite) TestRectify(c *C) {
 	artifact := &ct.Artifact{ID: "test-artifact-2"}
 	processes := map[string]int{testJobType: testJobCount}
 	release := NewRelease("test-release-2", artifact, processes)
-	form = NewFormation(&ct.ExpandedFormation{App: app, Release: release, Artifact: artifact, Processes: processes})
+	form = NewFormation(&ct.ExpandedFormation{App: app, Release: release, ImageArtifact: artifact, Processes: processes})
 	newJob = &Job{Formation: form, AppID: testAppID, ReleaseID: testReleaseID, Type: testJobType}
 	config = jobConfig(newJob, testHostID)
 	// Add the job to the host without adding the formation. Expected error.
@@ -300,7 +305,7 @@ func (TestSuite) TestRectify(c *C) {
 	s.CreateRelease(release)
 	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: processes})
 	s.waitFormationChange()
-	_, err := s.waitDurationForEvent(EventTypeJobStart, 1*time.Second)
+	_, err := s.waitDurationForEvent("handled job start event", 1*time.Second)
 	c.Assert(err, NotNil)
 	c.Assert(job.Formation, NotNil)
 	c.Assert(s.RunningJobs(), HasLen, 2)
@@ -308,43 +313,69 @@ func (TestSuite) TestRectify(c *C) {
 
 func (TestSuite) TestMultipleHosts(c *C) {
 	hosts := newTestHosts()
+	host1 := hosts[testHostID]
 	fakeCluster := newTestCluster(hosts)
-	s := runTestScheduler(c, fakeCluster, true)
-	defer s.Stop()
-	s.maxHostChecks = 1
+	s := newTestScheduler(c, fakeCluster, true)
 
 	// use incremental job IDs so we can find them easily in s.jobs
-	jobID := 0
-	generateJobUUID = func() string {
-		jobID++
-		return fmt.Sprintf("job%d", jobID)
+	var jobID uint64
+	s.generateJobUUID = func() string {
+		return fmt.Sprintf("job%d", atomic.AddUint64(&jobID, 1))
 	}
-	defer func() { generateJobUUID = random.UUID }()
+	s.maxHostChecks = 1
 
-	assertJobs := func(expected map[string]*Job) {
-		jobs := s.Jobs()
-		c.Assert(jobs, HasLen, len(expected))
-		for id, job := range expected {
-			actual, ok := jobs[id]
-			if !ok {
-				c.Fatalf("%s does not exist in s.jobs", id)
+	go s.Run()
+	defer s.Stop()
+
+	// assertJobs checks that hosts have expected jobs based on their type
+	// and current state
+	type hostJobs map[*FakeHostClient][]*Job
+	assertJobs := func(expected hostJobs) {
+		// get a sorted list of scheduler jobs per host to compare
+		// against the expected list
+		actual := make(map[string]sortJobs)
+		for _, job := range s.InternalState().Jobs {
+			actual[job.HostID] = append(actual[job.HostID], job)
+		}
+		for _, jobs := range actual {
+			jobs.SortReverse()
+		}
+
+		for host, jobs := range expected {
+			actual := actual[host.ID()]
+			if len(actual) != len(jobs) {
+				c.Fatalf("expected %s to have %d jobs, got %d", host.ID(), len(jobs), len(actual))
 			}
-			c.Assert(actual.Type, Equals, job.Type)
-			c.Assert(actual.state, Equals, job.state)
-			c.Assert(actual.HostID, Equals, job.HostID)
+			for i, job := range jobs {
+				j := actual[i]
+				c.Assert(j.Type, Equals, job.Type)
+				c.Assert(j.State, Equals, job.State)
+
+				// check the host has the job if it is running (stopped
+				// jobs are removed from the host)
+				if job.State != JobStateStarting {
+					continue
+				}
+				id := cluster.GenerateJobID(host.ID(), j.ID)
+				hostJob, err := host.GetJob(id)
+				c.Assert(err, IsNil)
+				c.Assert(hostJob.Job.ID, Equals, id)
+			}
 		}
 	}
 
 	c.Log("Initialize the cluster with 1 host and wait for a job to start on it.")
 	s.waitJobStart()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStarting, HostID: testHostID},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+		},
 	})
 
 	c.Log("Add a host to the cluster, then create a new app, artifact, release, and associated formation.")
-	h2 := NewFakeHostClient("host2")
-	fakeCluster.AddHost(h2)
-	hosts[h2.ID()] = h2
+	host2 := NewFakeHostClient("host2", true)
+	fakeCluster.AddHost(host2)
+	hosts[host2.ID()] = host2
 	app := &ct.App{ID: "test-app-2", Name: "test-app-2"}
 	artifact := &ct.Artifact{ID: "test-artifact-2"}
 	processes := map[string]int{"omni": 1}
@@ -354,87 +385,139 @@ func (TestSuite) TestMultipleHosts(c *C) {
 	s.CreateArtifact(artifact)
 	s.CreateRelease(release)
 	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: processes})
-	s.waitFormationChange()
 	s.waitJobStart()
 	s.waitJobStart()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStarting, HostID: "host1"},
-		"job2": {Type: "omni", state: JobStateStarting, HostID: "host1"},
-		"job3": {Type: "omni", state: JobStateStarting, HostID: "host2"},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStarting},
+		},
 	})
 
-	assertHostJobs := func(host *FakeHostClient, ids ...string) {
-		jobs, err := host.ListJobs()
-		c.Assert(err, IsNil)
-		c.Assert(jobs, HasLen, len(ids))
-		for _, id := range ids {
-			id = cluster.GenerateJobID(host.ID(), id)
-			job, ok := jobs[id]
-			if !ok {
-				c.Fatalf("%s missing job with ID %s", host.ID(), id)
-			}
-			c.Assert(job.Job.ID, Equals, id)
-		}
-	}
-	h1 := hosts[testHostID]
-	assertHostJobs(h1, "job1", "job2")
-	assertHostJobs(h2, "job3")
-
-	h3 := NewFakeHostClient("host3")
+	host3 := NewFakeHostClient("host3", true)
 	c.Log("Add a host, wait for omni job start on that host.")
-	fakeCluster.AddHost(h3)
+	fakeCluster.AddHost(host3)
 	s.waitJobStart()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStarting, HostID: "host1"},
-		"job2": {Type: "omni", state: JobStateStarting, HostID: "host1"},
-		"job3": {Type: "omni", state: JobStateStarting, HostID: "host2"},
-		"job4": {Type: "omni", state: JobStateStarting, HostID: "host3"},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStarting},
+		},
+		host3: {
+			{Type: "omni", State: JobStateStarting},
+		},
 	})
-	assertHostJobs(h3, "job4")
 
 	c.Log("Crash one of the omni jobs, and wait for it to restart")
-	h3.CrashJob("job4")
+	host3.CrashJob("job4")
 	s.waitJobStop()
 	s.waitJobStart()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStarting, HostID: "host1"},
-		"job2": {Type: "omni", state: JobStateStarting, HostID: "host1"},
-		"job3": {Type: "omni", state: JobStateStarting, HostID: "host2"},
-		"job4": {Type: "omni", state: JobStateStopped, HostID: "host3"},
-		"job5": {Type: "omni", state: JobStateStarting, HostID: "host3"},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStarting},
+		},
+		host3: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStarting},
+		},
 	})
-	assertHostJobs(h3, "job5")
+
+	c.Log("Unbalance the omni jobs, wait for them to be re-balanced")
+
+	// pause the scheduler so we can unbalance the jobs without it trying
+	// to rectify the situation
+	s.Pause()
+
+	// move host2's job to host3
+	var job *host.ActiveJob
+	jobs, err := host2.ListJobs()
+	for _, j := range jobs {
+		if j.Status == host.StatusStarting {
+			job = &j
+			break
+		}
+	}
+	if job == nil {
+		c.Fatal("could not find host2's omni job")
+	}
+	newJob := job.Job.Dup()
+	newJob.ID = cluster.GenerateJobID(host3.ID(), s.generateJobUUID())
+	host3.AddJob(newJob)
+	err = host2.StopJob(job.Job.ID)
+	c.Assert(err, IsNil)
+
+	// resume the scheduler and check it moves the job back to host2
+	s.Resume()
+	s.waitJobStart()
+	s.waitJobStart()
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host3: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStarting},
+			{Type: "omni", State: JobStateStopped},
+		},
+	})
 
 	c.Logf("Remove one of the hosts. Ensure the cluster recovers correctly (hosts=%v)", hosts)
-	h3.Healthy = false
+	host3.Healthy = false
 	fakeCluster.SetHosts(hosts)
 	s.waitFormationSync()
 	s.waitRectify()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStarting, HostID: "host1"},
-		"job2": {Type: "omni", state: JobStateStarting, HostID: "host1"},
-		"job3": {Type: "omni", state: JobStateStarting, HostID: "host2"},
-		"job4": {Type: "omni", state: JobStateStopped, HostID: "host3"},
-		"job5": {Type: "omni", state: JobStateStopped, HostID: "host3"},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStarting},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStarting},
+		},
+		host3: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStopped},
+		},
 	})
-	assertHostJobs(h1, "job1", "job2")
-	assertHostJobs(h2, "job3")
 
 	c.Logf("Remove another host. Ensure the cluster recovers correctly (hosts=%v)", hosts)
-	h1.Healthy = false
-	fakeCluster.RemoveHost(testHostID)
+	host1.Healthy = false
+	fakeCluster.RemoveHost(host1.ID())
 	s.waitFormationSync()
-	s.waitRectify()
 	s.waitJobStart()
-	assertJobs(map[string]*Job{
-		"job1": {Type: "web", state: JobStateStopped, HostID: "host1"},
-		"job2": {Type: "omni", state: JobStateStopped, HostID: "host1"},
-		"job3": {Type: "omni", state: JobStateStarting, HostID: "host2"},
-		"job4": {Type: "omni", state: JobStateStopped, HostID: "host3"},
-		"job5": {Type: "omni", state: JobStateStopped, HostID: "host3"},
-		"job6": {Type: "web", state: JobStateStarting, HostID: "host2"},
+	assertJobs(hostJobs{
+		host1: {
+			{Type: "web", State: JobStateStopped},
+			{Type: "omni", State: JobStateStopped},
+		},
+		host2: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStarting},
+			{Type: "web", State: JobStateStarting},
+		},
+		host3: {
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStopped},
+			{Type: "omni", State: JobStateStopped},
+		},
 	})
-	assertHostJobs(h2, "job3", "job6")
 }
 
 func (TestSuite) TestMultipleSchedulers(c *C) {
@@ -445,10 +528,10 @@ func (TestSuite) TestMultipleSchedulers(c *C) {
 	s2 := runTestScheduler(c, cluster, false)
 	defer s2.Stop()
 
-	_, err := s1.waitDurationForEvent(EventTypeJobStart, 1*time.Second)
-	c.Assert(err, Not(IsNil))
-	_, err = s2.waitDurationForEvent(EventTypeJobStart, 1*time.Second)
-	c.Assert(err, Not(IsNil))
+	_, err := s1.waitDurationForEvent("handled job start event", 1*time.Second)
+	c.Assert(err, NotNil)
+	_, err = s2.waitDurationForEvent("handled job start event", 1*time.Second)
+	c.Assert(err, NotNil)
 
 	// Make S1 the leader, wait for jobs to start
 	s1.discoverd.promote()
@@ -471,10 +554,10 @@ func (TestSuite) TestMultipleSchedulers(c *C) {
 	s2.PutFormation(formation)
 	s1.waitFormationChange()
 	s2.waitFormationChange()
-	_, err = s2.waitDurationForEvent(EventTypeJobStart, 1*time.Second)
-	c.Assert(err, Not(IsNil))
-	_, err = s1.waitDurationForEvent(EventTypeJobStart, 1*time.Second)
-	c.Assert(err, Not(IsNil))
+	_, err = s2.waitDurationForEvent("handled job start event", 1*time.Second)
+	c.Assert(err, NotNil)
+	_, err = s1.waitDurationForEvent("handled job start event", 1*time.Second)
+	c.Assert(err, NotNil)
 
 	s2.discoverd.promote()
 	s2.waitJobStart()
@@ -503,7 +586,6 @@ func (TestSuite) TestStopJob(c *C) {
 		jobs       Jobs
 		shouldStop string
 		err        string
-		jobCheck   func(*Job)
 	}
 	for _, t := range []*test{
 		{
@@ -523,39 +605,39 @@ func (TestSuite) TestStopJob(c *C) {
 		},
 		{
 			desc:       "a running job",
-			jobs:       Jobs{"job1": &Job{ID: "job1", Formation: formation, Type: "web", state: JobStateRunning}},
+			jobs:       Jobs{"job1": &Job{ID: "job1", Formation: formation, Type: "web", State: JobStateRunning}},
 			shouldStop: "job1",
 		},
 		{
 			desc: "multiple running jobs, stops most recent",
 			jobs: Jobs{
-				"job1": &Job{ID: "job1", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent.Add(-5 * time.Minute)},
-				"job2": &Job{ID: "job2", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent},
-				"job3": &Job{ID: "job3", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent.Add(-10 * time.Minute)},
+				"job1": &Job{ID: "job1", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent.Add(-5 * time.Minute)},
+				"job2": &Job{ID: "job2", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent},
+				"job3": &Job{ID: "job3", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent.Add(-10 * time.Minute)},
 			},
 			shouldStop: "job2",
 		},
 		{
 			desc: "one running and one stopped, stops running job",
 			jobs: Jobs{
-				"job1": &Job{ID: "job1", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent.Add(-5 * time.Minute)},
-				"job2": &Job{ID: "job2", Formation: formation, Type: "web", state: JobStateStopped, startedAt: recent},
+				"job1": &Job{ID: "job1", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent.Add(-5 * time.Minute)},
+				"job2": &Job{ID: "job2", Formation: formation, Type: "web", State: JobStateStopped, StartedAt: recent},
 			},
 			shouldStop: "job1",
 		},
 		{
 			desc: "one running and one scheduled, stops scheduled job",
 			jobs: Jobs{
-				"job1": &Job{ID: "job1", Formation: formation, Type: "web", state: JobStatePending, startedAt: recent.Add(-5 * time.Minute), restartTimer: time.NewTimer(0)},
-				"job2": &Job{ID: "job2", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent},
+				"job1": &Job{ID: "job1", Formation: formation, Type: "web", State: JobStatePending, StartedAt: recent.Add(-5 * time.Minute), restartTimer: time.NewTimer(0)},
+				"job2": &Job{ID: "job2", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent},
 			},
 			shouldStop: "job1",
 		},
 		{
 			desc: "one running and one new, stops new job",
 			jobs: Jobs{
-				"job1": &Job{ID: "job1", Formation: formation, Type: "web", state: JobStatePending, startedAt: recent.Add(-5 * time.Minute)},
-				"job2": &Job{ID: "job2", Formation: formation, Type: "web", state: JobStateRunning, startedAt: recent},
+				"job1": &Job{ID: "job1", Formation: formation, Type: "web", State: JobStatePending, StartedAt: recent.Add(-5 * time.Minute)},
+				"job2": &Job{ID: "job2", Formation: formation, Type: "web", State: JobStateRunning, StartedAt: recent},
 			},
 			shouldStop: "job1",
 		},
@@ -581,6 +663,7 @@ func (TestSuite) TestJobPlacementTags(c *C) {
 			"host2": {ID: "host2", Tags: map[string]string{"disk": "ssd", "cpu": "slow"}},
 			"host3": {ID: "host3", Tags: map[string]string{"disk": "ssd", "cpu": "fast"}},
 		},
+		logger: log15.New(),
 	}
 
 	// use a formation with tagged process types
@@ -592,7 +675,7 @@ func (TestSuite) TestJobPlacementTags(c *C) {
 			"worker": {},
 			"clock":  {},
 		}},
-		Artifact: &ct.Artifact{},
+		ImageArtifact: &ct.Artifact{},
 		Tags: map[string]map[string]string{
 			"web":    nil,
 			"db":     {"disk": "ssd"},
@@ -604,39 +687,92 @@ func (TestSuite) TestJobPlacementTags(c *C) {
 	// continually place jobs, and check they get placed in a round-robin
 	// fashion on the hosts matching the type's tags
 	type test struct {
-		typ  string
-		host string
+		typ   string
+		count int
+		hosts map[string]int
 	}
-	for i, t := range []*test{
+	for _, t := range []*test{
 		// web go on all hosts
-		{typ: "web", host: "host1"},
-		{typ: "web", host: "host2"},
-		{typ: "web", host: "host3"},
-		{typ: "web", host: "host1"},
-		{typ: "web", host: "host2"},
-		{typ: "web", host: "host3"},
+		{
+			typ:   "web",
+			count: 6,
+			hosts: map[string]int{
+				"host1": 2,
+				"host2": 2,
+				"host3": 2,
+			},
+		},
+
 		// db go on hosts 2 and 3
+		{
+			typ:   "db",
+			count: 4,
+			hosts: map[string]int{
+				"host2": 2,
+				"host3": 2,
+			},
+		},
 
-		{typ: "db", host: "host2"},
-		{typ: "db", host: "host3"},
-		{typ: "db", host: "host2"},
-		{typ: "db", host: "host3"},
 		// worker go on hosts 1 and 3
-
-		{typ: "worker", host: "host1"},
-		{typ: "worker", host: "host3"},
-		{typ: "worker", host: "host1"},
-		{typ: "worker", host: "host3"},
+		{
+			typ:   "worker",
+			count: 4,
+			hosts: map[string]int{
+				"host1": 2,
+				"host3": 2,
+			},
+		},
 
 		// clock go on host 2
-		{typ: "clock", host: "host2"},
-		{typ: "clock", host: "host2"},
-		{typ: "clock", host: "host2"},
+		{
+			typ:   "clock",
+			count: 4,
+			hosts: map[string]int{
+				"host2": 4,
+			},
+		},
 	} {
-		job := s.jobs.Add(&Job{ID: fmt.Sprintf("job%d", i), Formation: formation, Type: t.typ})
-		req := &PlacementRequest{Job: job, Err: make(chan error, 1)}
-		s.HandlePlacementRequest(req)
-		c.Assert(<-req.Err, IsNil, Commentf("placing job %d", i))
-		c.Assert(req.Host.ID, Equals, t.host, Commentf("placing job %d", i))
+		hosts := make(map[string]int, 3)
+		for i := 0; i < t.count; i++ {
+			job := s.jobs.Add(&Job{ID: fmt.Sprintf("job-%s-%d", t.typ, i), Formation: formation, Type: t.typ, State: JobStatePending})
+			req := &PlacementRequest{Job: job, Err: make(chan error, 1)}
+			s.HandlePlacementRequest(req)
+			c.Assert(<-req.Err, IsNil, Commentf("placing %s job %d", t.typ, i))
+			hosts[req.Host.ID]++
+		}
+		c.Assert(hosts, DeepEquals, t.hosts, Commentf("placing %s jobs", t.typ))
 	}
+}
+
+func (TestSuite) TestScaleCriticalApp(c *C) {
+	s := runTestScheduler(c, nil, true)
+	defer s.Stop()
+	s.waitJobStart()
+
+	// scale a critical app up
+	app := &ct.App{ID: "critical-app", Meta: map[string]string{"flynn-system-critical": "true"}}
+	artifact := &ct.Artifact{ID: random.UUID()}
+	processes := map[string]int{"critical": 1}
+	release := NewRelease("critical-release-1", artifact, processes)
+	s.CreateApp(app)
+	s.CreateArtifact(artifact)
+	s.CreateRelease(release)
+	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: processes})
+	s.waitJobStart()
+
+	// check we can't scale it down
+	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: nil})
+	_, err := s.waitForEvent("refusing to scale down critical app")
+	s.c.Assert(err, IsNil)
+	s.waitFormationChange()
+
+	// scale up another formation
+	newRelease := NewRelease("critical-release-2", artifact, processes)
+	s.CreateRelease(newRelease)
+	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: newRelease.ID, Processes: processes})
+	s.waitJobStart()
+
+	// check we can now scale the original down
+	s.PutFormation(&ct.Formation{AppID: app.ID, ReleaseID: release.ID, Processes: nil})
+	s.waitJobStop()
 }

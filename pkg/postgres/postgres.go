@@ -6,12 +6,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/appliance/postgresql/state"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/attempt"
-	"github.com/flynn/flynn/pkg/dialer"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/pkg/sirenia/state"
+	"github.com/jackc/pgx"
 )
 
 const (
@@ -31,7 +30,7 @@ type Conf struct {
 
 var connectAttempts = attempt.Strategy{
 	Min:   5,
-	Total: 30 * time.Second,
+	Total: 5 * time.Minute,
 	Delay: 200 * time.Millisecond,
 }
 
@@ -97,12 +96,12 @@ func Open(conf *Conf, afterConn func(*pgx.Conn) error) (*DB, error) {
 		User:     conf.User,
 		Database: conf.Database,
 		Password: conf.Password,
-		Dial:     dialer.Retry.Dial,
 	}
 	connPool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
 		ConnConfig:     connConfig,
 		AfterConnect:   afterConn,
 		MaxConnections: 20,
+		AcquireTimeout: 30 * time.Second,
 	})
 	db := &DB{connPool, conf}
 	return db, err

@@ -15,11 +15,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/bootstrap"
+	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/exec"
+	"github.com/flynn/flynn/pkg/random"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -28,11 +31,12 @@ usage: flynn-host bootstrap [options] [<manifest>]
 
 Options:
   -n, --min-hosts=MIN  minimum number of hosts required to be online
-  -t, --timeout=SECS   seconds to wait for hosts to come online [default: 30]
+  -t, --timeout=SECS   seconds to wait for hosts to come online [default: 120]
   --json               format log output as json
   --from-backup=FILE   bootstrap from backup file
   --discovery=TOKEN    use discovery token to connect to cluster
   --peer-ips=IPLIST    use IP address list to connect to cluster
+  --steps=STEPS        only run the given STEPS (comma separated)
 
 Bootstrap layer 1 using the provided manifest`)
 }
@@ -59,10 +63,15 @@ func runBootstrap(args *docopt.Args) error {
 		manifestFile = "/etc/flynn/bootstrap-manifest.json"
 	}
 
+	var steps []string
+	if s := args.String["--steps"]; s != "" {
+		steps = strings.Split(s, ",")
+	}
+
 	var err error
 	manifest, err = readBootstrapManifest(manifestFile)
 	if err != nil {
-		return fmt.Errorf("Error reading manifest:", err)
+		return fmt.Errorf("Error reading manifest: %s", err)
 	}
 
 	if n := args.String["--min-hosts"]; n != "" {
@@ -102,7 +111,7 @@ func runBootstrap(args *docopt.Args) error {
 	if bf := args.String["--from-backup"]; bf != "" {
 		err = runBootstrapBackup(manifest, bf, ch, cfg)
 	} else {
-		err = bootstrap.Run(manifest, ch, cfg)
+		err = bootstrap.Run(manifest, ch, cfg, steps)
 	}
 
 	<-done
@@ -121,47 +130,60 @@ func runBootstrapBackup(manifest []byte, backupFile string, ch chan *bootstrap.S
 	defer f.Close()
 	tr := tar.NewReader(f)
 
-	var data struct {
-		Discoverd, Flannel, Postgres, Controller *ct.ExpandedFormation
-	}
-	for {
-		header, err := tr.Next()
-		if err != nil {
-			return fmt.Errorf("error reading backup file: %s", err)
+	getFile := func(name string) (io.Reader, error) {
+		rewound := false
+		var res io.Reader
+		for {
+			header, err := tr.Next()
+			if err == io.EOF && !rewound {
+				if _, err := f.Seek(0, os.SEEK_SET); err != nil {
+					return nil, fmt.Errorf("error seeking in backup file: %s", err)
+				}
+				rewound = true
+				tr = tar.NewReader(f)
+				continue
+			} else if err != nil {
+				return nil, fmt.Errorf("error finding %s in backup file: %s", name, err)
+			}
+			if path.Base(header.Name) != name {
+				continue
+			}
+			if strings.HasSuffix(name, ".gz") {
+				res, err = gzip.NewReader(tr)
+				if err != nil {
+					return nil, fmt.Errorf("error opening %s from backup file: %s", name, err)
+				}
+			} else {
+				res = tr
+			}
+			break
 		}
-		if path.Base(header.Name) != "flynn.json" {
-			continue
-		}
-		if err := json.NewDecoder(tr).Decode(&data); err != nil {
-			return fmt.Errorf("error decoding backup data: %s", err)
-		}
-		break
+		return res, nil
 	}
 
-	var db io.Reader
-	rewound := false
-	for {
-		header, err := tr.Next()
-		if err == io.EOF && !rewound {
-			if _, err := f.Seek(0, os.SEEK_SET); err != nil {
-				return fmt.Errorf("error seeking in backup file: %s", err)
-			}
-			rewound = true
-		} else if err != nil {
-			return fmt.Errorf("error finding db in backup file: %s", err)
-		}
-		if path.Base(header.Name) != "postgres.sql.gz" {
-			continue
-		}
-		db, err = gzip.NewReader(tr)
-		if err != nil {
-			return fmt.Errorf("error opening db from backup file: %s", err)
-		}
-		break
+	var data struct {
+		Discoverd, Flannel, Postgres, MariaDB, MongoDB, Controller *ct.ExpandedFormation
+	}
+
+	jsonData, err := getFile("flynn.json")
+	if err != nil {
+		return err
+	}
+	if jsonData == nil {
+		return fmt.Errorf("did not file flynn.json in backup file")
+	}
+	if err := json.NewDecoder(jsonData).Decode(&data); err != nil {
+		return fmt.Errorf("error decoding backup data: %s", err)
+	}
+
+	db, err := getFile("postgres.sql.gz")
+	if err != nil {
+		return err
 	}
 	if db == nil {
-		return fmt.Errorf("did not found postgres.sql.gz in backup file")
+		return fmt.Errorf("did not find postgres.sql.gz in backup file")
 	}
+
 	// add buffer to the end of the SQL import containing commands that rewrite data in the controller db
 	sqlBuf := &bytes.Buffer{}
 	db = io.MultiReader(db, sqlBuf)
@@ -186,48 +208,130 @@ AS $function$
 $function$;
 `)
 
-	var manifestSteps []struct {
+	type manifestStep struct {
 		ID       string
 		Artifact struct {
 			URI string
 		}
 		Release struct {
-			Env map[string]string
+			Env       map[string]string
+			Processes map[string]ct.ProcessType
 		}
 	}
+	var manifestSteps []*manifestStep
 	if err := json.Unmarshal(manifest, &manifestSteps); err != nil {
 		return fmt.Errorf("error decoding manifest json: %s", err)
 	}
+
 	artifactURIs := make(map[string]string)
+	updateProcArgs := func(f *ct.ExpandedFormation, step *manifestStep) {
+		for typ, proc := range step.Release.Processes {
+			p := f.Release.Processes[typ]
+			p.Args = proc.Args
+			f.Release.Processes[typ] = p
+		}
+	}
 	for _, step := range manifestSteps {
+		switch step.ID {
+		case "postgres":
+			updateProcArgs(data.Postgres, step)
+		case "controller":
+			updateProcArgs(data.Controller, step)
+		case "mariadb":
+			if data.MariaDB != nil {
+				updateProcArgs(data.MariaDB, step)
+			}
+		case "mongodb":
+			if data.MongoDB != nil {
+				updateProcArgs(data.MongoDB, step)
+			}
+		}
 		if step.Artifact.URI != "" {
 			artifactURIs[step.ID] = step.Artifact.URI
-			if step.ID == "gitreceive" {
-				artifactURIs["slugbuilder"] = step.Release.Env["SLUGBUILDER_IMAGE_URI"]
-				artifactURIs["slugrunner"] = step.Release.Env["SLUGRUNNER_IMAGE_URI"]
-			}
-			// update current artifact in database for service
+
+			// update current artifact in database for service, taking care to
+			// check the database version as migration 15 changed the way
+			// artifacts are related to releases in the database
 			sqlBuf.WriteString(fmt.Sprintf(`
-UPDATE artifacts SET uri = '%s'
-WHERE artifact_id = (SELECT artifact_id FROM releases
-                     WHERE release_id = (SELECT release_id FROM apps
-                     WHERE name = '%s'));`, step.Artifact.URI, step.ID))
+DO $$
+  BEGIN
+    IF (SELECT MAX(id) FROM schema_migrations) < 15 THEN
+      UPDATE artifacts SET uri = '%[1]s' WHERE artifact_id = (
+	SELECT artifact_id FROM releases WHERE release_id = (
+	  SELECT release_id FROM apps WHERE name = '%[2]s'
+	)
+      );
+    ELSE
+      UPDATE artifacts SET uri = '%[1]s' WHERE type = 'docker' AND artifact_id = (
+	SELECT artifact_id FROM release_artifacts WHERE release_id = (
+	  SELECT release_id FROM apps WHERE name = '%[2]s'
+	)
+      );
+    END IF;
+  END;
+$$;`, step.Artifact.URI, step.ID))
 		}
 	}
 
-	data.Discoverd.Artifact.URI = artifactURIs["discoverd"]
+	data.Discoverd.ImageArtifact.URI = artifactURIs["discoverd"]
 	data.Discoverd.Release.Env["DISCOVERD_PEERS"] = "{{ range $ip := .SortedHostIPs }}{{ $ip }}:1111,{{ end }}"
-	data.Postgres.Artifact.URI = artifactURIs["postgres"]
-	data.Flannel.Artifact.URI = artifactURIs["flannel"]
-	data.Controller.Artifact.URI = artifactURIs["controller"]
-
-	for _, app := range []string{"gitreceive", "taffy"} {
-		for _, env := range []string{"slugbuilder", "slugrunner"} {
-			sqlBuf.WriteString(fmt.Sprintf(`
-UPDATE releases SET env = pg_temp.json_object_update_key(env, '%s_IMAGE_URI', '%s')
-WHERE release_id = (SELECT release_id from apps WHERE name = '%s');`,
-				strings.ToUpper(env), artifactURIs[env], app))
+	data.Postgres.ImageArtifact.URI = artifactURIs["postgres"]
+	data.Flannel.ImageArtifact.URI = artifactURIs["flannel"]
+	data.Controller.ImageArtifact.URI = artifactURIs["controller"]
+	if data.MariaDB != nil {
+		data.MariaDB.ImageArtifact.URI = artifactURIs["mariadb"]
+		if data.MariaDB.Processes["mariadb"] == 0 {
+			// skip mariadb if it wasn't scaled up in the backup
+			data.MariaDB = nil
 		}
+	}
+	if data.MongoDB != nil {
+		data.MongoDB.ImageArtifact.URI = artifactURIs["mongodb"]
+		if data.MongoDB.Processes["mongodb"] == 0 {
+			// skip mongodb if it wasn't scaled up in the backup
+			data.MongoDB = nil
+		}
+	}
+
+	// create the slugbuilder artifact if gitreceive still references
+	// SLUGBUILDER_IMAGE_URI (in which case there is no slugbuilder
+	// artifact in the database)
+	sqlBuf.WriteString(fmt.Sprintf(`
+DO $$
+  BEGIN
+    IF (SELECT env->>'SLUGBUILDER_IMAGE_ID' FROM releases WHERE release_id = (SELECT release_id FROM apps WHERE name = 'gitreceive')) IS NULL THEN
+      INSERT INTO artifacts (artifact_id, type, uri) VALUES ('%s', 'docker', '%s');
+    END IF;
+  END;
+$$;`, random.UUID(), artifactURIs["slugbuilder-image"]))
+
+	// update the URI of slug artifacts currently being referenced by
+	// gitreceive (which will also update all current user releases
+	// to use the latest slugrunner)
+	for _, name := range []string{"slugbuilder", "slugrunner"} {
+		sqlBuf.WriteString(fmt.Sprintf(`
+UPDATE artifacts SET uri = '%[1]s'
+WHERE artifact_id = (SELECT (env->>'%[2]s_IMAGE_ID')::uuid FROM releases WHERE release_id = (SELECT release_id FROM apps WHERE name = 'gitreceive'))
+OR uri = (SELECT env->>'%[2]s_IMAGE_URI' FROM releases WHERE release_id = (SELECT release_id FROM apps WHERE name = 'gitreceive'));`,
+			artifactURIs[name+"-image"], strings.ToUpper(name)))
+	}
+
+	// update the URI of redis artifacts currently being referenced by
+	// the redis app (which will also update all current redis
+	// resources to use the latest redis image)
+	sqlBuf.WriteString(fmt.Sprintf(`
+UPDATE artifacts SET uri = '%s'
+WHERE artifact_id = (SELECT (env->>'REDIS_IMAGE_ID')::uuid FROM releases WHERE release_id = (SELECT release_id FROM apps WHERE name = 'redis'))
+OR uri = (SELECT env->>'REDIS_IMAGE_URI' FROM releases WHERE release_id = (SELECT release_id FROM apps WHERE name = 'redis'));`,
+		artifactURIs["redis-image"]))
+
+	// ensure the image ID environment variables are set for legacy apps
+	// which use image URI variables
+	for _, name := range []string{"redis", "slugbuilder", "slugrunner"} {
+		sqlBuf.WriteString(fmt.Sprintf(`
+UPDATE releases SET env = pg_temp.json_object_update_key(env, '%[1]s_IMAGE_ID', (SELECT artifact_id::text FROM artifacts WHERE uri = '%[2]s'))
+WHERE env->>'%[1]s_IMAGE_URI' IS NOT NULL;`,
+			strings.ToUpper(name), artifactURIs[name+"-image"]))
 	}
 
 	step := func(id, name string, action bootstrap.Action) bootstrap.Step {
@@ -240,9 +344,9 @@ WHERE release_id = (SELECT release_id from apps WHERE name = '%s');`,
 		}
 	}
 
-	// start discoverd/flannel/postgres
+	// start discoverd/flannel/postgres/mariadb
 	cfg.Singleton = data.Postgres.Release.Env["SINGLETON"] == "true"
-	steps := bootstrap.Manifest{
+	systemSteps := bootstrap.Manifest{
 		step("discoverd", "run-app", &bootstrap.RunAppAction{
 			ExpandedFormation: data.Discoverd,
 		}),
@@ -257,7 +361,28 @@ WHERE release_id = (SELECT release_id from apps WHERE name = '%s');`,
 			URL: "http://postgres-api.discoverd/ping",
 		}),
 	}
-	state, err := steps.Run(ch, cfg)
+
+	// Only run up MariaDB if it's in the backup
+	if data.MariaDB != nil {
+		systemSteps = append(systemSteps, step("mariadb", "run-app", &bootstrap.RunAppAction{
+			ExpandedFormation: data.MariaDB,
+		}))
+		systemSteps = append(systemSteps, step("mariadb-wait", "wait", &bootstrap.WaitAction{
+			URL: "http://mariadb-api.discoverd/ping",
+		}))
+	}
+
+	// Only run up MongoDB if it's in the backup
+	if data.MongoDB != nil {
+		systemSteps = append(systemSteps, step("mongodb", "run-app", &bootstrap.RunAppAction{
+			ExpandedFormation: data.MongoDB,
+		}))
+		systemSteps = append(systemSteps, step("mongodb-wait", "wait", &bootstrap.WaitAction{
+			URL: "http://mongodb-api.discoverd/ping",
+		}))
+	}
+
+	state, err := systemSteps.Run(ch, cfg)
 	if err != nil {
 		return err
 	}
@@ -269,8 +394,8 @@ WHERE release_id = (SELECT release_id FROM apps WHERE name = 'discoverd')
 `, state.StepData["discoverd"].(*bootstrap.RunAppState).Release.Env["DISCOVERD_PEERS"]))
 
 	// load data into postgres
-	cmd := exec.JobUsingHost(state.Hosts[0], host.Artifact{Type: data.Postgres.Artifact.Type, URI: data.Postgres.Artifact.URI}, nil)
-	cmd.Entrypoint = []string{"psql"}
+	cmd := exec.JobUsingHost(state.Hosts[0], host.Artifact{Type: data.Postgres.ImageArtifact.Type, URI: data.Postgres.ImageArtifact.URI}, nil)
+	cmd.Args = []string{"psql"}
 	cmd.Env = map[string]string{
 		"PGHOST":     "leader.postgres.discoverd",
 		"PGUSER":     "flynn",
@@ -278,7 +403,7 @@ WHERE release_id = (SELECT release_id FROM apps WHERE name = 'discoverd')
 		"PGPASSWORD": data.Postgres.Release.Env["PGPASSWORD"],
 	}
 	cmd.Stdin = db
-	meta := bootstrap.StepMeta{ID: "restore", Action: "restore-db"}
+	meta := bootstrap.StepMeta{ID: "restore", Action: "restore-postgres"}
 	ch <- &bootstrap.StepInfo{StepMeta: meta, State: "start", Timestamp: time.Now().UTC()}
 	out, err := cmd.CombinedOutput()
 	if os.Getenv("DEBUG") != "" {
@@ -296,25 +421,133 @@ WHERE release_id = (SELECT release_id FROM apps WHERE name = 'discoverd')
 	}
 	ch <- &bootstrap.StepInfo{StepMeta: meta, State: "done", Timestamp: time.Now().UTC()}
 
-	// start controller/scheduler
-	data.Controller.Processes["web"] = 1
-	delete(data.Controller.Processes, "worker")
-	meta = bootstrap.StepMeta{ID: "controller", Action: "run-app"}
-	ch <- &bootstrap.StepInfo{StepMeta: meta, State: "start", Timestamp: time.Now().UTC()}
-	if err := (&bootstrap.RunAppAction{
-		ID:                "controller",
-		ExpandedFormation: data.Controller,
-	}).Run(state); err != nil {
-		ch <- &bootstrap.StepInfo{
-			StepMeta:  meta,
-			State:     "error",
-			Error:     err.Error(),
-			Err:       err,
-			Timestamp: time.Now().UTC(),
+	var mysqldb io.Reader
+	if data.MariaDB != nil {
+		mysqldb, err = getFile("mysql.sql.gz")
+		if err != nil {
+			return err
 		}
+	}
+
+	// load data into mariadb if it was present in the backup.
+	if mysqldb != nil && data.MariaDB != nil {
+		cmd = exec.JobUsingHost(state.Hosts[0], host.Artifact{Type: data.MariaDB.ImageArtifact.Type, URI: data.MariaDB.ImageArtifact.URI}, nil)
+		cmd.Args = []string{"mysql", "-u", "flynn", "-h", "leader.mariadb.discoverd"}
+		cmd.Env = map[string]string{
+			"MYSQL_PWD": data.MariaDB.Release.Env["MYSQL_PWD"],
+		}
+		cmd.Stdin = mysqldb
+		meta = bootstrap.StepMeta{ID: "restore", Action: "restore-mariadb"}
+		ch <- &bootstrap.StepInfo{StepMeta: meta, State: "start", Timestamp: time.Now().UTC()}
+		out, err = cmd.CombinedOutput()
+		if os.Getenv("DEBUG") != "" {
+			fmt.Println(string(out))
+		}
+		if err != nil {
+			ch <- &bootstrap.StepInfo{
+				StepMeta:  meta,
+				State:     "error",
+				Error:     fmt.Sprintf("error running mysql restore: %s - %q", err, string(out)),
+				Err:       err,
+				Timestamp: time.Now().UTC(),
+			}
+			return err
+		}
+		ch <- &bootstrap.StepInfo{StepMeta: meta, State: "done", Timestamp: time.Now().UTC()}
+	}
+
+	var mongodb io.Reader
+	if data.MongoDB != nil {
+		mongodb, err = getFile("mongodb.archive.gz")
+		if err != nil {
+			return err
+		}
+	}
+
+	// load data into mongodb if it was present in the backup.
+	if mongodb != nil && data.MongoDB != nil {
+		cmd = exec.JobUsingHost(state.Hosts[0], host.Artifact{Type: data.MongoDB.ImageArtifact.Type, URI: data.MongoDB.ImageArtifact.URI}, nil)
+		cmd.Args = []string{"mongorestore", "-h", "leader.mongodb.discoverd", "-u", "flynn", "-p", data.MongoDB.Release.Env["MONGO_PWD"], "--archive"}
+		cmd.Stdin = mongodb
+		meta = bootstrap.StepMeta{ID: "restore", Action: "restore-mongodb"}
+		ch <- &bootstrap.StepInfo{StepMeta: meta, State: "start", Timestamp: time.Now().UTC()}
+		out, err = cmd.CombinedOutput()
+		if os.Getenv("DEBUG") != "" {
+			fmt.Println(string(out))
+		}
+		if err != nil {
+			ch <- &bootstrap.StepInfo{
+				StepMeta:  meta,
+				State:     "error",
+				Error:     fmt.Sprintf("error running mongodb restore: %s - %q", err, string(out)),
+				Err:       err,
+				Timestamp: time.Now().UTC(),
+			}
+			return err
+		}
+		ch <- &bootstrap.StepInfo{StepMeta: meta, State: "done", Timestamp: time.Now().UTC()}
+	}
+
+	// start controller API
+	data.Controller.Processes = map[string]int{"web": 1}
+	_, err = bootstrap.Manifest{
+		step("controller", "run-app", &bootstrap.RunAppAction{
+			ExpandedFormation: data.Controller,
+		}),
+	}.RunWithState(ch, state)
+
+	// wait for controller to come up
+	meta = bootstrap.StepMeta{ID: "wait-controller", Action: "wait-controller"}
+	ch <- &bootstrap.StepInfo{StepMeta: meta, State: "start", Timestamp: time.Now().UTC()}
+	controllerInstances, err := discoverd.GetInstances("controller", 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("error getting controller instance: %s", err)
+	}
+
+	// get blobstore config
+	client, err := controller.NewClient("http://"+controllerInstances[0].Addr, data.Controller.Release.Env["AUTH_KEY"])
+	if err != nil {
 		return err
 	}
+	blobstoreRelease, err := client.GetAppRelease("blobstore")
+	if err != nil {
+		return fmt.Errorf("error getting blobstore release: %s", err)
+	}
+	blobstoreFormation, err := client.GetExpandedFormation("blobstore", blobstoreRelease.ID)
+	if err != nil {
+		return fmt.Errorf("error getting blobstore expanded formation: %s", err)
+	}
+	state.SetControllerKey(data.Controller.Release.Env["AUTH_KEY"])
 	ch <- &bootstrap.StepInfo{StepMeta: meta, State: "done", Timestamp: time.Now().UTC()}
+
+	// start blobstore, scheduler, and enable cluster monitor
+	data.Controller.Processes = map[string]int{"scheduler": 1}
+	// only start one scheduler instance
+	schedulerProcess := data.Controller.Release.Processes["scheduler"]
+	schedulerProcess.Omni = false
+	data.Controller.Release.Processes["scheduler"] = schedulerProcess
+	_, err = bootstrap.Manifest{
+		step("blobstore", "run-app", &bootstrap.RunAppAction{
+			ExpandedFormation: blobstoreFormation,
+		}),
+		step("blobstore-wait", "wait", &bootstrap.WaitAction{
+			URL:    "http://blobstore.discoverd",
+			Status: 200,
+		}),
+		step("controller-scheduler", "run-app", &bootstrap.RunAppAction{
+			ExpandedFormation: data.Controller,
+		}),
+		step("status", "status-check", &bootstrap.StatusCheckAction{
+			URL:     "http://status-web.discoverd",
+			Timeout: 600,
+		}),
+		step("cluster-monitor", "cluster-monitor", &bootstrap.ClusterMonitorAction{
+			Enabled: true,
+		}),
+	}.RunWithState(ch, state)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

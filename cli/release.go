@@ -9,9 +9,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/host/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -20,6 +21,8 @@ usage: flynn release [-q|--quiet]
        flynn release add [-t <type>] [-f <file>] <uri>
        flynn release update <file> [<id>] [--clean]
        flynn release show [--json] [<id>]
+       flynn release delete [-y] <id>
+       flynn release rollback [-y] [<id>]
 
 Manage app releases.
 
@@ -29,12 +32,12 @@ Options:
 	-f, --file=<file>  release configuration file
 	--json             print release configuration in JSON format
 	--clean            update from a clean slate (ignoring prior config)
+	-y, --yes          skip the confirmation prompt when deleting a release
 
 Commands:
 	With no arguments, shows a list of releases associated with the app.
 
-	add	add a new release
-
+	add
 		Create a new release from a Docker image.
 
 		The optional file argument takes a path to a file containing release
@@ -42,16 +45,26 @@ Commands:
 		release environment and processes (similar to a Procfile). It can take any
 		of the arguments the controller Release type can take.
 
-	show	show information about a release
+	show
+		Show information about a release.
 
 		Omit the ID to show information about the current release.
 
-	update	update an existing release
+	update
+		Update an existing release.
 
 		Takes a path to a file containing release configuration in a JSON format.
 		It can take any of the arguments the controller Release type can take, and
 		will override existing config with any values set thus. Omit the ID to
 		update the current release.
+
+	delete
+		Delete a release.
+
+		Any associated file artifacts (e.g. slugs) will also be deleted.
+
+	rollback
+		Rollback to a previous release. Deploys the previous release or specified release ID.
 
 Examples:
 
@@ -62,22 +75,21 @@ Examples:
 		"env": {"MY_VAR": "Hello World, this will be available in all process types."},
 		"processes": {
 			"echo": {
-				"cmd": ["socat -v tcp-l:$PORT,fork exec:/bin/cat"],
-				"entrypoint": ["sh", "-c"],
+				"args": ["sh", "-c", "socat -v tcp-l:$PORT,fork exec:/bin/cat"],
 				"env": {"ECHO": "This var is specific to the echo process type."},
 				"ports": [{"proto": "tcp"}]
 			}
 		}
 	}
 	$ flynn release add -f config.json https://registry.hub.docker.com?name=flynn/slugbuilder&id=15d72b7f573b
-	Created release 427537e78be4417fae2e24d11bc993eb.
+	Created release 989ce4a8-0088-444c-8379-caddded4b957.
 
 	$ flynn release
 	ID                                Created
-	427537e78be4417fae2e24d11bc993eb  11 seconds ago
+	989ce4a8-0088-444c-8379-caddded4b957  11 seconds ago
 
 	$ flynn release show
-	ID:             427537e78be4417fae2e24d11bc993eb
+	ID:             989ce4a8-0088-444c-8379-caddded4b957
 	Artifact:       docker+https://registry.hub.docker.com?name=flynn/slugbuilder&id=15d72b7f573b
 	Process Types:  echo
 	Created At:     2015-05-06 21:58:12.751741 +0000 UTC
@@ -91,13 +103,15 @@ Examples:
 			}
 		}
 	}
-	$ flynn release update 427537e78be4417fae2e24d11bc993eb update.json
-	Created release 0101020305080d1522375990e9000000.
+	$ flynn release update update.json
+	Created release 1a270395-8d31-4ec1-953a-0683b4f12635.
 
+	$ flynn release delete --yes c6b7f512-ef49-46f7-bb57-dd39e97bfb09
+	Deleted release c6b7f512-ef49-46f7-bb57-dd39e97bfb09 (deleted 1 files)
 `)
 }
 
-func runRelease(args *docopt.Args, client *controller.Client) error {
+func runRelease(args *docopt.Args, client controller.Client) error {
 	if args.Bool["show"] {
 		return runReleaseShow(args, client)
 	}
@@ -111,10 +125,16 @@ func runRelease(args *docopt.Args, client *controller.Client) error {
 	if args.Bool["update"] {
 		return runReleaseUpdate(args, client)
 	}
+	if args.Bool["delete"] {
+		return runReleaseDelete(args, client)
+	}
+	if args.Bool["rollback"] {
+		return runReleaseRollback(args, client)
+	}
 	return runReleaseList(args, client)
 }
 
-func runReleaseList(args *docopt.Args, client *controller.Client) error {
+func runReleaseList(args *docopt.Args, client controller.Client) error {
 	list, err := client.AppReleaseList(mustApp())
 	if err != nil {
 		return err
@@ -136,7 +156,7 @@ func runReleaseList(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runReleaseShow(args *docopt.Args, client *controller.Client) error {
+func runReleaseShow(args *docopt.Args, client controller.Client) error {
 	var release *ct.Release
 	var err error
 	if args.String["<id>"] != "" {
@@ -150,13 +170,13 @@ func runReleaseShow(args *docopt.Args, client *controller.Client) error {
 	if args.Bool["--json"] {
 		return json.NewEncoder(os.Stdout).Encode(release)
 	}
-	var artifactDesc string
-	if release.ArtifactID != "" {
-		artifact, err := client.GetArtifact(release.ArtifactID)
+	var artifacts []string
+	for _, id := range release.ArtifactIDs {
+		artifact, err := client.GetArtifact(id)
 		if err != nil {
 			return err
 		}
-		artifactDesc = fmt.Sprintf("%s+%s", artifact.Type, artifact.URI)
+		artifacts = append(artifacts, fmt.Sprintf("%s+%s", artifact.Type, artifact.URI))
 	}
 	types := make([]string, 0, len(release.Processes))
 	for typ := range release.Processes {
@@ -165,7 +185,9 @@ func runReleaseShow(args *docopt.Args, client *controller.Client) error {
 	w := tabwriter.NewWriter(os.Stdout, 1, 2, 2, ' ', 0)
 	defer w.Flush()
 	listRec(w, "ID:", release.ID)
-	listRec(w, "Artifact:", artifactDesc)
+	for i, artifact := range artifacts {
+		listRec(w, fmt.Sprintf("Artifact[%d]:", i), artifact)
+	}
 	listRec(w, "Process Types:", strings.Join(types, ", "))
 	listRec(w, "Created At:", release.CreatedAt)
 	for k, v := range release.Env {
@@ -174,7 +196,7 @@ func runReleaseShow(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runReleaseAddDocker(args *docopt.Args, client *controller.Client) error {
+func runReleaseAddDocker(args *docopt.Args, client controller.Client) error {
 	release := &ct.Release{}
 	if args.String["--file"] != "" {
 		data, err := ioutil.ReadFile(args.String["--file"])
@@ -187,19 +209,19 @@ func runReleaseAddDocker(args *docopt.Args, client *controller.Client) error {
 	}
 
 	artifact := &ct.Artifact{
-		Type: "docker",
+		Type: host.ArtifactTypeDocker,
 		URI:  args.String["<uri>"],
 	}
 	if err := client.CreateArtifact(artifact); err != nil {
 		return err
 	}
 
-	release.ArtifactID = artifact.ID
+	release.ArtifactIDs = []string{artifact.ID}
 	if err := client.CreateRelease(release); err != nil {
 		return err
 	}
 
-	if err := client.DeployAppRelease(mustApp(), release.ID); err != nil {
+	if err := client.DeployAppRelease(mustApp(), release.ID, nil); err != nil {
 		return err
 	}
 
@@ -208,7 +230,7 @@ func runReleaseAddDocker(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runReleaseUpdate(args *docopt.Args, client *controller.Client) error {
+func runReleaseUpdate(args *docopt.Args, client controller.Client) error {
 	var release *ct.Release
 	var err error
 	if args.String["<id>"] != "" {
@@ -232,7 +254,7 @@ func runReleaseUpdate(args *docopt.Args, client *controller.Client) error {
 	// Basically, there's no way to merge JSON that can reliably knock out set values.
 	// Instead, throw the --clean flag to start from a largely empty Release.
 	if args.Bool["--clean"] {
-		updates.ArtifactID = release.ArtifactID
+		updates.ArtifactIDs = release.ArtifactIDs
 		release = updates
 	} else {
 		release.ID = ""
@@ -249,11 +271,8 @@ func runReleaseUpdate(args *docopt.Args, client *controller.Client) error {
 				continue
 			}
 
-			if len(procUpdate.Cmd) > 0 {
-				procRelease.Cmd = procUpdate.Cmd
-			}
-			if len(procUpdate.Entrypoint) > 0 {
-				procRelease.Entrypoint = procUpdate.Entrypoint
+			if len(procUpdate.Args) > 0 {
+				procRelease.Args = procUpdate.Args
 			}
 			for key, value := range procUpdate.Env {
 				procRelease.Env[key] = value
@@ -288,11 +307,66 @@ func runReleaseUpdate(args *docopt.Args, client *controller.Client) error {
 		return err
 	}
 
-	if err := client.DeployAppRelease(mustApp(), release.ID); err != nil {
+	if err := client.DeployAppRelease(mustApp(), release.ID, nil); err != nil {
 		return err
 	}
 
 	log.Printf("Created release %s.", release.ID)
+
+	return nil
+}
+
+func runReleaseDelete(args *docopt.Args, client controller.Client) error {
+	releaseID := args.String["<id>"]
+	if !args.Bool["--yes"] {
+		if !promptYesNo(fmt.Sprintf("Are you sure you want to delete release %q?", releaseID)) {
+			return nil
+		}
+	}
+	res, err := client.DeleteRelease(mustApp(), releaseID)
+	if err != nil {
+		return err
+	}
+	if len(res.RemainingApps) > 0 {
+		log.Printf("Release scaled down for app but not fully deleted (still associated with %d other apps)", len(res.RemainingApps))
+	} else {
+		log.Printf("Deleted release %s (deleted %d files)", releaseID, len(res.DeletedFiles))
+	}
+	return nil
+}
+
+func runReleaseRollback(args *docopt.Args, client controller.Client) error {
+	currentRelease, err := client.GetAppRelease(mustApp())
+	if err != nil {
+		return err
+	}
+	releaseID := args.String["<id>"]
+	if releaseID == "" {
+		releases, err := client.AppReleaseList(mustApp())
+		if err != nil {
+			return err
+		}
+		if len(releases) < 2 {
+			return fmt.Errorf("Not enough releases to perform a rollback.")
+		}
+		releaseID = releases[1].ID
+	} else if releaseID == currentRelease.ID {
+		return fmt.Errorf("Release id given is the current release.")
+	}
+
+	if !args.Bool["--yes"] {
+		if !promptYesNo(fmt.Sprintf("Are you sure you want to rollback to release %q?", releaseID)) {
+			return nil
+		}
+	}
+
+	log.Printf("Rolling back to release %s from %s.\n", releaseID, currentRelease.ID)
+
+	if err := client.DeployAppRelease(mustApp(), releaseID, nil); err != nil {
+		return err
+	}
+
+	log.Printf("Successfully rolled back to release %s.\n", releaseID)
 
 	return nil
 }

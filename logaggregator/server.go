@@ -8,11 +8,12 @@ import (
 	"os"
 	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/logaggregator/snapshot"
 	"github.com/flynn/flynn/logaggregator/utils"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/syslog/rfc6587"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type Server struct {
@@ -24,11 +25,14 @@ type Server struct {
 	syslogListener net.Listener
 	apiListener    net.Listener
 	syslogWg       sync.WaitGroup
+	syslogDone     chan struct{}
 
 	hb discoverd.Heartbeater
 
 	api      http.Handler
 	shutdown chan struct{}
+
+	testMessageHook chan struct{}
 }
 
 type ServerConfig struct {
@@ -47,6 +51,7 @@ func NewServer(conf ServerConfig) *Server {
 		conf:       conf,
 		api:        apiHandler(a, c),
 		shutdown:   make(chan struct{}),
+		syslogDone: make(chan struct{}),
 	}
 }
 
@@ -63,6 +68,7 @@ func (s *Server) Shutdown() {
 		if err := s.syslogListener.Close(); err != nil {
 			log15.Error("syslog listener shutdown error", "err", err)
 		}
+		<-s.syslogDone
 	}
 	if s.apiListener != nil {
 		if err := s.apiListener.Close(); err != nil {
@@ -118,15 +124,17 @@ func (s *Server) SyslogAddr() net.Addr {
 
 func (s *Server) Start() error {
 	var err error
-	s.syslogListener, err = net.Listen("tcp", s.conf.SyslogAddr)
+	sl, err := net.Listen("tcp", s.conf.SyslogAddr)
 	if err != nil {
 		return err
 	}
+	s.syslogListener = keepalive.Listener(sl)
 
-	s.apiListener, err = net.Listen("tcp", s.conf.ApiAddr)
+	al, err := net.Listen("tcp", s.conf.ApiAddr)
 	if err != nil {
 		return err
 	}
+	s.apiListener = keepalive.Listener(al)
 
 	if s.conf.Discoverd != nil {
 		s.hb, err = s.conf.Discoverd.AddServiceAndRegister(s.conf.ServiceName, s.conf.SyslogAddr)
@@ -142,6 +150,7 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) runSyslog() {
+	defer close(s.syslogDone)
 	for {
 		conn, err := s.syslogListener.Accept()
 		if err != nil {
@@ -182,6 +191,9 @@ func (s *Server) drainSyslogConn(conn net.Conn) {
 		} else {
 			s.Cursors.Update(string(msg.Hostname), cursor)
 			s.Aggregator.Feed(msg)
+		}
+		if s.testMessageHook != nil {
+			s.testMessageHook <- struct{}{}
 		}
 	}
 }

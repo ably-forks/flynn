@@ -13,15 +13,15 @@ import (
 	"strings"
 	"time"
 
-	gctx "github.com/flynn/flynn/Godeps/_workspace/src/github.com/gorilla/context"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/gorilla/sessions"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jvatic/asset-matrix-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/pkg/cors"
 	"github.com/flynn/flynn/pkg/ctxhelper"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/status"
+	gctx "github.com/gorilla/context"
+	"github.com/gorilla/sessions"
+	"github.com/julienschmidt/httprouter"
+	"github.com/jvatic/asset-matrix-go"
+	"golang.org/x/net/context"
 )
 
 type LoginInfo struct {
@@ -63,7 +63,6 @@ func APIHandler(conf *Config) http.Handler {
 	router.DELETE(prefixPath("/user/session"), api.WrapHandler(api.Logout))
 
 	router.GET(prefixPath("/config"), api.WrapHandler(api.GetConfig))
-	router.GET(prefixPath("/cert"), api.WrapHandler(api.GetCert))
 
 	router.NotFound = router2.ServeHTTP
 	router2.GET(prefixPath("/*path"), api.WrapHandler(api.ServeAsset))
@@ -227,13 +226,17 @@ type OAuthToken struct {
 type ExpandedUser struct {
 	Auths         map[string]*OAuthToken `json:"auths"`
 	ControllerKey string                 `json:"controller_key"`
+	StatusKey     string                 `json:"status_key"`
 }
 
 type UserConfig struct {
 	User *ExpandedUser `json:"user,omitempty"`
 
-	Endpoints          map[string]string `json:"endpoints"`
-	DefaultRouteDomain string            `json:"default_route_domain"`
+	Endpoints               map[string]string `json:"endpoints"`
+	DefaultRouteDomain      string            `json:"default_route_domain"`
+	GithubAPIURL            string            `json:"github_api_url"`
+	GithubTokenURL          string            `json:"github_token_url"`
+	GithubCloneAuthRequired bool              `json:"github_clone_auth_required"`
 }
 
 var baseConfig = UserConfig{
@@ -247,7 +250,12 @@ func (api *API) GetConfig(ctx context.Context, w http.ResponseWriter, req *http.
 	config := baseConfig
 
 	config.Endpoints["cluster_controller"] = fmt.Sprintf("https://%s", api.conf.ControllerDomain)
+	config.Endpoints["cluster_status"] = fmt.Sprintf("https://status.%s", api.conf.DefaultRouteDomain)
+	config.Endpoints["cert"] = fmt.Sprintf("http://%s/ca-cert", api.conf.ControllerDomain)
 	config.DefaultRouteDomain = api.conf.DefaultRouteDomain
+	config.GithubAPIURL = api.conf.GithubAPIURL
+	config.GithubTokenURL = api.conf.GithubTokenURL
+	config.GithubCloneAuthRequired = api.conf.GithubCloneAuthRequired
 
 	if api.IsAuthenticated(ctx) {
 		config.User = &ExpandedUser{}
@@ -258,21 +266,18 @@ func (api *API) GetConfig(ctx context.Context, w http.ResponseWriter, req *http.
 		}
 
 		config.User.ControllerKey = api.conf.ControllerKey
+		config.User.StatusKey = api.conf.StatusKey
 	}
 
 	httphelper.JSON(w, 200, config)
 }
 
-func (api *API) GetCert(ctx context.Context, w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
-	w.Write(api.conf.CACert)
-}
-
 type DashboardConfig struct {
-	AppName     string `json:"APP_NAME"`
-	ApiServer   string `json:"API_SERVER"`
-	PathPrefix  string `json:"PATH_PREFIX"`
-	InstallCert bool   `json:"INSTALL_CERT"`
+	AppName              string `json:"APP_NAME"`
+	ApiServer            string `json:"API_SERVER"`
+	PathPrefix           string `json:"PATH_PREFIX"`
+	InstallCert          bool   `json:"INSTALL_CERT"`
+	DefaultDeployTimeout int    `json:"DEFAULT_DEPLOY_TIMEOUT"`
 }
 
 func (api *API) ServeDashboardJs(ctx context.Context, w http.ResponseWriter, req *http.Request) {
@@ -304,10 +309,11 @@ func (api *API) cacheDashboardJS() error {
 
 	data.Write([]byte("window.DashboardConfig = "))
 	json.NewEncoder(&data).Encode(DashboardConfig{
-		AppName:     api.conf.AppName,
-		ApiServer:   api.conf.URL,
-		PathPrefix:  api.conf.PathPrefix,
-		InstallCert: len(api.conf.CACert) > 0,
+		AppName:              api.conf.AppName,
+		ApiServer:            api.conf.URL,
+		PathPrefix:           api.conf.PathPrefix,
+		InstallCert:          api.conf.InstallCert,
+		DefaultDeployTimeout: api.conf.DefaultDeployTimeout,
 	})
 	data.Write([]byte(";\n"))
 	io.Copy(&data, js)

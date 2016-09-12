@@ -18,7 +18,10 @@
     "id": "discoverd",
     "app": {
       "name": "discoverd",
-      "meta": {"flynn-system-app": "true"}
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
     },
     "action": "run-app",
     "release": {
@@ -31,7 +34,6 @@
         "app": {
           "ports": [{"port": 1111, "proto": "tcp"}, {"port": 53, "proto": "tcp"}],
           "data": true,
-          "resurrect": true,
           "host_network": true,
           "omni": true,
           "service": "discoverd"
@@ -61,7 +63,6 @@
       "processes": {
         "app": {
           "ports": [{"port": 5002, "proto": "tcp"}],
-          "resurrect": true,
           "host_network": true,
           "omni": true
         }
@@ -87,7 +88,10 @@
     "id": "postgres",
     "app": {
       "name": "postgres",
-      "meta": {"flynn-system-app": "true"}
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
     },
     "action": "run-app",
     "release": {
@@ -96,22 +100,22 @@
         "PGDATABASE": "postgres",
         "PGHOST": "leader.postgres.discoverd",
         "PGUSER": "flynn",
-        "PGPASSWORD": "{{ (index .StepData \"pg-password\").Data }}"
+        "PGPASSWORD": "{{ (index .StepData \"pg-password\").Data }}",
+        "SIRENIA_PROCESS": "postgres"
       },
       "processes": {
         "postgres": {
           "ports": [{"port": 5432, "proto": "tcp"}],
           "data": true,
-          "cmd": ["postgres"],
+          "args": ["/bin/start-flynn-postgres", "postgres"],
           "service": "postgres",
           "env": {
             "SINGLETON": "{{ .Singleton }}"
-          },
-          "resurrect": true
+          }
         },
         "web": {
           "ports": [{"port": 80, "proto": "tcp"}],
-          "cmd": ["api"]
+          "args": ["/bin/start-flynn-postgres", "api"]
         }
       }
     },
@@ -167,12 +171,14 @@
     "action": "run-app",
     "app": {
       "name": "controller",
-      "meta": {"flynn-system-app": "true"}
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      }
     },
     "release": {
       "env": {
         "AUTH_KEY": "{{ (index .StepData \"controller-key\").Data }}",
-        "BACKOFF_PERIOD": "{{ getenv \"BACKOFF_PERIOD\" }}",
         "DEFAULT_ROUTE_DOMAIN": "{{ getenv \"CLUSTER_DOMAIN\" }}",
         "NAME_SEED": "{{ (index .StepData \"name-seed\").Data }}",
         "CA_CERT": "{{ (index .StepData \"controller-cert\").CACert }}"
@@ -180,19 +186,17 @@
       "processes": {
         "web": {
           "ports": [{"port": 80, "proto": "tcp"}],
-          "cmd": ["controller"],
-          "service": "controller",
-          "resurrect": true
+          "args": ["/bin/start-flynn-controller", "controller"],
+          "service": "controller"
         },
         "scheduler": {
-          "cmd": ["scheduler"],
+          "args": ["/bin/start-flynn-controller", "scheduler"],
           "omni": true,
           "service": "controller-scheduler",
-          "ports": [{ "proto": "tcp" }],
-          "resurrect": true
+          "ports": [{ "proto": "tcp" }]
         },
         "worker": {
-          "cmd": ["worker"],
+          "args": ["/bin/start-flynn-controller", "worker"],
           "ports": [{ "proto": "tcp" }]
         }
       }
@@ -229,8 +233,11 @@
     "from_step": "postgres",
     "app": {
       "name": "postgres",
-      "meta": {"flynn-system-app": "true"},
-      "strategy": "postgres",
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      },
+      "strategy": "sirenia",
       "deploy_timeout": 120
     }
   },
@@ -250,9 +257,12 @@
     "from_step": "discoverd",
     "app": {
       "name": "discoverd",
-      "meta": {"flynn-system-app": "true"},
+      "meta": {
+        "flynn-system-app": "true",
+        "flynn-system-critical": "true"
+      },
       "strategy": "discoverd-meta",
-      "deploy_timeout": 120
+      "deploy_timeout": 300
     }
   },
   {
@@ -274,6 +284,30 @@
     }
   },
   {
+    "id": "slugbuilder-image",
+    "action": "create-artifact",
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/slugbuilder&id=$image_id[slugbuilder]"
+    }
+  },
+  {
+    "id": "slugrunner-image",
+    "action": "create-artifact",
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/slugrunner&id=$image_id[slugrunner]"
+    }
+  },
+  {
+    "id": "redis-image",
+    "action": "create-artifact",
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/redis&id=$image_id[redis]"
+    }
+  },
+  {
     "id": "redis",
     "app": {
       "name": "redis",
@@ -284,12 +318,12 @@
       "env": {
         "FLYNN_REDIS": "redis",
         "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
-        "REDIS_IMAGE_URI": "$image_repository?name=flynn/redis&id=$image_id[redis]"
+        "REDIS_IMAGE_ID": "{{ (index .StepData \"redis-image\").ID }}"
       },
       "processes": {
         "web": {
           "ports": [{"port": 80, "proto": "tcp"}],
-          "cmd": ["api"]
+          "args": ["/bin/start-flynn-redis", "api"]
         }
       }
     },
@@ -308,6 +342,117 @@
     "url":"http://redis-api.discoverd/clusters"
   },
   {
+    "id": "mariadb-password",
+    "action": "gen-random"
+  },
+  {
+    "id": "mariadb",
+    "app": {
+      "name": "mariadb",
+      "strategy": "sirenia",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "action": "deploy-app",
+    "release": {
+      "env": {
+        "FLYNN_MYSQL": "mariadb",
+        "MYSQL_HOST": "leader.mariadb.discoverd",
+        "MYSQL_DATABASE": "mysql",
+        "MYSQL_USER": "flynn",
+        "MYSQL_PWD": "{{ (index .StepData \"mariadb-password\").Data }}",
+        "SIRENIA_PROCESS": "mariadb"
+      },
+      "processes": {
+        "mariadb": {
+          "ports": [{"port": 3306, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mariadb", "mariadb"],
+          "service": "mariadb",
+          "env": {
+            "SINGLETON": "{{ .Singleton }}"
+          },
+          "data": true
+        },
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mariadb", "api"],
+          "env": {
+            "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}"
+          }
+        }
+      }
+    },
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/mariadb&id=$image_id[mariadb]"
+    },
+    "processes": {
+      "mariadb": 0,
+      "web": 2
+    }
+  },
+  {
+    "id": "add-mysql-provider",
+    "action": "add-provider",
+    "name": "mysql",
+    "url": "http://mariadb-api.discoverd/databases"
+  },
+  {
+    "id": "mongodb-password",
+    "action": "gen-random"
+  },
+  {
+    "id": "mongodb",
+    "app": {
+      "name": "mongodb",
+      "strategy": "sirenia",
+      "meta": {"flynn-system-app": "true"},
+      "deploy_timeout": 240
+    },
+    "action": "deploy-app",
+    "release": {
+      "env": {
+        "FLYNN_MONGO": "mongodb",
+        "MONGO_DATABASE": "admin",
+        "MONGO_HOST": "leader.mongodb.discoverd",
+        "MONGO_USER": "flynn",
+        "MONGO_PWD": "{{ (index .StepData \"mongodb-password\").Data }}",
+        "SIRENIA_PROCESS": "mongodb"
+      },
+      "processes": {
+        "mongodb": {
+          "ports": [{"port": 27017, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mongodb", "mongodb"],
+          "service": "mongodb",
+          "env": {
+            "SINGLETON": "{{ .Singleton }}"
+          },
+          "data": true
+        },
+        "web": {
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "args": ["/bin/start-flynn-mongodb", "api"],
+          "env": {
+            "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}"
+          }
+        }
+      }
+    },
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/mongodb&id=$image_id[mongodb]"
+    },
+    "processes": {
+      "mongodb": 0,
+      "web": 2
+    }
+  },
+  {
+    "id": "add-mongodb-provider",
+    "action": "add-provider",
+    "name": "mongodb",
+    "url": "http://mongodb-api.discoverd/databases"
+  },
+  {
     "id": "blobstore",
     "action": "deploy-app",
     "app": {
@@ -321,7 +466,8 @@
     "release": {
       "processes": {
         "web": {
-          "ports": [{"port": 80, "proto": "tcp"}]
+          "ports": [{"port": 80, "proto": "tcp"}],
+          "service": "blobstore"
         }
       }
     },
@@ -350,8 +496,9 @@
       "processes": {
         "app": {
           "host_network": true,
-          "cmd": ["-http-port", "80", "-https-port", "443", "-tcp-range-start", "3000", "-tcp-range-end", "3500"],
-          "omni": true
+          "args": ["/bin/flynn-router", "-http-port", "80", "-https-port", "443", "-tcp-range-start", "3000", "-tcp-range-end", "3500"],
+          "omni": true,
+          "service": "router-api"
         }
       }
     },
@@ -374,8 +521,8 @@
     "release": {
       "env": {
         "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
-        "SLUGBUILDER_IMAGE_URI": "$image_repository?name=flynn/slugbuilder&id=$image_id[slugbuilder]",
-        "SLUGRUNNER_IMAGE_URI": "$image_repository?name=flynn/slugrunner&id=$image_id[slugrunner]"
+        "SLUGBUILDER_IMAGE_ID": "{{ (index .StepData \"slugbuilder-image\").ID }}",
+        "SLUGRUNNER_IMAGE_ID": "{{ (index .StepData \"slugrunner-image\").ID }}"
       },
       "processes": {
         "app": {
@@ -385,6 +532,47 @@
               "service": {
                 "name": "gitreceive",
                 "create": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    "processes": {
+      "app": 2
+    }
+  },
+  {
+    "id": "docker-receive-secret",
+    "action": "gen-random"
+  },
+  {
+    "id": "docker-receive",
+    "action": "deploy-app",
+    "app": {
+      "name": "docker-receive",
+      "meta": {"flynn-system-app": "true"}
+    },
+    "artifact": {
+      "type": "docker",
+      "uri": "$image_repository?name=flynn/docker-receive&id=$image_id[docker-receive]"
+    },
+    "release": {
+      "env": {
+        "AUTH_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "REGISTRY_HTTP_SECRET": "{{ (index .StepData \"docker-receive-secret\").Data }}"
+      },
+      "processes": {
+        "app": {
+          "ports": [
+            {
+              "port": 80,
+              "proto": "tcp",
+              "service": {
+                "name": "docker-receive",
+                "create": true,
+                "check": {"type": "http", "path": "/.well-known/status"}
               }
             }
           ]
@@ -409,6 +597,15 @@
     "type": "http",
     "service": "gitreceive",
     "domain": "git.{{ getenv \"CLUSTER_DOMAIN\" }}"
+  },
+  {
+    "id": "docker-receive-route",
+    "action": "add-route",
+    "app_step": "docker-receive",
+    "cert_step": "controller-cert",
+    "type": "http",
+    "service": "docker-receive",
+    "domain": "docker.{{ getenv \"CLUSTER_DOMAIN\" }}"
   },
   {
     "id": "controller-route",
@@ -440,7 +637,7 @@
     "release": {
       "processes": {
         "app": {
-          "cmd": ["-logaddr", ":514", "-apiaddr", ":80"],
+          "args": ["/bin/logaggregator", "-logaddr", ":514", "-apiaddr", ":80"],
           "ports": [
             {"port": 80, "proto": "tcp"},
             {"port": 514, "proto": "tcp"}
@@ -466,10 +663,15 @@
     "release": {
       "env": {
         "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
-        "SLUGBUILDER_IMAGE_URI": "$image_repository?name=flynn/slugbuilder&id=$image_id[slugbuilder]",
-        "SLUGRUNNER_IMAGE_URI": "$image_repository?name=flynn/slugrunner&id=$image_id[slugrunner]"
+        "SLUGBUILDER_IMAGE_ID": "{{ (index .StepData \"slugbuilder-image\").ID }}",
+        "SLUGRUNNER_IMAGE_ID": "{{ (index .StepData \"slugrunner-image\").ID }}"
       }
     }
+  },
+  {
+    "id": "status-key",
+    "action": "gen-random",
+    "data": "{{ getenv \"STATUS_KEY\" }}"
   },
   {
     "id": "dashboard",
@@ -487,12 +689,12 @@
         "DEFAULT_ROUTE_DOMAIN": "{{ getenv \"CLUSTER_DOMAIN\" }}",
         "CONTROLLER_DOMAIN": "controller.{{ getenv \"CLUSTER_DOMAIN\" }}",
         "CONTROLLER_KEY": "{{ (index .StepData \"controller-key\").Data }}",
+        "STATUS_KEY": "{{ (index .StepData \"status-key\").Data }}",
         "URL": "https://dashboard.{{ getenv \"CLUSTER_DOMAIN\" }}",
         "SESSION_SECRET": "{{ (index .StepData \"dashboard-session-secret\").Data }}",
         "LOGIN_TOKEN": "{{ (index .StepData \"dashboard-login-token\").Data }}",
         "APP_NAME": "dashboard",
-        "SECURE_COOKIES": "true",
-        "CA_CERT": "{{ (index .StepData \"controller-cert\").CACert }}"
+        "SECURE_COOKIES": "true"
       },
       "processes": {
         "web": {
@@ -520,11 +722,6 @@
     "type": "http",
     "service": "dashboard-web",
     "domain": "dashboard.{{ getenv \"CLUSTER_DOMAIN\" }}"
-  },
-  {
-    "id": "status-key",
-    "action": "gen-random",
-    "data": "{{ getenv \"STATUS_KEY\" }}"
   },
   {
     "id": "status",
@@ -572,10 +769,20 @@
     "url": "http://redis-api.discoverd/ping"
   },
   {
+    "id": "mariadb-wait",
+    "action": "wait",
+    "url": "http://mariadb-api.discoverd/ping"
+  },
+  {
+    "id": "mongodb-wait",
+    "action": "wait",
+    "url": "http://mongodb-api.discoverd/ping"
+  },
+  {
     "id": "blobstore-wait",
     "action": "wait",
     "url": "http://blobstore.discoverd",
-    "status": 404
+    "status": 200
   },
   {
     "id": "gitreceive-wait",
@@ -583,9 +790,20 @@
     "url": "tcp://gitreceive.discoverd"
   },
   {
+    "id": "docker-receive-wait",
+    "action": "wait",
+    "url": "http://docker-receive.discoverd/v2/",
+    "status": 401
+  },
+  {
     "id": "status-check",
     "action": "status-check",
     "url": "http://status-web.discoverd"
+  },
+  {
+    "id": "cluster-monitor",
+    "action": "cluster-monitor",
+    "enabled": true
   },
   {
     "id": "log-complete",

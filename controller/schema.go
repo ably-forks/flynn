@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/flynn/flynn/pkg/postgres"
 )
 
@@ -241,8 +244,255 @@ $$ LANGUAGE plpgsql`,
 	migrations.Add(10,
 		`ALTER TABLE formations ADD COLUMN tags jsonb`,
 	)
+	migrations.Add(11,
+		`INSERT INTO deployment_strategies VALUES ('sirenia')`,
+		`UPDATE apps SET strategy = 'sirenia' WHERE name = 'postgres'`,
+		`DELETE FROM deployment_strategies WHERE name = 'postgres'`,
+	)
+	migrations.Add(12,
+		`INSERT INTO event_types (name) VALUES ('resource_app_deletion')`,
+	)
+	migrations.Add(13,
+		// define a function to merge two JSON objects, taken from:
+		// https://gist.github.com/inindev/2219dff96851928c2282
+		`CREATE OR REPLACE FUNCTION public.jsonb_merge(data jsonb, merge_data jsonb)
+		RETURNS jsonb
+		IMMUTABLE
+		LANGUAGE sql
+		AS $$
+		    SELECT json_object_agg(key, value)::jsonb
+		    FROM (
+			WITH to_merge AS (
+			    SELECT * FROM jsonb_each(merge_data)
+			)
+			SELECT *
+			FROM jsonb_each(data)
+			WHERE key NOT IN (SELECT key FROM to_merge)
+			UNION ALL
+			SELECT * FROM to_merge
+		    ) t;
+		$$`,
+		`UPDATE apps SET meta = jsonb_merge(meta, '{"flynn-system-critical":"true"}') WHERE name IN ('discoverd', 'flannel', 'postgres', 'controller')`,
+	)
+	migrations.Add(14,
+		`CREATE TABLE backup_statuses (name text PRIMARY KEY)`,
+		`INSERT INTO backup_statuses (name) VALUES
+			('running'), ('complete'), ('error')`,
+		`CREATE TABLE backups (
+			backup_id uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
+			status text NOT NULL REFERENCES backup_statuses (name),
+			sha512 text,
+			size bigint,
+			error text,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			completed_at timestamptz,
+			deleted_at timestamptz
+		)`,
+		`INSERT INTO event_types (name) VALUES ('cluster_backup')`,
+	)
+	migrations.Add(15,
+		`ALTER TABLE artifacts ADD COLUMN meta jsonb`,
+		`CREATE TABLE release_artifacts (
+			release_id uuid NOT NULL REFERENCES releases (release_id),
+			artifact_id uuid NOT NULL REFERENCES artifacts (artifact_id),
+			created_at timestamptz NOT NULL DEFAULT now(),
+			deleted_at timestamptz,
+			PRIMARY KEY (release_id, artifact_id))`,
+
+		// add a check to ensure releases only have a single "docker"
+		// artifact, and that artifact is added first
+		`CREATE FUNCTION check_release_artifacts() RETURNS OPAQUE AS $$
+			BEGIN
+			    IF (
+			      SELECT COUNT(*)
+			      FROM release_artifacts r
+			      INNER JOIN artifacts a ON r.artifact_id = a.artifact_id
+			      WHERE r.release_id = NEW.release_id AND a.type = 'docker'
+			    ) != 1 THEN
+			      RAISE EXCEPTION 'must have exactly one artifact of type "docker"' USING ERRCODE = 'check_violation';
+			    END IF;
+
+			    RETURN NULL;
+			END;
+			$$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER release_artifacts_trigger
+			AFTER INSERT ON release_artifacts
+			FOR EACH ROW EXECUTE PROCEDURE check_release_artifacts()`,
+		`INSERT INTO release_artifacts (release_id, artifact_id) (SELECT release_id, artifact_id FROM releases WHERE artifact_id IS NOT NULL)`,
+
+		// set "git=true" for releases with SLUG_URL set
+		`UPDATE releases SET meta = jsonb_merge(CASE WHEN meta = 'null' THEN '{}' ELSE meta END, '{"git":"true"}') WHERE env ? 'SLUG_URL'`,
+
+		// create file artifacts for any releases with SLUG_URL set,
+		// taking care not to create duplicate artifacts
+		`DO $$
+		DECLARE
+			release RECORD;
+			artifact uuid;
+		BEGIN
+			FOR release IN SELECT * FROM releases WHERE env ? 'SLUG_URL' LOOP
+				SELECT INTO artifact artifact_id FROM artifacts WHERE type = 'file' AND uri = release.env->>'SLUG_URL';
+
+				IF NOT FOUND THEN
+					INSERT INTO artifacts (type, uri, meta)
+					VALUES ('file', release.env->>'SLUG_URL', '{"blobstore":"true"}')
+					RETURNING artifact_id INTO artifact;
+				END IF;
+
+				INSERT INTO release_artifacts (release_id, artifact_id) VALUES(release.release_id, artifact);
+			END LOOP;
+		END $$`,
+		`ALTER TABLE releases DROP COLUMN artifact_id`,
+	)
+	migrations.Add(16,
+		// set "blobstore=true" for artifacts stored in the blobstore
+		`UPDATE artifacts SET meta = jsonb_merge(CASE WHEN meta = 'null' THEN '{}' ELSE meta END, '{"blobstore":"true"}') WHERE uri LIKE 'http://blobstore.discoverd/%'`,
+
+		`INSERT INTO event_types (name) VALUES ('release_deletion')`,
+
+		// add a trigger to prevent current app releases from being deleted
+		`CREATE FUNCTION check_release_delete() RETURNS OPAQUE AS $$
+			BEGIN
+				IF NEW.deleted_at IS NOT NULL AND (SELECT COUNT(*) FROM apps WHERE release_id = NEW.release_id) != 0 THEN
+					RAISE EXCEPTION 'cannot delete current app release' USING ERRCODE = 'check_violation';
+				END IF;
+
+				RETURN NULL;
+			END;
+		$$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER check_release_delete AFTER UPDATE ON releases FOR EACH ROW EXECUTE PROCEDURE check_release_delete()`,
+	)
+	migrations.Add(17,
+		// add an "index" column to release_artifacts which is set
+		// explicitly to the array index of release.ArtifactIDs
+		`ALTER TABLE release_artifacts ADD COLUMN index integer`,
+		`CREATE UNIQUE INDEX ON release_artifacts (release_id, index) WHERE deleted_at IS NULL`,
+		`DO $$
+		DECLARE
+			row RECORD;
+			release uuid;
+			i int;
+		BEGIN
+			FOR release IN SELECT DISTINCT(release_id) FROM release_artifacts LOOP
+				i := 0;
+				FOR row IN SELECT * FROM release_artifacts WHERE release_id = release ORDER BY created_at ASC LOOP
+					UPDATE release_artifacts SET index = i WHERE release_id = release AND artifact_id = row.artifact_id;
+					i := i + 1;
+				END LOOP;
+			END LOOP;
+		END $$`,
+		`ALTER TABLE release_artifacts ALTER COLUMN index SET NOT NULL`,
+	)
+	migrations.Add(18,
+		`INSERT INTO event_types (name) VALUES ('app_garbage_collection')`,
+	)
+	migrations.AddSteps(19,
+		migrateProcessArgs,
+	)
+	migrations.Add(20,
+		// update Redis app service name to match the app name
+		`UPDATE releases
+		SET processes = r.processes
+		FROM (
+			SELECT r.release_id AS id, jsonb_set(r.processes, '{redis,service}', ('"' || a.name || '"')::jsonb, true) AS processes
+			FROM releases r
+			INNER JOIN apps a USING (release_id)
+			WHERE a.meta->>'flynn-system-app' = 'true' AND a.name LIKE 'redis-%'
+		) r
+		WHERE release_id = r.id`,
+	)
 }
 
 func migrateDB(db *postgres.DB) error {
 	return migrations.Migrate(db)
+}
+
+// migrateProcessArgs sets ProcessType.Args from Entrypoint / Cmd for every
+// release, and also prepends an explicit entrypoint for system and slug apps
+// (they will no longer use the Dockerfile Entrypoint as they have some args
+// like `scheduler` for the controller scheduler and `start web` for slugs).
+func migrateProcessArgs(tx *postgres.DBTx) error {
+	type Release struct {
+		ID      string
+		AppName *string
+		AppMeta map[string]string
+		Meta    map[string]string
+
+		// use map[string]interface{} for process types so we can
+		// just update Args and leave other fields untouched
+		Processes map[string]map[string]interface{}
+	}
+
+	// get all the releases with the associated app name if set
+	var releases []Release
+	rows, err := tx.Query("SELECT r.release_id, r.meta, r.processes, a.name, a.meta FROM releases r LEFT JOIN apps a ON a.release_id = r.release_id")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var release Release
+		if err := rows.Scan(&release.ID, &release.Meta, &release.Processes, &release.AppName, &release.AppMeta); err != nil {
+			rows.Close()
+			return err
+		}
+		releases = append(releases, release)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, release := range releases {
+		for typ, proc := range release.Processes {
+			// if the release is for a system app which has a Cmd,
+			// explicitly set the Entrypoint
+			var cmd []interface{}
+			if v, ok := proc["cmd"]; ok {
+				cmd = v.([]interface{})
+			}
+			if release.AppName != nil && release.AppMeta["flynn-system-app"] == "true" && len(cmd) > 0 {
+				switch *release.AppName {
+				case "postgres":
+					proc["entrypoint"] = []interface{}{"/bin/start-flynn-postgres"}
+				case "controller":
+					proc["entrypoint"] = []interface{}{"/bin/start-flynn-controller"}
+				case "redis":
+					proc["entrypoint"] = []interface{}{"/bin/start-flynn-redis"}
+				case "mariadb":
+					proc["entrypoint"] = []interface{}{"/bin/start-flynn-mariadb"}
+				case "mongodb":
+					proc["entrypoint"] = []interface{}{"/bin/start-flynn-mongodb"}
+				case "router":
+					proc["entrypoint"] = []interface{}{"/bin/flynn-router"}
+				case "logaggregator":
+					proc["entrypoint"] = []interface{}{"/bin/logaggregator"}
+				default:
+					if strings.HasPrefix(*release.AppName, "redis-") {
+						proc["entrypoint"] = []interface{}{"/bin/start-flynn-redis"}
+					} else {
+						panic(fmt.Sprintf("migration failed to set entrypoint for system app %s", *release.AppName))
+					}
+				}
+			}
+
+			// git releases use the slugrunner which need an Entrypoint
+			if release.Meta["git"] == "true" {
+				proc["entrypoint"] = []interface{}{"/runner/init"}
+			}
+
+			// construct Args by appending Cmd to Entrypoint
+			var args []interface{}
+			if v, ok := proc["entrypoint"]; ok {
+				args = v.([]interface{})
+			}
+			proc["args"] = append(args, cmd...)
+			release.Processes[typ] = proc
+		}
+
+		// save the processes back to the db
+		if err := tx.Exec("UPDATE releases SET processes = $1 WHERE release_id = $2", release.Processes, release.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

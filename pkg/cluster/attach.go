@@ -47,8 +47,11 @@ func (c *Host) Attach(req *host.AttachReq, wait bool) (AttachClient, error) {
 				errBytes = errBytes[4:]
 			}
 			errMsg := string(errBytes)
-			if errMsg == host.ErrJobNotRunning.Error() {
+			switch errMsg {
+			case host.ErrJobNotRunning.Error():
 				return host.ErrJobNotRunning
+			case host.ErrAttached.Error():
+				return host.ErrAttached
 			}
 			return errors.New(errMsg)
 		default:
@@ -140,6 +143,7 @@ func (c *attachClient) Wait() error {
 func (c *attachClient) Receive(stdout, stderr io.Writer) (int, error) {
 	if c.wait != nil {
 		if err := c.wait(); err != nil {
+			c.mtx.Unlock()
 			return -1, err
 		}
 		c.mtx.Unlock()
@@ -254,7 +258,5 @@ func (c *attachClient) CloseWrite() error {
 }
 
 func (c *attachClient) Close() error {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
 	return c.conn.Close()
 }

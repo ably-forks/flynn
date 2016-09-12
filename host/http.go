@@ -15,9 +15,6 @@ import (
 	"sync"
 	"time"
 
-	tuf "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/client"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/host/downloader"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/host/volume/api"
@@ -26,9 +23,13 @@ import (
 	"github.com/flynn/flynn/pinkerton/layer"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/sse"
 	"github.com/flynn/flynn/pkg/version"
+	tuf "github.com/flynn/go-tuf/client"
+	"github.com/julienschmidt/httprouter"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type Host struct {
@@ -47,6 +48,8 @@ type Host struct {
 
 	listener net.Listener
 
+	maxJobConcurrency uint64
+
 	log log15.Logger
 }
 
@@ -62,7 +65,6 @@ func (h *Host) StopJob(id string) error {
 	}
 	defer h.state.Release()
 
-	log.Info("getting job")
 	job := h.state.GetJob(id)
 	if job == nil {
 		log.Warn("job not found")
@@ -72,6 +74,13 @@ func (h *Host) StopJob(id string) error {
 	case host.StatusStarting:
 		log.Info("job status is starting, marking it as stopped")
 		h.state.SetForceStop(id)
+
+		// if the job doesn't exist in the backend, mark it as done
+		// to avoid it remaining in the starting state indefinitely
+		if !h.backend.JobExists(id) {
+			h.state.SetStatusDone(id, 0)
+		}
+
 		return nil
 	case host.StatusRunning:
 		log.Info("stopping job")
@@ -85,7 +94,6 @@ func (h *Host) StopJob(id string) error {
 func (h *Host) SignalJob(id string, sig int) error {
 	log := h.log.New("fn", "SignalJob", "job.id", id, "sig", sig)
 
-	log.Info("getting job")
 	job := h.state.GetJob(id)
 	if job == nil {
 		log.Warn("job not found")
@@ -102,8 +110,61 @@ func (h *Host) streamEvents(id string, w http.ResponseWriter) error {
 	return nil
 }
 
+func (h *Host) ConfigureNetworking(config *host.NetworkConfig) {
+	log := h.log.New("fn", "ConfigureNetworking")
+
+	if config.JobID != "" {
+		log.Info("persisting flannel job_id", "job.id", config.JobID)
+		if err := h.state.SetPersistentSlot("flannel", config.JobID); err != nil {
+			log.Error("error assigning flannel to persistent slot")
+		}
+	}
+	h.networkOnce.Do(func() {
+		log.Info("configuring network", "subnet", config.Subnet, "mtu", config.MTU, "resolvers", config.Resolvers)
+		if err := h.backend.ConfigureNetworking(config); err != nil {
+			log.Error("error configuring network", "err", err)
+			shutdown.Fatal(err)
+		}
+
+		h.statusMtx.Lock()
+		h.status.Network = config
+		h.statusMtx.Unlock()
+	})
+	h.statusMtx.Lock()
+	h.status.Network.JobID = config.JobID
+	h.backend.SetNetworkConfig(h.status.Network)
+	h.statusMtx.Unlock()
+}
+
+func (h *Host) ConfigureDiscoverd(config *host.DiscoverdConfig) {
+	log := h.log.New("fn", "ConfigureDiscoverd")
+
+	if config.JobID != "" {
+		log.Info("persisting discoverd job_id", "job.id", config.JobID)
+		if err := h.state.SetPersistentSlot("discoverd", config.JobID); err != nil {
+			log.Error("error assigning discoverd to persistent slot")
+		}
+	}
+
+	if config.URL != "" && config.DNS != "" {
+		go h.discoverdOnce.Do(func() {
+			log.Info("connecting to service discovery", "url", config.URL)
+			if err := h.discMan.ConnectLocal(config.URL); err != nil {
+				log.Error("error connecting to service discovery", "err", err)
+				shutdown.Fatal(err)
+			}
+		})
+	}
+
+	h.statusMtx.Lock()
+	h.status.Discoverd = config
+	h.backend.SetDiscoverdConfig(h.status.Discoverd)
+	h.statusMtx.Unlock()
+}
+
 type jobAPI struct {
-	host *Host
+	host                  *Host
+	addJobRateLimitBucket *RateLimitBucket
 }
 
 func (h *jobAPI) ListJobs(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -131,7 +192,6 @@ func (h *jobAPI) GetJob(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 		return
 	}
 
-	log.Info("getting job")
 	job := h.host.state.GetJob(id)
 	if job == nil {
 		log.Warn("job not found")
@@ -225,6 +285,7 @@ func (h *jobAPI) PullBinariesAndConfig(w http.ResponseWriter, r *http.Request, p
 	}
 	opts := &tuf.HTTPRemoteOptions{
 		UserAgent: fmt.Sprintf("flynn-host/%s %s-%s pull", version.String(), runtime.GOOS, runtime.GOARCH),
+		Retries:   tuf.DefaultHTTPRetries,
 	}
 	log.Info("creating remote TUF store")
 	remote, err := tuf.HTTPRemoteStore(query.Get("repository"), opts)
@@ -264,9 +325,20 @@ func (h *jobAPI) AddJob(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 
 	log := h.host.log.New("fn", "AddJob", "job.id", id)
 
+	if !h.addJobRateLimitBucket.Take() {
+		log.Warn("maximum concurrent AddJob calls running")
+		httphelper.Error(w, httphelper.JSONError{
+			Code:    httphelper.RatelimitedErrorCode,
+			Message: "maximum concurrent AddJob calls running, try again later",
+			Retry:   true,
+		})
+		return
+	}
+
 	if shutdown.IsActive() {
 		log.Warn("refusing to start job due to active shutdown")
 		httphelper.JSON(w, 500, struct{}{})
+		h.addJobRateLimitBucket.Put()
 		return
 	}
 
@@ -275,6 +347,13 @@ func (h *jobAPI) AddJob(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 	if err := httphelper.DecodeJSON(r, job); err != nil {
 		log.Error("error decoding job", "err", err)
 		httphelper.Error(w, err)
+		h.addJobRateLimitBucket.Put()
+		return
+	}
+	if job.ImageArtifact == nil {
+		log.Warn("rejecting job as no ImageArtifact set")
+		httphelper.ValidationError(w, "ImageArtifact", "must be set")
+		h.addJobRateLimitBucket.Put()
 		return
 	}
 
@@ -282,20 +361,30 @@ func (h *jobAPI) AddJob(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 	if err := h.host.state.Acquire(); err != nil {
 		log.Error("error acquiring state database", "err", err)
 		httphelper.Error(w, err)
+		h.addJobRateLimitBucket.Put()
 		return
 	}
 
-	h.host.state.AddJob(job)
+	if err := h.host.state.AddJob(job); err != nil {
+		log.Error("error adding job to state database", "err", err)
+		if err == ErrJobExists {
+			httphelper.ConflictError(w, err.Error())
+		} else {
+			httphelper.Error(w, err)
+		}
+		h.addJobRateLimitBucket.Put()
+		return
+	}
 
 	go func() {
-		// TODO(titanous): ratelimit this goroutine?
 		log.Info("running job")
-		err := h.host.backend.Run(job, nil)
+		err := h.host.backend.Run(job, nil, h.addJobRateLimitBucket)
 		h.host.state.Release()
 		if err != nil {
 			log.Error("error running job", "err", err)
 			h.host.state.SetStatusFailed(job.ID, err)
 		}
+		h.addJobRateLimitBucket.Put()
 	}()
 
 	// TODO(titanous): return 201 Accepted
@@ -306,27 +395,15 @@ func (h *jobAPI) ConfigureDiscoverd(w http.ResponseWriter, r *http.Request, _ ht
 	log := h.host.log.New("fn", "ConfigureDiscoverd")
 
 	log.Info("decoding config")
-	var config host.DiscoverdConfig
-	if err := httphelper.DecodeJSON(r, &config); err != nil {
+	config := &host.DiscoverdConfig{}
+	if err := httphelper.DecodeJSON(r, config); err != nil {
 		log.Error("error decoding config", "err", err)
 		httphelper.Error(w, err)
 		return
 	}
 	log.Info("config decoded", "url", config.URL, "dns", config.DNS)
 
-	h.host.statusMtx.Lock()
-	h.host.status.Discoverd = &config
-	h.host.statusMtx.Unlock()
-
-	if config.URL != "" && config.DNS != "" {
-		go h.host.discoverdOnce.Do(func() {
-			log.Info("connecting to service discovery", "url", config.URL)
-			if err := h.host.discMan.ConnectLocal(config.URL); err != nil {
-				log.Error("error connecting to service discovery", "err", err)
-				shutdown.Fatal(err)
-			}
-		})
-	}
+	h.host.ConfigureDiscoverd(config)
 }
 
 func (h *jobAPI) ConfigureNetworking(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
@@ -342,17 +419,7 @@ func (h *jobAPI) ConfigureNetworking(w http.ResponseWriter, r *http.Request, _ h
 	// configure the network before returning a response in case the
 	// network coordinator requires the bridge to be created (e.g.
 	// when using flannel with the "alloc" backend)
-	h.host.networkOnce.Do(func() {
-		log.Info("configuring network", "subnet", config.Subnet, "mtu", config.MTU, "resolvers", config.Resolvers)
-		if err := h.host.backend.ConfigureNetworking(config); err != nil {
-			log.Error("error configuring network", "err", err)
-			shutdown.Fatal(err)
-		}
-
-		h.host.statusMtx.Lock()
-		h.host.status.Network = config
-		h.host.statusMtx.Unlock()
-	})
+	h.host.ConfigureNetworking(config)
 }
 
 func (h *jobAPI) GetStatus(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
@@ -486,9 +553,12 @@ func (h *jobAPI) RegisterRoutes(r *httprouter.Router) error {
 func (h *Host) ServeHTTP() {
 	r := httprouter.New()
 
-	r.POST("/attach", (&attachHandler{state: h.state, backend: h.backend}).ServeHTTP)
+	r.POST("/attach", newAttachHandler(h.state, h.backend, h.log).ServeHTTP)
 
-	jobAPI := &jobAPI{host: h}
+	jobAPI := &jobAPI{
+		host: h,
+		addJobRateLimitBucket: NewRateLimitBucket(h.maxJobConcurrency),
+	}
 	jobAPI.RegisterRoutes(r)
 
 	volAPI := volumeapi.NewHTTPAPI(cluster.NewClient(), h.vman)
@@ -529,7 +599,11 @@ func (h *Host) Close() error {
 func newHTTPListener(addr string) (net.Listener, error) {
 	fdEnv := os.Getenv("FLYNN_HTTP_FD")
 	if fdEnv == "" {
-		return net.Listen("tcp", addr)
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return keepalive.Listener(l), nil
 	}
 	fd, err := strconv.Atoi(fdEnv)
 	if err != nil {
@@ -538,4 +612,34 @@ func newHTTPListener(addr string) (net.Listener, error) {
 	file := os.NewFile(uintptr(fd), "http")
 	defer file.Close()
 	return net.FileListener(file)
+}
+
+// RateLimitBucket implements a Token Bucket using a buffered channel
+type RateLimitBucket struct {
+	ch chan struct{}
+}
+
+func NewRateLimitBucket(size uint64) *RateLimitBucket {
+	return &RateLimitBucket{ch: make(chan struct{}, size)}
+}
+
+// Take attempts to take a token from the bucket, returning whether or not a
+// token was taken
+func (r *RateLimitBucket) Take() bool {
+	select {
+	case r.ch <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// Wait takes the next available token
+func (r *RateLimitBucket) Wait() {
+	r.ch <- struct{}{}
+}
+
+// Put returns a token to the bucket
+func (r *RateLimitBucket) Put() {
+	<-r.ch
 }

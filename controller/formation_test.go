@@ -5,9 +5,10 @@ import (
 	"os"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/random"
+	. "github.com/flynn/go-check"
 )
 
 func (s *S) TestFormationStreaming(c *C) {
@@ -18,8 +19,9 @@ func (s *S) TestFormationStreaming(c *C) {
 
 	updates := make(chan *ct.ExpandedFormation)
 	streamCtrl, connectErr := s.c.StreamFormations(&before, updates)
-
 	c.Assert(connectErr, IsNil)
+	defer streamCtrl.Close()
+
 	var existingFound bool
 	for f := range updates {
 		if f.App == nil {
@@ -53,8 +55,8 @@ func (s *S) TestFormationStreaming(c *C) {
 	c.Assert(out.Release, DeepEquals, release)
 	c.Assert(out.App, DeepEquals, app)
 	c.Assert(out.Processes, DeepEquals, formation.Processes)
-	c.Assert(out.Artifact.CreatedAt, Not(IsNil))
-	c.Assert(out.Artifact.ID, Equals, release.ArtifactID)
+	c.Assert(out.ImageArtifact.CreatedAt, Not(IsNil))
+	c.Assert(out.ImageArtifact.ID, Equals, release.ImageArtifactID())
 
 	c.Assert(s.c.DeleteFormation(app.ID, release.ID), IsNil)
 
@@ -69,15 +71,65 @@ func (s *S) TestFormationStreaming(c *C) {
 	c.Assert(out.Processes, IsNil)
 }
 
+func (s *S) TestFormationStreamDeleted(c *C) {
+	app := s.createTestApp(c, &ct.App{Name: "formation-stream-deleted"})
+
+	// create 3 releases with formations
+	releases := make([]*ct.Release, 3)
+	for i := 0; i < 3; i++ {
+		releases[i] = s.createTestRelease(c, &ct.Release{})
+		s.createTestFormation(c, &ct.Formation{ReleaseID: releases[i].ID, AppID: app.ID})
+	}
+
+	// delete the first release (which also deletes the first formation)
+	_, err := s.c.DeleteRelease(app.ID, releases[0].ID)
+	c.Assert(err, IsNil)
+	deletedRelease := releases[0]
+
+	// check streaming formations does not include the deleted release
+	updates := make(chan *ct.ExpandedFormation)
+	stream, err := s.c.StreamFormations(nil, updates)
+	c.Assert(err, IsNil)
+	defer stream.Close()
+
+	actual := 0
+outer:
+	for {
+		select {
+		case update, ok := <-updates:
+			if !ok {
+				c.Fatalf("stream closed unexpectedly: %s", stream.Err())
+			}
+			if update.App == nil {
+				break outer
+			}
+			if update.App.ID != app.ID {
+				continue
+			}
+			if update.Release != nil && update.Release.ID == deletedRelease.ID {
+				c.Fatal("expected stream to not include deleted release but it did")
+			}
+			actual++
+		case <-time.After(10 * time.Second):
+			c.Fatal("timed out waiting for formation updates")
+		}
+	}
+	expected := len(releases) - 1
+	if actual != expected {
+		c.Fatalf("expected %d updates, got %d", expected, actual)
+	}
+}
+
 func (s *S) TestFormationListActive(c *C) {
 	app1 := s.createTestApp(c, &ct.App{})
 	app2 := s.createTestApp(c, &ct.App{})
-	artifact := s.createTestArtifact(c, &ct.Artifact{})
+	imageArtifact := s.createTestArtifact(c, &ct.Artifact{Type: host.ArtifactTypeDocker})
+	fileArtifact := s.createTestArtifact(c, &ct.Artifact{Type: host.ArtifactTypeFile})
 
 	createFormation := func(app *ct.App, procs map[string]int) *ct.ExpandedFormation {
 		release := &ct.Release{
-			ArtifactID: artifact.ID,
-			Processes:  make(map[string]ct.ProcessType, len(procs)),
+			ArtifactIDs: []string{imageArtifact.ID, fileArtifact.ID},
+			Processes:   make(map[string]ct.ProcessType, len(procs)),
 		}
 		for typ := range procs {
 			release.Processes[typ] = ct.ProcessType{}
@@ -89,10 +141,11 @@ func (s *S) TestFormationListActive(c *C) {
 			Processes: procs,
 		})
 		return &ct.ExpandedFormation{
-			App:       app,
-			Release:   release,
-			Artifact:  artifact,
-			Processes: procs,
+			App:           app,
+			Release:       release,
+			ImageArtifact: imageArtifact,
+			FileArtifacts: []*ct.Artifact{fileArtifact},
+			Processes:     procs,
 		}
 	}
 
@@ -115,7 +168,8 @@ func (s *S) TestFormationListActive(c *C) {
 		actual := list[i]
 		c.Assert(actual.App.ID, Equals, f.App.ID)
 		c.Assert(actual.Release.ID, Equals, f.Release.ID)
-		c.Assert(actual.Artifact.ID, Equals, f.Artifact.ID)
+		c.Assert(actual.ImageArtifact.ID, Equals, f.ImageArtifact.ID)
+		c.Assert(actual.FileArtifacts, DeepEquals, f.FileArtifacts)
 		c.Assert(actual.Processes, DeepEquals, f.Processes)
 	}
 }
@@ -123,14 +177,14 @@ func (s *S) TestFormationListActive(c *C) {
 func (s *S) TestFormationStreamingInterrupted(c *C) {
 	before := time.Now()
 	appRepo := NewAppRepo(s.hc.db, os.Getenv("DEFAULT_ROUTE_DOMAIN"), s.hc.rc)
-	releaseRepo := NewReleaseRepo(s.hc.db)
+	releaseRepo := NewReleaseRepo(s.hc.db, nil, nil)
 	artifactRepo := NewArtifactRepo(s.hc.db)
 	formationRepo := NewFormationRepo(s.hc.db, appRepo, releaseRepo, artifactRepo)
 
-	artifact := &ct.Artifact{Type: "docker", URI: fmt.Sprintf("https://example.com/%s", random.String(8))}
+	artifact := &ct.Artifact{Type: host.ArtifactTypeDocker, URI: fmt.Sprintf("https://example.com/%s", random.String(8))}
 	c.Assert(artifactRepo.Add(artifact), IsNil)
 
-	release := &ct.Release{ArtifactID: artifact.ID}
+	release := &ct.Release{ArtifactIDs: []string{artifact.ID}}
 	c.Assert(releaseRepo.Add(release), IsNil)
 
 	app := &ct.App{Name: "streamtest-interrupted"}
@@ -142,7 +196,7 @@ func (s *S) TestFormationStreamingInterrupted(c *C) {
 	ch := make(chan *ct.ExpandedFormation)
 	updated := make(chan struct{})
 
-	_, err := formationRepo.Subscribe(ch, before, updated)
+	_, err := formationRepo.Subscribe(nil, ch, before, updated)
 	c.Assert(err, IsNil)
 
 	// simulate scenario where we have not completed `sendUpdatedSince` but the channel for a subscription
@@ -150,5 +204,9 @@ func (s *S) TestFormationStreamingInterrupted(c *C) {
 	formationRepo.unsubscribeAll()
 
 	// wait until `sendUpdateSince` finishes at which point it will not longer send to the (now closed) channel.
-	<-updated
+	select {
+	case <-updated:
+	case <-time.After(5 * time.Second):
+		c.Fatal("timed out waiting for sendUpdatedSince to finish")
+	}
 }

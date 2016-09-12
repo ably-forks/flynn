@@ -15,12 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/hashicorp/raft"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/hashicorp/raft-boltdb"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/discoverd/client"
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/stream"
+	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft-boltdb"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -167,6 +167,7 @@ func (s *Store) Open() error {
 	config.CommitTimeout = s.CommitTimeout
 	config.LogOutput = s.LogOutput
 	config.EnableSingleNode = s.EnableSingleNode
+	config.ShutdownOnRemove = false
 
 	// Create multiplexing transport layer.
 	raftLayer := newRaftLayer(s.Listener, s.Advertise)
@@ -217,7 +218,7 @@ func (s *Store) LastIndex() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.raft != nil {
-		return s.raft.LastIndex()
+		return s.raft.AppliedIndex()
 	}
 	return 0
 }
@@ -307,17 +308,34 @@ func (s *Store) LeaderCh() <-chan bool {
 	return s.leaderCh
 }
 
-// isLeader returns true if the store is currently the leader.
-func (s *Store) isLeader() bool { return s.raft.Leader() == s.Advertise.String() }
+// IsLeader returns true if the store is currently the leader.
+func (s *Store) IsLeader() bool { return s.raft.Leader() == s.Advertise.String() }
 
 // AddPeer adds a peer to the raft cluster. Panic if store is not open yet.
 func (s *Store) AddPeer(peer string) error {
-	return s.raft.AddPeer(peer).Error()
+	err := s.raft.AddPeer(peer).Error()
+	if err == raft.ErrNotLeader {
+		err = ErrNotLeader
+	} else if err == raft.ErrKnownPeer {
+		return nil
+	}
+	return err
 }
 
 // RemovePeer removes a peer from the raft cluster. Panic if store is not open yet.
 func (s *Store) RemovePeer(peer string) error {
-	return s.raft.RemovePeer(peer).Error()
+	err := s.raft.RemovePeer(peer).Error()
+	if err == raft.ErrNotLeader {
+		err = ErrNotLeader
+	} else if err == raft.ErrUnknownPeer {
+		return nil
+	}
+	return err
+}
+
+// GetPeers returns a list of peers in the raft cluster.
+func (s *Store) GetPeers() ([]string, error) {
+	return s.peerStore.Peers()
 }
 
 // SetPeers sets a list of peers in the raft cluster. Panic if store is not open yet.
@@ -446,19 +464,22 @@ func (s *Store) AddInstance(service string, inst *discoverd.Instance) error {
 	// Check if it's the leader.
 	// This check is needed because the heartbeats don't go through raft so
 	// it is not verified here like it normally would be when calling raftApply().
-	if !s.isLeader() {
+	if !s.IsLeader() {
 		return ErrNotLeader
 	}
 
+	s.mu.Lock()
 	// Track heartbeat time, if leader.
 	s.heartbeats[instanceKey{service, inst.ID}] = time.Now()
 
 	// Ignore if instance already exists and it hasn't changed.
 	if m := s.data.Instances[service]; m != nil {
 		if prev := m[inst.ID]; prev != nil && inst.Equal(prev) {
+			s.mu.Unlock()
 			return nil
 		}
 	}
+	s.mu.Unlock()
 
 	// Serialize command.
 	cmd, err := json.Marshal(&addInstanceCommand{
@@ -631,9 +652,17 @@ func (s *Store) applySetServiceMetaCommand(cmd []byte, index uint64) error {
 		}
 	}
 
+	leaderID := c.Meta.LeaderID
+	c.Meta.LeaderID = ""
+
 	// Update the meta and set the index.
 	c.Meta.Index = index
 	s.data.Metas[c.Service] = c.Meta
+
+	if leaderID != "" {
+		// If a new leader was included in the meta update, apply it
+		s.data.Leaders[c.Service] = leaderID
+	}
 
 	// Broadcast EventKindServiceMeta event.
 	s.broadcast(&discoverd.Event{
@@ -641,6 +670,17 @@ func (s *Store) applySetServiceMetaCommand(cmd []byte, index uint64) error {
 		Kind:        discoverd.EventKindServiceMeta,
 		ServiceMeta: c.Meta,
 	})
+
+	if leaderID != "" {
+		// Broadcast leader update, if the new instance exists
+		if inst := s.data.Instances[c.Service][leaderID]; inst != nil {
+			s.broadcast(&discoverd.Event{
+				Service:  c.Service,
+				Kind:     discoverd.EventKindLeader,
+				Instance: inst,
+			})
+		}
+	}
 
 	return nil
 }
@@ -781,7 +821,7 @@ func (s *Store) EnforceExpiry() error {
 		defer s.mu.Unlock()
 
 		// Ignore if this store is not the leader and hasn't been for at least 2 TTLs intervals.
-		if !s.isLeader() {
+		if !s.IsLeader() {
 			return raft.ErrNotLeader
 		} else if s.leaderTime.IsZero() || time.Since(s.leaderTime) < (2*s.InstanceTTL) {
 			return ErrLeaderWait
@@ -889,6 +929,7 @@ func (s *Store) applyExpireInstancesCommand(cmd []byte) error {
 func (s *Store) raftApply(typ byte, cmd []byte) (uint64, error) {
 	s.mu.RLock()
 	if s.raft == nil {
+		s.mu.RUnlock()
 		return 0, ErrShutdown
 	}
 	s.mu.RUnlock()
@@ -1300,8 +1341,8 @@ func (s *ProxyStore) ServiceLeader(service string) (*discoverd.Instance, error) 
 	return client.Service(service).Leader()
 }
 
-// storeHdr is the header byte used by the multiplexer.
-const storeHdr = byte('\xff')
+// StoreHdr is the header byte used by the multiplexer.
+const StoreHdr = byte('\xff')
 
 // raftLayer provides multiplexing for the listener.
 type raftLayer struct {
@@ -1328,7 +1369,7 @@ func (l *raftLayer) Dial(addr string, timeout time.Duration) (net.Conn, error) {
 	}
 
 	// Write a header byte.
-	_, err = conn.Write([]byte{storeHdr})
+	_, err = conn.Write([]byte{StoreHdr})
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -1347,7 +1388,7 @@ func (l *raftLayer) Accept() (net.Conn, error) {
 	var hdr [1]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		return nil, fmt.Errorf("read store header byte: %s", err)
-	} else if hdr[0] != storeHdr {
+	} else if hdr[0] != StoreHdr {
 		return nil, fmt.Errorf("unexpected store header byte: 0x%02x", hdr[0])
 	}
 

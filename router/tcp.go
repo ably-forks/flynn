@@ -9,11 +9,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/discoverd/cache"
 	"github.com/flynn/flynn/pkg/connutil"
 	"github.com/flynn/flynn/router/proxy"
 	"github.com/flynn/flynn/router/types"
+	"golang.org/x/net/context"
 )
 
 type TCPListener struct {
@@ -126,6 +126,7 @@ func (l *TCPListener) Start() error {
 	// TODO(benburkert): the sync API cannot handle routes deleted while the
 	// listen/notify connection is disconnected
 	if err := l.startSync(ctx); err != nil {
+		l.Close()
 		return err
 	}
 
@@ -173,6 +174,9 @@ func (l *TCPListener) doSync(ctx context.Context, errc chan<- error) <-chan stru
 func (l *TCPListener) Close() error {
 	l.mtx.Lock()
 	defer l.mtx.Unlock()
+	if l.closed {
+		return nil
+	}
 	l.stopSync()
 	for _, s := range l.routes {
 		s.Close()
@@ -226,14 +230,21 @@ func (h *tcpSyncHandler) Set(data *router.Route) error {
 		if err != nil {
 			return err
 		}
+
 		service = &tcpService{
 			name: r.Service,
 			sc:   sc,
-			rp:   proxy.NewReverseProxy(sc.Addrs, nil, false),
 		}
 		h.l.services[r.Service] = service
 	}
 	r.service = service
+	var bf proxy.BackendListFunc
+	if r.Leader {
+		bf = service.sc.LeaderAddr
+	} else {
+		bf = service.sc.Addrs
+	}
+	r.rp = proxy.NewReverseProxy(bf, nil, false, logger)
 	if listener, ok := h.l.listeners[r.Port]; ok {
 		r.l = listener
 		delete(h.l.listeners, r.Port)
@@ -284,7 +295,7 @@ type tcpRoute struct {
 	l       net.Listener
 	addr    string
 	service *tcpService
-	mtx     sync.RWMutex
+	rp      *proxy.ReverseProxy
 }
 
 func (r *tcpRoute) Serve(started chan<- error) {
@@ -305,9 +316,7 @@ func (r *tcpRoute) Serve(started chan<- error) {
 		if err != nil {
 			break
 		}
-		r.mtx.RLock()
-		go r.service.ServeConn(conn)
-		r.mtx.RUnlock()
+		go r.ServeConn(conn)
 	}
 }
 
@@ -333,10 +342,8 @@ type tcpService struct {
 	name string
 	sc   cache.ServiceCache
 	refs int
-
-	rp *proxy.ReverseProxy
 }
 
-func (s *tcpService) ServeConn(conn net.Conn) {
-	s.rp.ServeConn(context.Background(), connutil.CloseNotifyConn(conn))
+func (r *tcpRoute) ServeConn(conn net.Conn) {
+	r.rp.ServeConn(context.Background(), connutil.CloseNotifyConn(conn))
 }

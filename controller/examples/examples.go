@@ -13,8 +13,10 @@ import (
 	"time"
 
 	cc "github.com/flynn/flynn/controller/client"
+	"github.com/flynn/flynn/controller/client/v1"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/host/types"
 	g "github.com/flynn/flynn/pkg/examplegenerator"
 	"github.com/flynn/flynn/pkg/httprecorder"
 	"github.com/flynn/flynn/pkg/random"
@@ -24,14 +26,9 @@ import (
 
 type generator struct {
 	conf        *config
-	client      *cc.Client
+	client      cc.Client
 	recorder    *httprecorder.Recorder
 	resourceIds map[string]string
-}
-
-type example struct {
-	name string
-	f    func()
 }
 
 func main() {
@@ -178,8 +175,11 @@ func (e *generator) createAppError() {
 
 func (e *generator) getInitialAppRelease() {
 	appRelease, err := e.client.GetAppRelease("gitreceive")
-	if err == nil {
-		e.resourceIds["SLUGRUNNER_IMAGE_URI"] = appRelease.Env["SLUGRUNNER_IMAGE_URI"]
+	if err != nil {
+		return
+	}
+	if artifact, err := e.client.GetArtifact(appRelease.Env["SLUGRUNNER_IMAGE_ID"]); err == nil {
+		e.resourceIds["SLUGRUNNER_IMAGE_URI"] = artifact.URI
 	}
 }
 
@@ -276,12 +276,12 @@ func (e *generator) deleteRoute() {
 func (e *generator) deleteApp() {
 	// call Delete rather than DeleteApp as the latter uses the app stream
 	// to watch app_deletion events.
-	e.client.Delete(fmt.Sprintf("/apps/%s", e.resourceIds["app"]), nil)
+	e.client.(*v1controller.Client).Delete(fmt.Sprintf("/apps/%s", e.resourceIds["app"]), nil)
 }
 
 func (e *generator) createArtifact() {
 	artifact := &ct.Artifact{
-		Type: "docker",
+		Type: host.ArtifactTypeDocker,
 		URI:  e.resourceIds["SLUGRUNNER_IMAGE_URI"],
 	}
 	err := e.client.CreateArtifact(artifact)
@@ -297,13 +297,13 @@ func (e *generator) listArtifacts() {
 
 func (e *generator) createRelease() {
 	release := &ct.Release{
-		ArtifactID: e.resourceIds["artifact"],
+		ArtifactIDs: []string{e.resourceIds["artifact"]},
 		Env: map[string]string{
 			"some": "info",
 		},
 		Processes: map[string]ct.ProcessType{
 			"foo": {
-				Cmd: []string{"ls", "-l"},
+				Args: []string{"ls", "-l"},
 				Env: map[string]string{
 					"BAR": "baz",
 				},
@@ -384,7 +384,7 @@ func (e *generator) runJob() {
 		Env: map[string]string{
 			"BODY": "Hello!",
 		},
-		Cmd: []string{"echo", "$BODY"},
+		Args: []string{"echo", "$BODY"},
 	}
 	job, err := e.client.RunJobDetached(e.resourceIds["app"], new_job)
 	if err == nil {
@@ -496,7 +496,7 @@ func (e *generator) listDeployments() {
 }
 
 func (e *generator) eventsList() {
-	events, err := e.client.ListEvents(cc.ListEventsOptions{
+	events, err := e.client.ListEvents(ct.ListEventsOptions{
 		Count: 10,
 	})
 	if err != nil {
@@ -510,7 +510,7 @@ func (e *generator) eventsList() {
 
 func (e *generator) eventsStream() {
 	events := make(chan *ct.Event)
-	e.client.StreamEvents(cc.StreamEventsOptions{
+	e.client.StreamEvents(ct.StreamEventsOptions{
 		Past:  true,
 		Count: 10,
 	}, events)

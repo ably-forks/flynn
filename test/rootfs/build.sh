@@ -4,7 +4,7 @@ set -e -x
 src_dir="$(cd "$(dirname "$0")" && pwd)"
 build_dir=${1:-.}
 
-truncate -s 32G ${build_dir}/rootfs.img
+truncate -s 50G ${build_dir}/rootfs.img
 mkfs.ext4 -FqL rootfs ${build_dir}/rootfs.img
 
 dir=$(mktemp -d)
@@ -16,7 +16,7 @@ cleanup() {
 }
 trap cleanup ERR
 
-image="http://cdimage.ubuntu.com/ubuntu-core/releases/14.04.2/release/ubuntu-core-14.04.2-core-amd64.tar.gz"
+image="http://cdimage.ubuntu.com/ubuntu-base/releases/14.04/release/ubuntu-base-14.04-core-amd64.tar.gz"
 curl -L ${image} | sudo tar -xzC ${dir}
 
 # use jchroot (https://github.com/vincentbernat/jchroot) which uses a PID

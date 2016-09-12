@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	. "github.com/flynn/go-check"
 )
 
 // Hook gocheck up to the "go test" runner
@@ -25,7 +25,9 @@ func (CheckSuite) TestTCPSuccess(c *C) {
 
 	go func() {
 		conn, err := l.Accept()
-		if err != nil {
+		if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+			return
+		} else if err != nil {
 			panic(err)
 		}
 		conn.Close()
@@ -131,7 +133,10 @@ func (CheckSuite) TestHTTPReadTimeout(c *C) {
 		MatchBytes: []byte("foo"),
 	}).Check()
 	c.Assert(err, NotNil)
-	c.Assert(strings.Contains(err.Error(), "use of closed network connection"), Equals, true, Commentf("err = %s", err))
+	if !strings.Contains(err.Error(), "use of closed network connection") && // <=go1.4
+		!strings.Contains(err.Error(), "Client.Timeout exceeded while reading body") { // >=go1.5
+		c.Fatalf("unexpected error %q", err)
+	}
 }
 
 func (CheckSuite) TestHTTPConnectRefused(c *C) {

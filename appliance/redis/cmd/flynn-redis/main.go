@@ -9,12 +9,13 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/appliance/redis"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -126,9 +127,7 @@ func (m *Main) Run() error {
 
 	// Add service to discoverd registry.
 	m.Logger.Info("adding service", "name", m.ServiceName)
-	if err = m.DiscoverdClient.AddService(m.ServiceName, &discoverd.ServiceConfig{
-		LeaderType: discoverd.LeaderTypeManual,
-	}); err != nil && !httphelper.IsObjectExistsError(err) {
+	if err = m.DiscoverdClient.AddService(m.ServiceName, nil); err != nil && !httphelper.IsObjectExistsError(err) {
 		m.Logger.Error("error adding discoverd service", "err", err)
 		return err
 	}
@@ -155,7 +154,7 @@ func (m *Main) Run() error {
 		m.Logger.Error("error opening port", "err", err)
 		return err
 	}
-	m.ln = ln
+	m.ln = keepalive.Listener(ln)
 
 	// Initialize and server handler.
 	m.Logger.Info("serving http api")

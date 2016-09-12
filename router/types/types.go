@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+// Certificate describes a TLS certificate for one or more routes
+type Certificate struct {
+	// ID is the unique ID of this Certificate
+	ID string `json:"id,omitempty"`
+	// Routes contains the IDs of routes assigned to this cert
+	Routes []string `json:"routes,omitempty"`
+	// TLSCert is the optional TLS public certificate. It is only used for HTTP routes.
+	Cert string `json:"cert,omitempty"`
+	// TLSCert is the optional TLS private key. It is only used for HTTP routes.
+	Key string `json:"key,omitempty"`
+	// CreatedAt is the time this cert was created.
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	// UpdatedAt is the time this cert was last updated.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
 // Route is a struct that combines the fields of HTTPRoute and TCPRoute
 // for easy JSON marshaling.
 type Route struct {
@@ -17,6 +33,9 @@ type Route struct {
 	ParentRef string `json:"parent_ref,omitempty"`
 	// Service is the ID of the service.
 	Service string `json:"service"`
+	// Leader is whether or not traffic should only be routed to the leader or
+	// all instances
+	Leader bool `json:"leader"`
 	// CreatedAt is the time this Route was created.
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	// UpdatedAt is the time this Route was last updated.
@@ -24,12 +43,14 @@ type Route struct {
 
 	// Domain is the domain name of this Route. It is only used for HTTP routes.
 	Domain string `json:"domain,omitempty"`
-	// TLSCert is the optional TLS public certificate of this Route. It is only
-	// used for HTTP routes.
-	TLSCert string `json:"tls_cert,omitempty"`
-	// TLSCert is the optional TLS private key of this Route. It is only
-	// used for HTTP routes.
-	TLSKey string `json:"tls_key,omitempty"`
+
+	// Certificate contains TLSCert and TLSKey
+	Certificate *Certificate `json:"certificate,omitempty"`
+
+	// Deprecated in favor of Certificate
+	LegacyTLSCert string `json:"tls_cert,omitempty"`
+	LegacyTLSKey  string `json:"tls_key,omitempty"`
+
 	// Sticky is whether or not to use sticky sessions for this route. It is only
 	// used for HTTP routes.
 	Sticky bool `json:"sticky,omitempty"`
@@ -51,14 +72,16 @@ func (r Route) HTTPRoute() *HTTPRoute {
 		ID:        r.ID,
 		ParentRef: r.ParentRef,
 		Service:   r.Service,
+		Leader:    r.Leader,
 		CreatedAt: r.CreatedAt,
 		UpdatedAt: r.UpdatedAt,
 
-		Domain:  r.Domain,
-		TLSCert: r.TLSCert,
-		TLSKey:  r.TLSKey,
-		Sticky:  r.Sticky,
-		Path:    r.Path,
+		Domain:        r.Domain,
+		Certificate:   r.Certificate,
+		LegacyTLSCert: r.LegacyTLSCert,
+		LegacyTLSKey:  r.LegacyTLSKey,
+		Sticky:        r.Sticky,
+		Path:          r.Path,
 	}
 }
 
@@ -67,6 +90,7 @@ func (r Route) TCPRoute() *TCPRoute {
 		ID:        r.ID,
 		ParentRef: r.ParentRef,
 		Service:   r.Service,
+		Leader:    r.Leader,
 		CreatedAt: r.CreatedAt,
 		UpdatedAt: r.UpdatedAt,
 
@@ -79,14 +103,16 @@ type HTTPRoute struct {
 	ID        string
 	ParentRef string
 	Service   string
+	Leader    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
-	Domain  string
-	TLSCert string
-	TLSKey  string
-	Sticky  bool
-	Path    string
+	Domain        string
+	Certificate   *Certificate `json:"certificate,omitempty"`
+	LegacyTLSCert string       `json:"tls_cert,omitempty"`
+	LegacyTLSKey  string       `json:"tls_key,omitempty"`
+	Sticky        bool
+	Path          string
 }
 
 func (r HTTPRoute) FormattedID() string {
@@ -104,15 +130,17 @@ func (r HTTPRoute) ToRoute() *Route {
 		ID:        r.ID,
 		ParentRef: r.ParentRef,
 		Service:   r.Service,
+		Leader:    r.Leader,
 		CreatedAt: r.CreatedAt,
 		UpdatedAt: r.UpdatedAt,
 
 		// http-specific fields
-		Domain:  r.Domain,
-		TLSCert: r.TLSCert,
-		TLSKey:  r.TLSKey,
-		Sticky:  r.Sticky,
-		Path:    r.Path,
+		Domain:        r.Domain,
+		Certificate:   r.Certificate,
+		LegacyTLSCert: r.LegacyTLSCert,
+		LegacyTLSKey:  r.LegacyTLSKey,
+		Sticky:        r.Sticky,
+		Path:          r.Path,
 	}
 }
 
@@ -121,6 +149,7 @@ type TCPRoute struct {
 	ID        string
 	ParentRef string
 	Service   string
+	Leader    bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
@@ -141,6 +170,7 @@ func (r TCPRoute) ToRoute() *Route {
 		ID:        r.ID,
 		ParentRef: r.ParentRef,
 		Service:   r.Service,
+		Leader:    r.Leader,
 		CreatedAt: r.CreatedAt,
 		UpdatedAt: r.UpdatedAt,
 

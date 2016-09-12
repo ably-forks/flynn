@@ -1,29 +1,37 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path"
+	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/gorilla/sessions"
+	ct "github.com/flynn/flynn/controller/types"
+	"github.com/gorilla/sessions"
 )
 
 type Config struct {
-	Addr               string
-	DefaultRouteDomain string
-	ControllerDomain   string
-	ControllerKey      string
-	URL                string
-	InterfaceURL       string
-	PathPrefix         string
-	CookiePath         string
-	SecureCookies      bool
-	LoginToken         string
-	GithubToken        string
-	SessionStore       *sessions.CookieStore
-	AppName            string
-	CACert             []byte
-	Cache              bool
+	Addr                    string
+	DefaultRouteDomain      string
+	ControllerDomain        string
+	ControllerKey           string
+	StatusKey               string
+	URL                     string
+	InterfaceURL            string
+	PathPrefix              string
+	CookiePath              string
+	SecureCookies           bool
+	LoginToken              string
+	GithubToken             string
+	GithubAPIURL            string
+	GithubTokenURL          string
+	GithubCloneAuthRequired bool
+	SessionStore            *sessions.CookieStore
+	AppName                 string
+	InstallCert             bool
+	Cache                   bool
+	DefaultDeployTimeout    int
 }
 
 func LoadConfigFromEnv() *Config {
@@ -48,6 +56,8 @@ func LoadConfigFromEnv() *Config {
 	if conf.ControllerKey == "" {
 		log.Fatal("CONTROLLER_KEY is required!")
 	}
+
+	conf.StatusKey = os.Getenv("STATUS_KEY")
 
 	conf.URL = os.Getenv("URL")
 	if conf.URL == "" {
@@ -78,14 +88,25 @@ func LoadConfigFromEnv() *Config {
 
 	conf.GithubToken = os.Getenv("GITHUB_TOKEN")
 
+	if host := os.Getenv("GITHUB_ENTERPRISE_HOST"); host != "" {
+		conf.GithubAPIURL = fmt.Sprintf("https://%s/api/v3", host)
+		conf.GithubTokenURL = fmt.Sprintf("https://%s/settings/tokens/new", host)
+		conf.GithubCloneAuthRequired = true
+	} else {
+		conf.GithubAPIURL = "https://api.github.com"
+		conf.GithubTokenURL = "https://github.com/settings/tokens/new"
+	}
+
 	conf.AppName = os.Getenv("APP_NAME")
 	if conf.AppName == "" {
 		conf.AppName = "dashboard"
 	}
 
-	conf.CACert = []byte(os.Getenv("CA_CERT"))
+	conf.InstallCert = strings.HasPrefix(conf.URL, "https://")
 
 	conf.Cache = os.Getenv("DISABLE_CACHE") == ""
+
+	conf.DefaultDeployTimeout = ct.DefaultDeployTimeout
 
 	return conf
 }

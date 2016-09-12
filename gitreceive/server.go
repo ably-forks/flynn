@@ -45,14 +45,14 @@ func main() {
 }
 
 type gitHandler struct {
-	controller *controller.Client
+	controller controller.Client
 	authKey    []byte
 }
 
 type gitService struct {
 	method     string
 	suffix     string
-	handleFunc func(gitEnv, string, string, http.ResponseWriter, *http.Request)
+	handleFunc func(gitEnv, string, string, http.ResponseWriter, *http.Request) bool
 	rpc        string
 }
 
@@ -67,7 +67,7 @@ var gitServices = [...]gitService{
 	{"POST", "/git-receive-pack", handlePostRPC, "git-receive-pack"},
 }
 
-func newGitHandler(controller *controller.Client, authKey []byte) *gitHandler {
+func newGitHandler(controller controller.Client, authKey []byte) *gitHandler {
 	return &gitHandler{controller, authKey}
 }
 
@@ -95,7 +95,7 @@ func (h *gitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, password, _ := utils.ParseBasicAuth(r.Header)
+	_, password, _ := r.BasicAuth()
 	if !hmac.Equal([]byte(password), h.authKey) {
 		w.Header().Set("WWW-Authenticate", "Basic")
 		http.Error(w, "Authentication required", 401)
@@ -118,30 +118,28 @@ func (h *gitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer os.RemoveAll(repoPath)
-	if g.rpc == "git-receive-pack" {
-		defer func() {
-			if err := uploadRepo(repoPath, app.ID); err != nil {
-				logError(w, "uploadRepo", err)
-			}
-		}()
-	}
 
-	g.handleFunc(gitEnv{App: app.ID}, g.rpc, repoPath, w, r)
+	success := g.handleFunc(gitEnv{App: app.ID}, g.rpc, repoPath, w, r)
+	if success && g.rpc == "git-receive-pack" {
+		if err := uploadRepo(repoPath, app.ID); err != nil {
+			logError(w, "uploadRepo", err)
+		}
+	}
 }
 
-func handleGetInfoRefs(env gitEnv, _ string, path string, w http.ResponseWriter, r *http.Request) {
+func handleGetInfoRefs(env gitEnv, _ string, path string, w http.ResponseWriter, r *http.Request) bool {
 	rpc := r.URL.Query().Get("service")
 	if !(rpc == "git-upload-pack" || rpc == "git-receive-pack") {
 		// The 'dumb' Git HTTP protocol is not supported
 		http.Error(w, "Not Found", 404)
-		return
+		return false
 	}
 
 	// Prepare our Git subprocess
 	cmd, pipe := gitCommand(env, "git", subCommand(rpc), "--stateless-rpc", "--advertise-refs", path)
 	if err := cmd.Start(); err != nil {
 		fail500(w, "handleGetInfoRefs", err)
-		return
+		return false
 	}
 	defer cleanUpProcessGroup(cmd) // Ensure brute force subprocess clean-up
 
@@ -151,23 +149,25 @@ func handleGetInfoRefs(env gitEnv, _ string, path string, w http.ResponseWriter,
 	w.WriteHeader(200) // Don't bother with HTTP 500 from this point on, just return
 	if err := pktLine(w, fmt.Sprintf("# service=%s\n", rpc)); err != nil {
 		logError(w, "handleGetInfoRefs response", err)
-		return
+		return false
 	}
 	if err := pktFlush(w); err != nil {
 		logError(w, "handleGetInfoRefs response", err)
-		return
+		return false
 	}
 	if _, err := io.Copy(w, pipe); err != nil {
 		logError(w, "handleGetInfoRefs read from subprocess", err)
-		return
+		return false
 	}
 	if err := cmd.Wait(); err != nil {
 		logError(w, "handleGetInfoRefs wait for subprocess", err)
-		return
+		return false
 	}
+
+	return true
 }
 
-func handlePostRPC(env gitEnv, rpc string, path string, w http.ResponseWriter, r *http.Request) {
+func handlePostRPC(env gitEnv, rpc string, path string, w http.ResponseWriter, r *http.Request) bool {
 
 	// The client request body may have been gzipped.
 	body := r.Body
@@ -176,7 +176,7 @@ func handlePostRPC(env gitEnv, rpc string, path string, w http.ResponseWriter, r
 		body, err = gzip.NewReader(r.Body)
 		if err != nil {
 			fail500(w, "handlePostRPC", err)
-			return
+			return false
 		}
 	}
 
@@ -185,19 +185,22 @@ func handlePostRPC(env gitEnv, rpc string, path string, w http.ResponseWriter, r
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		fail500(w, "handlePostRPC", err)
-		return
+		return false
 	}
 	defer stdin.Close()
 	if err := cmd.Start(); err != nil {
 		fail500(w, "handlePostRPC", err)
-		return
+		return false
 	}
-	defer cleanUpProcessGroup(cmd) // Ensure brute force subprocess clean-up
+	go func(done <-chan bool) {
+		<-done
+		cleanUpProcessGroup(cmd) // Ensure brute force subprocess clean-up
+	}(w.(http.CloseNotifier).CloseNotify())
 
 	// Write the client request body to Git's standard input
 	if _, err := io.Copy(stdin, body); err != nil {
 		fail500(w, "handlePostRPC write to subprocess", err)
-		return
+		return false
 	}
 
 	// Start writing the response
@@ -206,12 +209,14 @@ func handlePostRPC(env gitEnv, rpc string, path string, w http.ResponseWriter, r
 	w.WriteHeader(200) // Don't bother with HTTP 500 from this point on, just return
 	if _, err := io.Copy(newWriteFlusher(w), pipe); err != nil {
 		logError(w, "handlePostRPC read from subprocess", err)
-		return
+		return false
 	}
 	if err := cmd.Wait(); err != nil {
 		logError(w, "handlePostRPC wait for subprocess", err)
-		return
+		return false
 	}
+
+	return true
 }
 
 func fail500(w http.ResponseWriter, context string, err error) {
@@ -291,6 +296,7 @@ func (w writeFlusher) Write(p []byte) (int, error) {
 
 var prereceiveHook = []byte(`#!/bin/bash
 set -eo pipefail;
+
 git-archive-all() {
 	GIT_DIR="$(pwd)"
 	cd ..
@@ -298,9 +304,19 @@ git-archive-all() {
 	git submodule --quiet update --init --recursive
 	tar --create --exclude-vcs .
 }
+
 while read oldrev newrev refname; do
-	[[ $refname = "refs/heads/master" ]] && git-archive-all $newrev | /bin/flynn-receiver "$RECEIVE_APP" "$newrev" | sed -u "s/^/"$'\e[1G\e[K'"/"
+	if [[ $refname = "refs/heads/master" ]]; then
+		git-archive-all $newrev | /bin/flynn-receiver "$RECEIVE_APP" "$newrev" --meta git=true | sed -u "s/^/"$'\e[1G\e[K'"/"
+		master_pushed=1
+		break
+	fi
 done
+
+if [[ -z "${master_pushed}" ]]; then
+  echo "The push must include a change to the master branch to be deployed."
+  exit 1
+fi
 `)
 
 func blobstoreCacheURL(cacheKey string) string {

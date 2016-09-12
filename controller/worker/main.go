@@ -5,17 +5,19 @@ import (
 	"os"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/client"
 	"github.com/flynn/flynn/controller/schema"
 	"github.com/flynn/flynn/controller/worker/app_deletion"
+	"github.com/flynn/flynn/controller/worker/app_garbage_collection"
 	"github.com/flynn/flynn/controller/worker/deployment"
 	"github.com/flynn/flynn/controller/worker/domain_migration"
+	"github.com/flynn/flynn/controller/worker/release_cleanup"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/status"
+	"github.com/flynn/que-go"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const workerCount = 10
@@ -29,7 +31,7 @@ func main() {
 	client, err := controller.NewClient("", os.Getenv("AUTH_KEY"))
 	if err != nil {
 		log.Error("error creating controller client", "err", err)
-		shutdown.Fatal()
+		shutdown.Fatal(err)
 	}
 
 	log.Info("connecting to postgres")
@@ -57,9 +59,11 @@ func main() {
 	workers := que.NewWorkerPool(
 		que.NewClient(db.ConnPool),
 		que.WorkMap{
-			"deployment":       deployment.JobHandler(db, client, logger),
-			"app_deletion":     app_deletion.JobHandler(db, client, logger),
-			"domain_migration": domain_migration.JobHandler(db, client, logger),
+			"deployment":             deployment.JobHandler(db, client, logger),
+			"app_deletion":           app_deletion.JobHandler(db, client, logger),
+			"domain_migration":       domain_migration.JobHandler(db, client, logger),
+			"release_cleanup":        release_cleanup.JobHandler(db, client, logger),
+			"app_garbage_collection": app_garbage_collection.JobHandler(db, client, logger),
 		},
 		workerCount,
 	)

@@ -11,7 +11,7 @@ import (
 	ct "github.com/flynn/flynn/controller/types"
 	logaggc "github.com/flynn/flynn/logaggregator/client"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -34,7 +34,7 @@ Options:
 // trailing zeros
 const rfc3339micro = "2006-01-02T15:04:05.000000Z07:00"
 
-func runLog(args *docopt.Args, client *controller.Client) error {
+func runLog(args *docopt.Args, client controller.Client) error {
 	rawOutput := args.Bool["--raw-output"]
 	opts := ct.LogOpts{
 		Follow: args.Bool["--follow"],
@@ -88,11 +88,4 @@ func runLog(args *docopt.Args, client *controller.Client) error {
 			)
 		}
 	}
-}
-
-func shorten(msg string, maxLength int) string {
-	if len(msg) > maxLength {
-		return msg[:maxLength]
-	}
-	return msg
 }

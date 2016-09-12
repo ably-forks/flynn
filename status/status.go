@@ -14,15 +14,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/flynn/flynn/controller/utils"
 	"github.com/flynn/flynn/discoverd/cache"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/status"
 )
 
 func main() {
 	handler := newStatusHandler(status.Handler(GetStatus), os.Getenv("AUTH_KEY"))
-	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), handler))
+	log.Fatal(http.ListenAndServe(":"+os.Getenv("PORT"), httphelper.CORSAllowAll.Handler(handler)))
 }
 
 type statusHandler struct {
@@ -80,7 +80,7 @@ func (s *statusHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !authed {
-			_, password, _ := utils.ParseBasicAuth(r.Header)
+			_, password, _ := r.BasicAuth()
 			if password == "" {
 				password = r.URL.Query().Get("key")
 			}
@@ -101,8 +101,9 @@ var httpClient = &http.Client{Timeout: 2 * time.Second}
 type ReqFn func() (*http.Request, error)
 
 type Service struct {
-	Name  string
-	ReqFn func() (*http.Request, error)
+	Name     string
+	ReqFn    func() (*http.Request, error)
+	Optional bool
 }
 
 func (s Service) Status() status.Status {
@@ -152,8 +153,10 @@ var services = []Service{
 	{Name: "discoverd"},
 	{Name: "flannel"},
 	{Name: "gitreceive", ReqFn: RandomReqFn("gitreceive")},
+	{Name: "docker-receive", ReqFn: RandomReqFn("docker-receive"), Optional: true},
 	{Name: "logaggregator", ReqFn: LeaderReqFn("logaggregator", "80")},
 	{Name: "postgres", ReqFn: LeaderReqFn("postgres", "5433")},
+	{Name: "mariadb", ReqFn: LeaderReqFn("mariadb", "3307"), Optional: true},
 	{Name: "router", ReqFn: RandomReqFn("router-api")},
 }
 
@@ -209,15 +212,16 @@ func init() {
 }
 
 type ServiceStatus struct {
-	Name   string
-	Status status.Status
+	Name     string
+	Status   status.Status
+	optional bool
 }
 
 func GetStatus() status.Status {
 	results := make(chan ServiceStatus)
 	for _, s := range services {
 		go func(s Service) {
-			results <- ServiceStatus{s.Name, s.Status()}
+			results <- ServiceStatus{s.Name, s.Status(), s.Optional}
 		}(s)
 	}
 
@@ -226,7 +230,7 @@ func GetStatus() status.Status {
 	for i := 0; i < len(services); i++ {
 		res := <-results
 		data[res.Name] = res.Status
-		if res.Status.Status != status.CodeHealthy {
+		if res.Status.Status != status.CodeHealthy && !res.optional {
 			healthy = false
 		}
 	}

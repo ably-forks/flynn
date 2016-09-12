@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,17 +13,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/host/types"
-	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/exec"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/version"
+	"github.com/flynn/go-docopt"
 )
-
-var clusterc = cluster.NewClient()
 
 func init() {
 	log.SetFlags(0)
@@ -31,7 +32,6 @@ func init() {
 var typesPattern = regexp.MustCompile("types.* -> (.+)\n")
 
 const blobstoreURL = "http://blobstore.discoverd"
-const scaleTimeout = 20 * time.Second
 
 func parsePairs(args *docopt.Args, str string) (map[string]string, error) {
 	pairs := args.All[str].([]string)
@@ -47,9 +47,15 @@ func parsePairs(args *docopt.Args, str string) (map[string]string, error) {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatalln("ERROR:", err)
+	}
+}
+
+func run() error {
 	client, err := controller.NewClient("", os.Getenv("CONTROLLER_KEY"))
 	if err != nil {
-		log.Fatalln("Unable to connect to controller:", err)
+		return fmt.Errorf("Unable to connect to controller: %s", err)
 	}
 
 	usage := `
@@ -64,60 +70,100 @@ Options:
 	appName := args.String["<app>"]
 	env, err := parsePairs(args, "--env")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	meta, err := parsePairs(args, "--meta")
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+
+	slugBuilder, err := client.GetArtifact(os.Getenv("SLUGBUILDER_IMAGE_ID"))
+	if err != nil {
+		return fmt.Errorf("Error getting slugbuilder image: %s", err)
+	}
+
+	slugRunnerID := os.Getenv("SLUGRUNNER_IMAGE_ID")
+	if _, err := client.GetArtifact(slugRunnerID); err != nil {
+		return fmt.Errorf("Error getting slugrunner image: %s", err)
 	}
 
 	app, err := client.GetApp(appName)
 	if err == controller.ErrNotFound {
-		log.Fatalf("Unknown app %q", appName)
+		return fmt.Errorf("Unknown app %q", appName)
 	} else if err != nil {
-		log.Fatalln("Error retrieving app:", err)
+		return fmt.Errorf("Error retrieving app: %s", err)
 	}
 	prevRelease, err := client.GetAppRelease(app.Name)
 	if err == controller.ErrNotFound {
 		prevRelease = &ct.Release{}
 	} else if err != nil {
-		log.Fatalln("Error getting current app release:", err)
+		return fmt.Errorf("Error getting current app release: %s", err)
 	}
 
 	fmt.Printf("-----> Building %s...\n", app.Name)
 
-	var output bytes.Buffer
-	slugURL := fmt.Sprintf("%s/%s.tgz", blobstoreURL, random.UUID())
-	cmd := exec.Command(exec.DockerImage(os.Getenv("SLUGBUILDER_IMAGE_URI")), slugURL)
-	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
-	cmd.Stderr = os.Stderr
-	cmd.Meta = map[string]string{
-		"flynn-controller.app":      app.ID,
-		"flynn-controller.app_name": app.Name,
-		"flynn-controller.release":  prevRelease.ID,
-	}
-	if len(prevRelease.Env) > 0 {
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			log.Fatalln(err)
-		}
-		go appendEnvDir(os.Stdin, stdin, prevRelease.Env)
-	} else {
-		cmd.Stdin = os.Stdin
-	}
-	cmd.Env = make(map[string]string)
-	cmd.Env["BUILD_CACHE_URL"] = fmt.Sprintf("%s/%s-cache.tgz", blobstoreURL, app.ID)
-	if buildpackURL, ok := prevRelease.Env["BUILDPACK_URL"]; ok {
-		cmd.Env["BUILDPACK_URL"] = buildpackURL
+	jobEnv := make(map[string]string)
+	jobEnv["BUILD_CACHE_URL"] = fmt.Sprintf("%s/%s-cache.tgz", blobstoreURL, app.ID)
+	if buildpackURL, ok := env["BUILDPACK_URL"]; ok {
+		jobEnv["BUILDPACK_URL"] = buildpackURL
+	} else if buildpackURL, ok := prevRelease.Env["BUILDPACK_URL"]; ok {
+		jobEnv["BUILDPACK_URL"] = buildpackURL
 	}
 	for _, k := range []string{"SSH_CLIENT_KEY", "SSH_CLIENT_HOSTS"} {
 		if v := os.Getenv(k); v != "" {
-			cmd.Env[k] = v
+			jobEnv[k] = v
+		}
+	}
+	slugURL := fmt.Sprintf("%s/%s/slug.tgz", blobstoreURL, random.UUID())
+
+	job := &host.Job{
+		Config: host.ContainerConfig{
+			Args:       []string{"/tmp/builder/build.sh", slugURL},
+			Env:        jobEnv,
+			Stdin:      true,
+			DisableLog: true,
+		},
+		Partition: "background",
+		Metadata: map[string]string{
+			"flynn-controller.app":      app.ID,
+			"flynn-controller.app_name": app.Name,
+			"flynn-controller.release":  prevRelease.ID,
+			"flynn-controller.type":     "slugbuilder",
+		},
+	}
+	if sb, ok := prevRelease.Processes["slugbuilder"]; ok {
+		job.Resources = sb.Resources
+	} else if rawLimit := os.Getenv("SLUGBUILDER_DEFAULT_MEMORY_LIMIT"); rawLimit != "" {
+		if limit, err := resource.ParseLimit(resource.TypeMemory, rawLimit); err == nil {
+			r := make(resource.Resources)
+			resource.SetDefaults(&r)
+			r[resource.TypeMemory] = resource.Spec{Limit: &limit, Request: &limit}
+			job.Resources = r
 		}
 	}
 
+	cmd := exec.Job(*slugBuilder.HostArtifact(), job)
+	var output bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
+	cmd.Stderr = os.Stderr
+
+	if len(prevRelease.Env) > 0 {
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := appendEnvDir(os.Stdin, stdin, prevRelease.Env); err != nil {
+				log.Fatalln("ERROR:", err)
+			}
+		}()
+	} else {
+		cmd.Stdin = os.Stdin
+	}
+
+	shutdown.BeforeExit(func() { cmd.Kill() })
 	if err := cmd.Run(); err != nil {
-		log.Fatalln("Build failed:", err)
+		return fmt.Errorf("Build failed: %s", err)
 	}
 
 	var types []string
@@ -127,15 +173,19 @@ Options:
 
 	fmt.Printf("-----> Creating release...\n")
 
-	artifact := &ct.Artifact{Type: "docker", URI: os.Getenv("SLUGRUNNER_IMAGE_URI")}
-	if err := client.CreateArtifact(artifact); err != nil {
-		log.Fatalln("Error creating artifact:", err)
+	slugArtifact := &ct.Artifact{
+		Type: host.ArtifactTypeFile,
+		URI:  slugURL,
+		Meta: map[string]string{"blobstore": "true"},
+	}
+	if err := client.CreateArtifact(slugArtifact); err != nil {
+		return fmt.Errorf("Error creating slug artifact: %s", err)
 	}
 
 	release := &ct.Release{
-		ArtifactID: artifact.ID,
-		Env:        prevRelease.Env,
-		Meta:       prevRelease.Meta,
+		ArtifactIDs: []string{slugRunnerID, slugArtifact.ID},
+		Env:         prevRelease.Env,
+		Meta:        prevRelease.Meta,
 	}
 	if release.Meta == nil {
 		release.Meta = make(map[string]string, len(meta))
@@ -152,7 +202,7 @@ Options:
 	procs := make(map[string]ct.ProcessType)
 	for _, t := range types {
 		proc := prevRelease.Processes[t]
-		proc.Cmd = []string{"start", t}
+		proc.Args = []string{"/runner/init", "start", t}
 		if t == "web" || strings.HasSuffix(t, "-web") {
 			proc.Service = app.Name + "-" + t
 			proc.Ports = []ct.Port{{
@@ -168,58 +218,88 @@ Options:
 		procs[t] = proc
 	}
 	release.Processes = procs
-	if release.Env == nil {
-		release.Env = make(map[string]string)
-	}
-	release.Env["SLUG_URL"] = slugURL
 
 	if err := client.CreateRelease(release); err != nil {
-		log.Fatalln("Error creating release:", err)
+		return fmt.Errorf("Error creating release: %s", err)
 	}
-	if err := client.DeployAppRelease(app.Name, release.ID); err != nil {
-		log.Fatalln("Error deploying app release:", err)
+	if err := client.DeployAppRelease(app.Name, release.ID, nil); err != nil {
+		return fmt.Errorf("Error deploying app release: %s", err)
 	}
 
-	fmt.Println("=====> Application deployed")
-
+	// if the app has a web job and has not been scaled before, create a
+	// web=1 formation and wait for the "APPNAME-web" service to start
+	// (whilst also watching job events so the deploy fails if the job
+	// crashes)
 	if needsDefaultScale(app.ID, prevRelease.ID, procs, client) {
+		fmt.Println("=====> Scaling initial release to web=1")
+
 		formation := &ct.Formation{
 			AppID:     app.ID,
 			ReleaseID: release.ID,
 			Processes: map[string]int{"web": 1},
 		}
 
-		watcher, err := client.WatchJobEvents(app.ID, release.ID)
+		jobEvents := make(chan *ct.Job)
+		jobStream, err := client.StreamJobEvents(app.ID, jobEvents)
 		if err != nil {
-			log.Fatalln("Error streaming job events", err)
-			return
+			return fmt.Errorf("Error streaming job events: %s", err)
 		}
-		defer watcher.Close()
+		defer jobStream.Close()
+
+		serviceEvents := make(chan *discoverd.Event)
+		serviceStream, err := discoverd.NewService(app.Name + "-web").Watch(serviceEvents)
+		if err != nil {
+			return fmt.Errorf("Error streaming service events: %s", err)
+		}
+		defer serviceStream.Close()
 
 		if err := client.PutFormation(formation); err != nil {
-			log.Fatalln("Error putting formation:", err)
+			return fmt.Errorf("Error putting formation: %s", err)
 		}
-		fmt.Println("=====> Waiting for web job to start...")
+		fmt.Println("-----> Waiting for initial web job to start...")
 
-		err = watcher.WaitFor(ct.JobEvents{"web": ct.JobUpEvents(1)}, scaleTimeout, func(e *ct.Job) error {
-			switch e.State {
-			case ct.JobStateUp:
-				fmt.Println("=====> Default web formation scaled to 1")
-			case ct.JobStateDown:
-				return fmt.Errorf("Failed to scale web process type")
+		err = func() error {
+			for {
+				select {
+				case e, ok := <-serviceEvents:
+					if !ok {
+						return fmt.Errorf("Service stream closed unexpectedly: %s", serviceStream.Err())
+					}
+					if e.Kind == discoverd.EventKindUp && e.Instance.Meta["FLYNN_RELEASE_ID"] == release.ID {
+						fmt.Println("=====> Initial web job started")
+						return nil
+					}
+				case e, ok := <-jobEvents:
+					if !ok {
+						return fmt.Errorf("Job stream closed unexpectedly: %s", jobStream.Err())
+					}
+					if e.State == ct.JobStateDown {
+						return errors.New("Initial web job failed to start")
+					}
+				case <-time.After(time.Duration(app.DeployTimeout) * time.Second):
+					return errors.New("Timed out waiting for initial web job to start")
+				}
 			}
-			return nil
-		})
+		}()
 		if err != nil {
-			log.Fatalln(err.Error())
+			fmt.Println("-----> WARN: scaling initial release down to web=0 due to error")
+			formation.Processes["web"] = 0
+			if err := client.PutFormation(formation); err != nil {
+				// just print this error and return the original error
+				fmt.Println("-----> WARN: could not scale the initial release down (it may continue to run):", err)
+			}
+			return err
 		}
 	}
+
+	fmt.Println("=====> Application deployed")
+	return nil
 }
 
 // needsDefaultScale indicates whether a release needs a default scale based on
 // whether it has a web process type and either has no previous release or no
 // previous scale.
-func needsDefaultScale(appID, prevReleaseID string, procs map[string]ct.ProcessType, client *controller.Client) bool {
+func needsDefaultScale(appID, prevReleaseID string, procs map[string]ct.ProcessType, client controller.Client) bool {
 	if _, ok := procs["web"]; !ok {
 		return false
 	}
@@ -230,7 +310,7 @@ func needsDefaultScale(appID, prevReleaseID string, procs map[string]ct.ProcessT
 	return err == controller.ErrNotFound
 }
 
-func appendEnvDir(stdin io.Reader, pipe io.WriteCloser, env map[string]string) {
+func appendEnvDir(stdin io.Reader, pipe io.WriteCloser, env map[string]string) error {
 	defer pipe.Close()
 	tr := tar.NewReader(stdin)
 	tw := tar.NewWriter(pipe)
@@ -241,14 +321,14 @@ func appendEnvDir(stdin io.Reader, pipe io.WriteCloser, env map[string]string) {
 			break
 		}
 		if err != nil {
-			log.Fatalln(err)
+			return err
 		}
 		hdr.Name = path.Join("app", hdr.Name)
 		if err := tw.WriteHeader(hdr); err != nil {
-			log.Fatalln(err)
+			return err
 		}
 		if _, err := io.Copy(tw, tr); err != nil {
-			log.Fatalln(err)
+			return err
 		}
 	}
 	// append env dir
@@ -261,10 +341,10 @@ func appendEnvDir(stdin io.Reader, pipe io.WriteCloser, env map[string]string) {
 		}
 
 		if err := tw.WriteHeader(hdr); err != nil {
-			log.Fatalln(err)
+			return err
 		}
 		if _, err := tw.Write([]byte(value)); err != nil {
-			log.Fatalln(err)
+			return err
 		}
 	}
 	hdr := &tar.Header{
@@ -273,7 +353,5 @@ func appendEnvDir(stdin io.Reader, pipe io.WriteCloser, env map[string]string) {
 		ModTime: time.Now(),
 		Size:    0,
 	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		log.Fatalln(err)
-	}
+	return tw.WriteHeader(hdr)
 }

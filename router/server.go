@@ -9,12 +9,13 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/vanillahsu/go_reuseport"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/flynn/router/schema"
 	"github.com/flynn/flynn/router/types"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var logger = log15.New("app", "router")
@@ -55,6 +56,7 @@ func (s *Router) Start() error {
 	log.Info("starting TCP listener")
 	if err := s.TCP.Start(); err != nil {
 		log.Error("error starting TCP listener", "err", err)
+		s.HTTP.Close()
 		return err
 	}
 	return nil
@@ -65,7 +67,7 @@ func (s *Router) Close() {
 	s.TCP.Close()
 }
 
-var listenFunc = reuseport.NewReusablePortListener
+var listenFunc = keepalive.ReusableListen
 
 func main() {
 	defer shutdown.Exit()
@@ -128,6 +130,10 @@ func main() {
 	if err := migrateDB(db); err != nil {
 		shutdown.Fatal(err)
 	}
+	db.Close()
+
+	log.Info("reconnecting to postgres with prepared queries")
+	db = postgres.Wait(nil, schema.PrepareStatements)
 
 	shutdown.BeforeExit(func() { db.Close() })
 

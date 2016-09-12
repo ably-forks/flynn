@@ -13,14 +13,14 @@ import (
 	"runtime"
 	"time"
 
-	tuf "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/client"
-	tufdata "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/data"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/kardianos/osext"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/go-update.v0"
 	cfg "github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/tufutil"
 	"github.com/flynn/flynn/pkg/version"
+	tuf "github.com/flynn/go-tuf/client"
+	tufdata "github.com/flynn/go-tuf/data"
+	"github.com/kardianos/osext"
+	"gopkg.in/inconshreveable/go-update.v0"
 )
 
 const upcktimePath = "cktime"
@@ -87,6 +87,7 @@ func (u *Updater) update() error {
 	plat := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
 	opts := &tuf.HTTPRemoteOptions{
 		UserAgent: fmt.Sprintf("flynn-cli/%s %s", version.String(), plat),
+		Retries:   tuf.DefaultHTTPRetries,
 	}
 	remote, err := tuf.HTTPRemoteStore(u.repo, opts)
 	if err != nil {

@@ -8,15 +8,14 @@ import (
 	"path"
 	"path/filepath"
 
-	tuf "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/client"
 	"github.com/flynn/flynn/pkg/tufutil"
+	tuf "github.com/flynn/go-tuf/client"
 )
 
 var binaries = []string{
 	"flynn-host",
 	"flynn-linux-amd64",
 	"flynn-init",
-	"flynn-nsumount",
 }
 
 var config = []string{

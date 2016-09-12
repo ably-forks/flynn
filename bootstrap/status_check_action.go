@@ -9,9 +9,10 @@ import (
 )
 
 type StatusCheckAction struct {
-	ID     string `json:"id"`
-	URL    string `json:"url"`
-	Output string `json:"output"`
+	ID      string `json:"id"`
+	URL     string `json:"url"`
+	Output  string `json:"output"`
+	Timeout int    `json:"timeout"` // in seconds
 }
 
 type StatusResponse struct {
@@ -32,7 +33,10 @@ func init() {
 }
 
 func (a *StatusCheckAction) Run(s *State) error {
-	const waitMax = time.Minute
+	waitMax := time.Minute
+	if a.Timeout > 0 {
+		waitMax = time.Duration(a.Timeout) * time.Second
+	}
 	const waitInterval = 500 * time.Millisecond
 
 	u, err := url.Parse(interpolate(s, a.URL))
@@ -41,7 +45,7 @@ func (a *StatusCheckAction) Run(s *State) error {
 	}
 	lookupDiscoverdURLHost(s, u, waitMax)
 
-	start := time.Now()
+	timeout := time.After(waitMax)
 	for {
 		req, err := http.NewRequest("GET", u.String(), nil)
 		if err != nil {
@@ -50,37 +54,38 @@ func (a *StatusCheckAction) Run(s *State) error {
 		req.Header = make(http.Header)
 		req.Header.Set("Accept", "application/json")
 		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			goto fail
-		}
-		if res.StatusCode == 200 {
-			s.StepData[a.ID] = &LogMessage{Msg: "all services healthy"}
-		} else if time.Now().Sub(start) < waitMax {
-			// if services are unhealthy wait out the wait period
-			// before reporting them as unhealthy to the user
-			time.Sleep(waitInterval)
-			continue
-		} else {
-			var status StatusResponse
-			err = json.NewDecoder(res.Body).Decode(&status)
-			if err != nil {
-				goto fail
-			}
+		if err == nil && res.StatusCode == 200 {
 			res.Body.Close()
-			msg := "unhealthy services detected!\n\nThe following services are reporting unhealthy, this likely indicates a problem with your deployment:\n"
-			for svc, s := range status.Data.Detail {
-				if s.Status != "healthy" {
-					msg += "\t" + svc + "\n"
-				}
-			}
-			msg += "\n"
-			s.StepData[a.ID] = &LogMessage{Msg: msg}
+			s.StepData[a.ID] = &LogMessage{Msg: "all services healthy"}
+			return nil
 		}
-		return nil
-	fail:
-		if time.Now().Sub(start) >= waitMax {
+		var status StatusResponse
+		if err == nil {
+			err = json.NewDecoder(res.Body).Decode(&status)
+			res.Body.Close()
+			if err != nil {
+				return err
+			}
+		}
+
+		select {
+		case <-time.After(waitInterval):
+			continue
+		case <-timeout:
+		}
+
+		if err != nil {
 			return fmt.Errorf("bootstrap: timed out waiting for %s, last response %s", a.URL, err)
 		}
-		time.Sleep(waitInterval)
+
+		msg := "unhealthy services detected!\n\nThe following services are reporting unhealthy, this likely indicates a problem with your deployment:\n"
+		for svc, s := range status.Data.Detail {
+			if s.Status != "healthy" {
+				msg += "\t" + svc + "\n"
+			}
+		}
+		msg += "\n"
+		s.StepData[a.ID] = &LogMessage{Msg: msg}
+		return nil
 	}
 }

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/units"
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	"github.com/docker/go-units"
 	"github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
@@ -22,6 +23,7 @@ import (
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/typeconv"
 	tc "github.com/flynn/flynn/test/cluster"
+	c "github.com/flynn/go-check"
 )
 
 type Helper struct {
@@ -32,7 +34,7 @@ type Helper struct {
 	cluster    *cluster.Client
 
 	controllerMtx sync.Mutex
-	controller    *controller.Client
+	controller    controller.Client
 
 	discMtx sync.Mutex
 	disc    *discoverd.Client
@@ -62,7 +64,7 @@ func (h *Helper) clusterClient(t *c.C) *cluster.Client {
 	return h.cluster
 }
 
-func (h *Helper) controllerClient(t *c.C) *controller.Client {
+func (h *Helper) controllerClient(t *c.C) controller.Client {
 	h.controllerMtx.Lock()
 	defer h.controllerMtx.Unlock()
 	if h.controller == nil {
@@ -108,12 +110,13 @@ func (h *Helper) anyHostClient(t *c.C) *cluster.Host {
 const (
 	resourceMem   int64 = 256 * units.MiB
 	resourceMaxFD int64 = 1024
-	resourceCmd         = "cat /sys/fs/cgroup/memory/memory.limit_in_bytes; ulimit -n"
+	resourceCmd         = "cat /sys/fs/cgroup/memory/memory.limit_in_bytes; cat /sys/fs/cgroup/cpu/cpu.shares; ulimit -n"
 )
 
 func testResources() resource.Resources {
 	r := resource.Resources{
 		resource.TypeMemory: resource.Spec{Limit: typeconv.Int64Ptr(resourceMem)},
+		resource.TypeCPU:    resource.Spec{Limit: typeconv.Int64Ptr(750)},
 		resource.TypeMaxFD:  resource.Spec{Limit: typeconv.Int64Ptr(resourceMaxFD)},
 	}
 	resource.SetDefaults(&r)
@@ -122,9 +125,10 @@ func testResources() resource.Resources {
 
 func assertResourceLimits(t *c.C, out string) {
 	limits := strings.Split(strings.TrimSpace(out), "\n")
-	t.Assert(limits, c.HasLen, 2)
+	t.Assert(limits, c.HasLen, 3)
 	t.Assert(limits[0], c.Equals, strconv.FormatInt(resourceMem, 10))
-	t.Assert(limits[1], c.Equals, strconv.FormatInt(resourceMaxFD, 10))
+	t.Assert(limits[1], c.Equals, strconv.FormatInt(768, 10))
+	t.Assert(limits[2], c.Equals, strconv.FormatInt(resourceMaxFD, 10))
 }
 
 func (h *Helper) createApp(t *c.C) (*ct.App, *ct.Release) {
@@ -134,14 +138,14 @@ func (h *Helper) createApp(t *c.C) (*ct.App, *ct.Release) {
 	t.Assert(client.CreateApp(app), c.IsNil)
 	debugf(t, "created app %s (%s)", app.Name, app.ID)
 
-	artifact := &ct.Artifact{Type: "docker", URI: imageURIs["test-apps"]}
+	artifact := &ct.Artifact{Type: host.ArtifactTypeDocker, URI: imageURIs["test-apps"]}
 	t.Assert(client.CreateArtifact(artifact), c.IsNil)
 
 	release := &ct.Release{
-		ArtifactID: artifact.ID,
+		ArtifactIDs: []string{artifact.ID},
 		Processes: map[string]ct.ProcessType{
 			"echoer": {
-				Cmd:     []string{"/bin/echoer"},
+				Args:    []string{"/bin/echoer"},
 				Service: "echo-service",
 				Ports: []ct.Port{{
 					Proto: "tcp",
@@ -152,25 +156,25 @@ func (h *Helper) createApp(t *c.C) (*ct.App, *ct.Release) {
 				}},
 			},
 			"ping": {
-				Cmd:   []string{"/bin/pingserv"},
+				Args:  []string{"/bin/pingserv"},
 				Ports: []ct.Port{{Proto: "tcp"}},
 			},
 			"printer": {
-				Cmd: []string{"sh", "-c", "while true; do echo I like to print; sleep 1; done"},
+				Args: []string{"sh", "-c", "while true; do echo I like to print; sleep 1; done"},
 			},
 			"crasher": {
-				Cmd: []string{"sh", "-c", "trap 'exit 1' SIGTERM; while true; do echo I like to crash; sleep 1; done"},
+				Args: []string{"sh", "-c", "trap 'exit 1' SIGTERM; while true; do echo I like to crash; sleep 1; done"},
 			},
 			"omni": {
-				Cmd:  []string{"sh", "-c", "while true; do echo I am everywhere; sleep 1; done"},
+				Args: []string{"sh", "-c", "while true; do echo I am everywhere; sleep 1; done"},
 				Omni: true,
 			},
 			"resources": {
-				Cmd:       []string{"sh", "-c", resourceCmd},
+				Args:      []string{"sh", "-c", resourceCmd},
 				Resources: testResources(),
 			},
 			"ish": {
-				Cmd:   []string{"/bin/ish"},
+				Args:  []string{"/bin/ish"},
 				Ports: []ct.Port{{Proto: "tcp"}},
 				Env: map[string]string{
 					"NAME": app.Name,
@@ -190,22 +194,18 @@ func (h *Helper) stopJob(t *c.C, id string) {
 	t.Assert(hc.StopJob(id), c.IsNil)
 }
 
-func (h *Helper) addHost(t *c.C) *tc.Instance {
-	return h.addHosts(t, 1, false)[0]
+func (h *Helper) addHost(t *c.C, service string) *tc.Instance {
+	return h.addHosts(t, 1, false, service)[0]
 }
 
-func (h *Helper) addVanillaHost(t *c.C) *tc.Instance {
-	return h.addHosts(t, 1, true)[0]
-}
-
-func (h *Helper) addHosts(t *c.C, count int, vanilla bool) []*tc.Instance {
+func (h *Helper) addHosts(t *c.C, count int, vanilla bool, service string) []*tc.Instance {
 	debugf(t, "adding %d hosts", count)
 
 	// wait for the router-api to start on the host (rather than using
 	// StreamHostEvents) as we wait for router-api when removing the
 	// host (so that could fail if the router-api never starts).
 	events := make(chan *discoverd.Event)
-	stream, err := h.discoverdClient(t).Service("router-api").Watch(events)
+	stream, err := h.discoverdClient(t).Service(service).Watch(events)
 	t.Assert(err, c.IsNil)
 	defer stream.Close()
 
@@ -235,11 +235,11 @@ loop:
 	return hosts
 }
 
-func (h *Helper) removeHost(t *c.C, host *tc.Instance) {
-	h.removeHosts(t, []*tc.Instance{host})
+func (h *Helper) removeHost(t *c.C, host *tc.Instance, service string) {
+	h.removeHosts(t, []*tc.Instance{host}, service)
 }
 
-func (h *Helper) removeHosts(t *c.C, hosts []*tc.Instance) {
+func (h *Helper) removeHosts(t *c.C, hosts []*tc.Instance, service string) {
 	debugf(t, "removing %d hosts", len(hosts))
 
 	// Clean shutdown requires waiting for that host to unadvertise on discoverd.
@@ -247,7 +247,7 @@ func (h *Helper) removeHosts(t *c.C, hosts []*tc.Instance) {
 	// removal (rather than using StreamHostEvents), so that other
 	// tests won't try and connect to this host via service discovery.
 	events := make(chan *discoverd.Event)
-	stream, err := h.discoverdClient(t).Service("router-api").Watch(events)
+	stream, err := h.discoverdClient(t).Service(service).Watch(events)
 	t.Assert(err, c.IsNil)
 	defer stream.Close()
 
@@ -255,6 +255,40 @@ func (h *Helper) removeHosts(t *c.C, hosts []*tc.Instance) {
 		t.Assert(testCluster.RemoveHost(events, host), c.IsNil)
 		debugf(t, "host removed: %s", host.ID)
 	}
+}
+
+func (h *Helper) assertURI(t *c.C, uri string, status int) {
+	req, err := http.NewRequest("HEAD", uri, nil)
+	t.Assert(err, c.IsNil)
+	res, err := http.DefaultClient.Do(req)
+	t.Assert(err, c.IsNil)
+	res.Body.Close()
+	t.Assert(res.StatusCode, c.Equals, status)
+}
+
+func (h *Helper) buildDockerImage(t *c.C, repo string, lines ...string) {
+	cmd := exec.Command("docker", "build", "--tag", repo, "-")
+	cmd.Stdin = bytes.NewReader([]byte(fmt.Sprintf("FROM flynn/test-apps\n%s\n", strings.Join(lines, "\n"))))
+	t.Assert(run(t, cmd), Succeeds)
+}
+
+func (h *Helper) testBuildCaching(t *c.C) {
+	r := h.newGitRepo(t, "build-cache")
+	t.Assert(r.flynn("create"), Succeeds)
+	t.Assert(r.flynn("env", "set", "BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline"), Succeeds)
+
+	r.git("commit", "-m", "bump", "--allow-empty")
+	push := r.git("push", "flynn", "master")
+	t.Assert(push, Succeeds)
+	t.Assert(push, c.Not(OutputContains), "cached")
+
+	r.git("commit", "-m", "bump", "--allow-empty")
+	push = r.git("push", "flynn", "master")
+	t.Assert(push, SuccessfulOutputContains, "cached: 0")
+
+	r.git("commit", "-m", "bump", "--allow-empty")
+	push = r.git("push", "flynn", "master")
+	t.Assert(push, SuccessfulOutputContains, "cached: 1")
 }
 
 type gitRepo struct {
@@ -292,6 +326,12 @@ func (r *gitRepo) git(args ...string) *CmdResult {
 	return run(r.t, cmd)
 }
 
+func (r *gitRepo) sh(command string) *CmdResult {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = r.dir
+	return run(r.t, cmd)
+}
+
 func (h *Helper) newCliTestApp(t *c.C) *cliTestApp {
 	app, release := h.createApp(t)
 	watcher, err := h.controllerClient(t).WatchJobEvents(app.Name, release.ID)
@@ -309,7 +349,7 @@ func (h *Helper) newCliTestApp(t *c.C) *cliTestApp {
 type cliTestApp struct {
 	id, name string
 	release  *ct.Release
-	watcher  *controller.JobWatcher
+	watcher  ct.JobWatcher
 	disc     *discoverd.Client
 	t        *c.C
 }

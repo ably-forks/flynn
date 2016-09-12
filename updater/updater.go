@@ -9,22 +9,24 @@ import (
 	"os"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/mattn/go-colorable"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/status"
 	"github.com/flynn/flynn/pkg/version"
 	"github.com/flynn/flynn/updater/types"
+	"github.com/mattn/go-colorable"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
-var slugbuilderURI, slugrunnerURI string
-var slugKeys = []string{"SLUGBUILDER_IMAGE_URI", "SLUGRUNNER_IMAGE_URI"}
+var redisImage, slugBuilder, slugRunner *ct.Artifact
 
 // use a flag to determine whether to use a TTY log formatter because actually
 // assigning a TTY to the job causes reading images via stdin to fail.
 var isTTY = flag.Bool("tty", false, "use a TTY log formatter")
+
+const deployTimeout = 30 * time.Minute
 
 func main() {
 	flag.Parse()
@@ -105,8 +107,32 @@ func run() error {
 		}
 		uris[app.Name] = uri
 	}
-	slugbuilderURI = uris["slugbuilder"]
-	slugrunnerURI = uris["slugrunner"]
+
+	log.Info("creating new image artifacts")
+	redisImage = &ct.Artifact{
+		Type: host.ArtifactTypeDocker,
+		URI:  uris["redis"],
+	}
+	if err := client.CreateArtifact(redisImage); err != nil {
+		log.Error("error creating redis image artifact", "err", err)
+		return err
+	}
+	slugRunner = &ct.Artifact{
+		Type: host.ArtifactTypeDocker,
+		URI:  uris["slugrunner"],
+	}
+	if err := client.CreateArtifact(slugRunner); err != nil {
+		log.Error("error creating slugrunner image artifact", "err", err)
+		return err
+	}
+	slugBuilder = &ct.Artifact{
+		Type: host.ArtifactTypeDocker,
+		URI:  uris["slugbuilder"],
+	}
+	if err := client.CreateArtifact(slugBuilder); err != nil {
+		log.Error("error creating slugbuilder image artifact", "err", err)
+		return err
+	}
 
 	// deploy system apps in order first
 	for _, appInfo := range updater.SystemApps {
@@ -125,11 +151,18 @@ func run() error {
 		log.Info("starting deploy of system app")
 
 		app, err := client.GetApp(appInfo.Name)
-		if err != nil {
+		if err == controller.ErrNotFound && appInfo.Optional {
+			log.Info(
+				"skipped deploy of system app",
+				"reason", "optional app not present",
+				"app", appInfo.Name,
+			)
+			continue
+		} else if err != nil {
 			log.Error("error getting app", "err", err)
 			return err
 		}
-		if err := deployApp(client, app, uris[appInfo.Name], log); err != nil {
+		if err := deployApp(client, app, uris[appInfo.Name], appInfo.UpdateRelease, log); err != nil {
 			if e, ok := err.(errDeploySkipped); ok {
 				log.Info(
 					"skipped deploy of system app",
@@ -143,19 +176,34 @@ func run() error {
 		log.Info("finished deploy of system app")
 	}
 
-	// deploy all other apps
+	// deploy all other apps (including provisioned Redis apps)
 	apps, err := client.AppList()
 	if err != nil {
 		log.Error("error getting apps", "err", err)
 		return err
 	}
 	for _, app := range apps {
+		log := log.New("name", app.Name)
+
+		if app.RedisAppliance() {
+			log.Info("starting deploy of Redis app")
+			if err := deployApp(client, app, redisImage.URI, nil, log); err != nil {
+				if e, ok := err.(errDeploySkipped); ok {
+					log.Info("skipped deploy of Redis app", "reason", e.reason)
+					continue
+				}
+				return err
+			}
+			log.Info("finished deploy of Redis app")
+			continue
+		}
+
 		if app.System() {
 			continue
 		}
-		log := log.New("name", app.Name)
+
 		log.Info("starting deploy of app to update slugrunner")
-		if err := deployApp(client, app, slugrunnerURI, log); err != nil {
+		if err := deployApp(client, app, slugRunner.URI, nil, log); err != nil {
 			if e, ok := err.(errDeploySkipped); ok {
 				log.Info("skipped deploy of app", "reason", e.reason)
 				continue
@@ -175,13 +223,13 @@ func (e errDeploySkipped) Error() string {
 	return e.reason
 }
 
-func deployApp(client *controller.Client, app *ct.App, uri string, log log15.Logger) error {
+func deployApp(client controller.Client, app *ct.App, uri string, updateFn updater.UpdateReleaseFn, log log15.Logger) error {
 	release, err := client.GetAppRelease(app.ID)
 	if err != nil {
 		log.Error("error getting release", "err", err)
 		return err
 	}
-	artifact, err := client.GetArtifact(release.ArtifactID)
+	artifact, err := client.GetArtifact(release.ImageArtifactID())
 	if err != nil {
 		log.Error("error getting release artifact", "err", err)
 		return err
@@ -196,8 +244,8 @@ func deployApp(client *controller.Client, app *ct.App, uri string, log log15.Log
 		}
 	}
 	skipDeploy := artifact.URI == uri
-	if updateSlugURIs(release.Env) {
-		skipDeploy = false // deploy apps that depend on slugbuilder images if updated
+	if updateImageIDs(release.Env) {
+		skipDeploy = false
 	}
 	if skipDeploy {
 		return errDeploySkipped{"app is already using latest images"}
@@ -209,26 +257,45 @@ func deployApp(client *controller.Client, app *ct.App, uri string, log log15.Log
 		return err
 	}
 	release.ID = ""
-	release.ArtifactID = artifact.ID
+	release.SetImageArtifactID(artifact.ID)
+	if updateFn != nil {
+		updateFn(release)
+	}
 	if err := client.CreateRelease(release); err != nil {
 		log.Error("error creating new release", "err", err)
 		return err
 	}
-	if err := client.DeployAppRelease(app.ID, release.ID); err != nil {
+	timeoutCh := make(chan struct{})
+	time.AfterFunc(deployTimeout, func() { close(timeoutCh) })
+	if err := client.DeployAppRelease(app.ID, release.ID, timeoutCh); err != nil {
 		log.Error("error deploying app", "err", err)
 		return err
 	}
 	return nil
 }
 
-func updateSlugURIs(env map[string]string) bool {
+// updateImageIDs updates REDIS_IMAGE_ID, SLUGBUILDER_IMAGE_ID and
+// SLUGRUNNER_IMAGE_ID if they are set and have an old ID, and also
+// replaces the legacy REDIS_IMAGE_URI, SLUGBUILDER_IMAGE_URI and
+// SLUGRUNNER_IMAGE_URI
+func updateImageIDs(env map[string]string) bool {
 	updated := false
-	for _, k := range slugKeys {
-		if v, ok := env[k]; ok {
-			if v != slugbuilderURI {
-				env[k] = slugbuilderURI
-				updated = true
-			}
+	for prefix, newID := range map[string]string{
+		"REDIS":       redisImage.ID,
+		"SLUGBUILDER": slugBuilder.ID,
+		"SLUGRUNNER":  slugRunner.ID,
+	} {
+		idKey := prefix + "_IMAGE_ID"
+		if id, ok := env[idKey]; ok && id != newID {
+			env[idKey] = newID
+			updated = true
+		}
+
+		uriKey := prefix + "_IMAGE_URI"
+		if _, ok := env[uriKey]; ok {
+			delete(env, uriKey)
+			env[idKey] = newID
+			updated = true
 		}
 	}
 	return updated

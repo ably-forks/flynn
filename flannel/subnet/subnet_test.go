@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ type mockSubnetRegistry struct {
 	delCh   chan string
 	index   uint64
 	ttl     uint64
+	mtx     sync.RWMutex
 }
 
 func newMockSubnetRegistry(ttlOverride uint64) *mockSubnetRegistry {
@@ -44,6 +46,8 @@ func (msr *mockSubnetRegistry) GetConfig() ([]byte, error) {
 }
 
 func (msr *mockSubnetRegistry) GetSubnets() (*Response, error) {
+	msr.mtx.RLock()
+	defer msr.mtx.RUnlock()
 	res := &Response{
 		Subnets: make(map[string][]byte, len(msr.subnets)),
 		Index:   msr.index,
@@ -55,6 +59,8 @@ func (msr *mockSubnetRegistry) GetSubnets() (*Response, error) {
 }
 
 func (msr *mockSubnetRegistry) CreateSubnet(sn, data string, ttl uint64) (*Response, error) {
+	msr.mtx.Lock()
+	defer msr.mtx.Unlock()
 	msr.index += 1
 
 	if msr.ttl > 0 {
@@ -73,6 +79,8 @@ func (msr *mockSubnetRegistry) CreateSubnet(sn, data string, ttl uint64) (*Respo
 }
 
 func (msr *mockSubnetRegistry) UpdateSubnet(sn, data string, ttl uint64) (*Response, error) {
+	msr.mtx.Lock()
+	defer msr.mtx.Unlock()
 	msr.index += 1
 
 	// add squared durations :)
@@ -97,6 +105,8 @@ func (msr *mockSubnetRegistry) UpdateSubnet(sn, data string, ttl uint64) (*Respo
 
 func (msr *mockSubnetRegistry) WatchSubnets(since uint64, stop chan bool) (*Response, error) {
 	var sn string
+	msr.mtx.Lock()
+	defer msr.mtx.Unlock()
 
 	select {
 	case <-stop:
@@ -127,11 +137,6 @@ func (msr *mockSubnetRegistry) WatchSubnets(since uint64, stop chan bool) (*Resp
 		}
 		return nil, fmt.Errorf("Subnet (%s) to delete was not found: ", sn)
 	}
-}
-
-func (msr *mockSubnetRegistry) hasSubnet(sn string) bool {
-	_, ok := msr.subnets[sn]
-	return ok
 }
 
 func TestAcquireLease(t *testing.T) {
@@ -279,6 +284,8 @@ func TestRenewLease(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// check that it's still good
+	msr.mtx.RLock()
+	defer msr.mtx.RUnlock()
 	for subnet, v := range msr.subnets {
 		if subnet == sn.StringSep(".", "-") {
 			if v.expiration.Before(time.Now()) {

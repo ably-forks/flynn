@@ -8,11 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/term"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/exec"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -29,11 +29,10 @@ Options:
 
 func runRun(args *docopt.Args, client *cluster.Client) error {
 	cmd := exec.Cmd{
-		Artifact: exec.DockerImage(args.String["<image>"]),
+		ImageArtifact: exec.DockerImage(args.String["<image>"]),
 		Job: &host.Job{
 			Config: host.ContainerConfig{
-				Entrypoint: []string{args.String["<command>"]},
-				Cmd:        args.All["<argument>"].([]string),
+				Args:       append([]string{args.String["<command>"]}, args.All["<argument>"].([]string)...),
 				TTY:        term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()),
 				Stdin:      true,
 				DisableLog: true,

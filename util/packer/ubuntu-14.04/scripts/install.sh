@@ -34,8 +34,7 @@ main() {
   add_apt_sources
   install_packages
   install_flynn
-  disable_docker_auto_restart
-  install_go
+  disable_docker_start
   apt_cleanup
 
   if vagrant_build; then
@@ -138,8 +137,7 @@ enable_cgroups() {
 create_groups() {
   groupadd docker
   groupadd fuse || true
-  groupadd libvirtd || true
-  usermod -a -G docker,fuse,libvirtd "${SUDO_USER}"
+  usermod -a -G docker,fuse "${SUDO_USER}"
 }
 
 add_apt_sources() {
@@ -172,18 +170,20 @@ install_packages() {
     "curl"
     "git"
     "iptables"
-    "libvirt-bin"
-    "libvirt-dev"
     "linux-image-extra-$(uname -r)"
-    "docker-engine"
+    "docker-engine=1.9.1-0~trusty"
     "make"
     "mercurial"
     "tup"
     "ubuntu-zfs"
     "vim-tiny"
+    "libsasl2-dev"
   )
 
   apt-get install -y ${packages[@]}
+
+  # hold back docker upgrades to prevent breaking pinkerton see gh issue #2459
+  apt-mark hold docker-engine
 
   # make tup suid root so that we can build in chroots
   chmod ug+s /usr/bin/tup
@@ -201,17 +201,11 @@ install_flynn() {
   fi
 
   bash -es -- -r "${repo}" < <(curl -sL --fail "${repo}/${script}")
+  sed -i 's/start on/#start on/' /etc/init/flynn-host.conf
 }
 
-disable_docker_auto_restart() {
-  sed -i 's/^#DOCKER_OPTS=.*/DOCKER_OPTS="-r=false"/' /etc/default/docker
-}
-
-install_go() {
-  cd /tmp
-  wget j.mp/godeb
-  tar xvzf godeb
-  ./godeb install 1.4.3
+disable_docker_start() {
+  echo manual > /etc/init/docker.override
 }
 
 apt_cleanup() {

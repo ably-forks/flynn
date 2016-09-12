@@ -5,11 +5,11 @@ import (
 	"io"
 	"os"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/cheggaaa/pb"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/term"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/cheggaaa/pb"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -37,7 +37,7 @@ Examples:
 `)
 }
 
-func runRedis(args *docopt.Args, client *controller.Client) error {
+func runRedis(args *docopt.Args, client controller.Client) error {
 	config, err := getAppRedisRunConfig(client)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func runRedis(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func getAppRedisRunConfig(client *controller.Client) (*runConfig, error) {
+func getAppRedisRunConfig(client controller.Client) (*runConfig, error) {
 	appRelease, err := client.GetAppRelease(mustApp())
 	if err != nil {
 		return nil, fmt.Errorf("error getting app release: %s", err)
@@ -61,7 +61,7 @@ func getAppRedisRunConfig(client *controller.Client) (*runConfig, error) {
 	return getRedisRunConfig(client, mustApp(), appRelease)
 }
 
-func getRedisRunConfig(client *controller.Client, app string, appRelease *ct.Release) (*runConfig, error) {
+func getRedisRunConfig(client controller.Client, app string, appRelease *ct.Release) (*runConfig, error) {
 	redisApp := appRelease.Env["FLYNN_REDIS"]
 	if redisApp == "" {
 		return nil, fmt.Errorf("No redis server found. Provision one with `flynn resource add redis`")
@@ -76,7 +76,7 @@ func getRedisRunConfig(client *controller.Client, app string, appRelease *ct.Rel
 		App:        app,
 		Release:    redisRelease.ID,
 		Env:        make(map[string]string),
-		Args:       []string{"-h", redisApp + ".discoverd", "-a", appRelease.Env["REDIS_PASSWORD"]},
+		Args:       []string{"redis-cli", "-h", redisApp + ".discoverd", "-a", appRelease.Env["REDIS_PASSWORD"]},
 		DisableLog: true,
 		Exit:       true,
 	}
@@ -84,15 +84,14 @@ func getRedisRunConfig(client *controller.Client, app string, appRelease *ct.Rel
 	return config, nil
 }
 
-func runRedisCLI(args *docopt.Args, client *controller.Client, config *runConfig) error {
-	config.Entrypoint = []string{"redis-cli"}
+func runRedisCLI(args *docopt.Args, client controller.Client, config *runConfig) error {
 	config.Env["PAGER"] = "less"
 	config.Env["LESS"] = "--ignore-case --LONG-PROMPT --SILENT --tabs=4 --quit-if-one-screen --no-init --quit-at-eof"
 	config.Args = append(config.Args, args.All["<argument>"].([]string)...)
 	return runJob(client, *config)
 }
 
-func runRedisDump(args *docopt.Args, client *controller.Client, config *runConfig) error {
+func runRedisDump(args *docopt.Args, client controller.Client, config *runConfig) error {
 	config.Stdout = os.Stdout
 	if filename := args.String["--file"]; filename != "" {
 		f, err := os.Create(filename)
@@ -114,11 +113,11 @@ func runRedisDump(args *docopt.Args, client *controller.Client, config *runConfi
 		config.Stdout = io.MultiWriter(config.Stdout, bar)
 	}
 
-	config.Entrypoint = []string{"/bin/dump-flynn-redis"}
+	config.Args[0] = "/bin/dump-flynn-redis"
 	return runJob(client, *config)
 }
 
-func runRedisRestore(args *docopt.Args, client *controller.Client, config *runConfig) error {
+func runRedisRestore(args *docopt.Args, client controller.Client, config *runConfig) error {
 	config.Stdin = os.Stdin
 	var size int64
 	if filename := args.String["--file"]; filename != "" {
@@ -150,6 +149,6 @@ func runRedisRestore(args *docopt.Args, client *controller.Client, config *runCo
 		config.Stdin = bar.NewProxyReader(config.Stdin)
 	}
 
-	config.Entrypoint = []string{"/bin/restore-flynn-redis"}
+	config.Args[0] = "/bin/restore-flynn-redis"
 	return runJob(client, *config)
 }

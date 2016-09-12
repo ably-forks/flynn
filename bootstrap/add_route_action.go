@@ -2,8 +2,10 @@ package bootstrap
 
 import (
 	"fmt"
+	"time"
 
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/tlscert"
 	"github.com/flynn/flynn/router/types"
 )
@@ -42,13 +44,22 @@ func (a *AddRouteAction) Run(s *State) error {
 			if err != nil {
 				return err
 			}
-			route.TLSCert = cert.Cert
-			route.TLSKey = cert.PrivateKey
+			route.Certificate = &router.Certificate{
+				Cert: cert.Cert,
+				Key:  cert.PrivateKey,
+			}
 		}
 		a.Route = route.ToRoute()
 	}
 
-	if err := client.CreateRoute(data.App.ID, a.Route); err != nil {
+	err = attempt.Strategy{
+		Min:   5,
+		Total: 10 * time.Second,
+		Delay: 200 * time.Millisecond,
+	}.Run(func() error {
+		return client.CreateRoute(data.App.ID, a.Route)
+	})
+	if err != nil {
 		return err
 	}
 	s.StepData[a.ID] = &AddRouteState{App: data.App, Route: a.Route}

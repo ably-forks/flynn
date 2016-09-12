@@ -1,13 +1,17 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,13 +20,15 @@ import (
 	"syscall"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/cli/config"
+	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/host/resource"
+	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/tlscert"
+	c "github.com/flynn/go-check"
 )
 
 type CLISuite struct {
@@ -88,18 +94,6 @@ func (s *CLISuite) TestAppWithCustomRemote(t *c.C) {
 
 func (s *CLISuite) TestAppWithNoRemote(t *c.C) {
 	testApp(s, t, "")
-}
-
-// TODO: share with cli/key.go
-func formatKeyID(s string) string {
-	buf := make([]byte, 0, len(s)+((len(s)-2)/2))
-	for i := range s {
-		buf = append(buf, s[i])
-		if (i+1)%2 == 0 && i != len(s)-1 {
-			buf = append(buf, ':')
-		}
-	}
-	return string(buf)
 }
 
 func (s *CLISuite) TestPs(t *c.C) {
@@ -211,10 +205,10 @@ func (s *CLISuite) TestScaleAll(t *c.C) {
 
 	prevRelease := release
 	release = &ct.Release{
-		ArtifactID: release.ArtifactID,
-		Env:        release.Env,
-		Meta:       release.Meta,
-		Processes:  release.Processes,
+		ArtifactIDs: release.ArtifactIDs,
+		Env:         release.Env,
+		Meta:        release.Meta,
+		Processes:   release.Processes,
 	}
 	t.Assert(client.CreateRelease(release), c.IsNil)
 	t.Assert(client.SetAppRelease(app.id, release.ID), c.IsNil)
@@ -312,6 +306,23 @@ func (s *CLISuite) TestRunSignal(t *c.C) {
 	t.Assert(out.String(), c.Equals, "got signal: interrupt")
 }
 
+func (s *CLISuite) TestRunNoImage(t *c.C) {
+	r := s.newGitRepo(t, "empty-release")
+	t.Assert(r.flynn("create"), Succeeds)
+	t.Assert(r.flynn("env", "set", "FOO=BAR", "BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline"), Succeeds)
+
+	// running a command before pushing should error
+	cmd := r.flynn("run", "env")
+	t.Assert(cmd, c.Not(Succeeds))
+	t.Assert(cmd, OutputContains, "App release has no image, push a release first")
+
+	// command should work after push
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+	cmd = r.flynn("run", "env")
+	t.Assert(cmd, Succeeds)
+	t.Assert(cmd, OutputContains, "FOO=BAR")
+}
+
 func (s *CLISuite) TestEnv(t *c.C) {
 	app := s.newCliTestApp(t)
 	defer app.cleanup()
@@ -376,17 +387,12 @@ func (s *CLISuite) TestRoute(t *c.C) {
 
 	// flynn route add http
 	route := random.String(32) + ".dev"
-	newRoute := app.flynn("route", "add", "http", "--sticky", route)
+	newRoute := app.flynn("route", "add", "http", route)
 	t.Assert(newRoute, Succeeds)
 	routeID := strings.TrimSpace(newRoute.Output)
 	assertRouteContains(routeID, true)
 
-	// duplicate http route
-	dupRoute := app.flynn("route", "add", "http", "--sticky", route)
-	t.Assert(dupRoute, c.Not(Succeeds))
-	t.Assert(dupRoute.Output, c.Equals, "conflict: Duplicate route\n")
-
-	// ensure sticky flag is set
+	// ensure sticky and leader flags default to not set
 	routes, err := client.RouteList(app.name)
 	t.Assert(err, c.IsNil)
 	var found bool
@@ -394,8 +400,36 @@ func (s *CLISuite) TestRoute(t *c.C) {
 		if fmt.Sprintf("%s/%s", r.Type, r.ID) != routeID {
 			continue
 		}
-		t.Assert(r.Sticky, c.Equals, true)
+		t.Assert(r.Sticky, c.Equals, false)
+		t.Assert(r.Leader, c.Equals, false)
 		found = true
+		break
+	}
+	t.Assert(found, c.Equals, true, c.Commentf("didn't find route"))
+
+	// flynn route add http --sticky --leader
+	route = random.String(32) + ".dev"
+	newRoute = app.flynn("route", "add", "http", "--sticky", route, "--leader")
+	t.Assert(newRoute, Succeeds)
+	routeID = strings.TrimSpace(newRoute.Output)
+	assertRouteContains(routeID, true)
+
+	// duplicate http route
+	dupRoute := app.flynn("route", "add", "http", "--sticky", route)
+	t.Assert(dupRoute, c.Not(Succeeds))
+	t.Assert(dupRoute.Output, c.Equals, "conflict: Duplicate route\n")
+
+	// ensure sticky and leader flags are set
+	routes, err = client.RouteList(app.name)
+	t.Assert(err, c.IsNil)
+	for _, r := range routes {
+		if fmt.Sprintf("%s/%s", r.Type, r.ID) != routeID {
+			continue
+		}
+		t.Assert(r.Sticky, c.Equals, true)
+		t.Assert(r.Leader, c.Equals, true)
+		found = true
+		break
 	}
 	t.Assert(found, c.Equals, true, c.Commentf("didn't find route"))
 
@@ -405,6 +439,13 @@ func (s *CLISuite) TestRoute(t *c.C) {
 	r, err := client.GetRoute(app.id, routeID)
 	t.Assert(err, c.IsNil)
 	t.Assert(r.Sticky, c.Equals, false)
+
+	// flynn route update --no-leader
+	newRoute = app.flynn("route", "update", routeID, "--no-leader")
+	t.Assert(newRoute, Succeeds)
+	r, err = client.GetRoute(app.id, routeID)
+	t.Assert(err, c.IsNil)
+	t.Assert(r.Leader, c.Equals, false)
 
 	// flynn route update --service
 	newRoute = app.flynn("route", "update", routeID, "--service", "foo")
@@ -420,6 +461,14 @@ func (s *CLISuite) TestRoute(t *c.C) {
 	r, err = client.GetRoute(app.id, routeID)
 	t.Assert(err, c.IsNil)
 	t.Assert(r.Sticky, c.Equals, true)
+	t.Assert(r.Service, c.Equals, "foo")
+
+	// flynn route update --leader
+	newRoute = app.flynn("route", "update", routeID, "--leader")
+	t.Assert(newRoute, Succeeds)
+	r, err = client.GetRoute(app.id, routeID)
+	t.Assert(err, c.IsNil)
+	t.Assert(r.Leader, c.Equals, true)
 	t.Assert(r.Service, c.Equals, "foo")
 
 	// flynn route add domain path
@@ -500,8 +549,9 @@ func (s *CLISuite) TestRoute(t *c.C) {
 	r, err = client.GetRoute(app.id, routeID)
 	t.Assert(err, c.IsNil)
 	t.Assert(r.Domain, c.Equals, "example.com")
-	t.Assert(r.TLSCert, c.Equals, cert.Cert)
-	t.Assert(r.TLSKey, c.Equals, cert.PrivateKey)
+	t.Assert(r.Certificate, c.NotNil)
+	t.Assert(r.Certificate.Cert, c.Equals, strings.Trim(cert.Cert, "\n"))
+	t.Assert(r.Certificate.Key, c.Equals, strings.Trim(cert.PrivateKey, "\n"))
 
 	// flynn route update tls cert
 	cert, err = tlscert.Generate([]string{"example.com"})
@@ -514,8 +564,9 @@ func (s *CLISuite) TestRoute(t *c.C) {
 	r, err = client.GetRoute(app.id, routeID)
 	t.Assert(err, c.IsNil)
 	t.Assert(r.Domain, c.Equals, "example.com")
-	t.Assert(r.TLSCert, c.Equals, cert.Cert)
-	t.Assert(r.TLSKey, c.Equals, cert.PrivateKey)
+	t.Assert(r.Certificate, c.NotNil)
+	t.Assert(r.Certificate.Cert, c.Equals, strings.Trim(cert.Cert, "\n"))
+	t.Assert(r.Certificate.Key, c.Equals, strings.Trim(cert.PrivateKey, "\n"))
 
 	// flynn route remove
 	t.Assert(app.flynn("route", "remove", routeID), Succeeds)
@@ -763,11 +814,11 @@ func (s *CLISuite) TestRelease(t *c.C) {
 		"env": {"GLOBAL": "FOO"},
 		"processes": {
 			"echoer": {
-				"cmd": ["/bin/echoer"],
+				"args": ["/bin/echoer"],
 				"env": {"ECHOER_ONLY": "BAR"}
 			},
 			"env": {
-				"cmd": ["sh", "-c", "env; while true; do sleep 60; done"],
+				"args": ["sh", "-c", "env; while true; do sleep 60; done"],
 				"env": {"ENV_ONLY": "BAZ"}
 			}
 		}
@@ -786,13 +837,13 @@ func (s *CLISuite) TestRelease(t *c.C) {
 		"env": {"GLOBAL": "FOO"},
 		"processes": {
 			"echoer": {
-				"cmd": ["/bin/echoer"],
+				"args": ["/bin/echoer"],
 				"env": {
 					"ECHOER_ONLY": "BAT"
 				}
 			},
 			"env": {
-				"cmd": ["sh", "-c", "env; while true; do sleep 60; done"],
+				"args": ["sh", "-c", "env; while true; do sleep 60; done"],
 				"env": {
 					"ENV_ONLY": "BAZ",
 					"ENV_UPDATE": "QUUX"
@@ -863,7 +914,7 @@ func (s *CLISuite) TestRelease(t *c.C) {
 func (s *CLISuite) TestLimits(t *c.C) {
 	app := s.newCliTestApp(t)
 	defer app.cleanup()
-	t.Assert(app.flynn("limit", "set", "resources", "memory=512MB", "max_fd=12k"), Succeeds)
+	t.Assert(app.flynn("limit", "set", "resources", "memory=512MB", "max_fd=12k", "cpu=2000"), Succeeds)
 
 	release, err := s.controller.GetAppRelease(app.name)
 	t.Assert(err, c.IsNil)
@@ -873,11 +924,13 @@ func (s *CLISuite) TestLimits(t *c.C) {
 	}
 	r := proc.Resources
 	t.Assert(*r[resource.TypeMemory].Limit, c.Equals, int64(536870912))
+	t.Assert(*r[resource.TypeCPU].Limit, c.Equals, int64(2000))
 	t.Assert(*r[resource.TypeMaxFD].Limit, c.Equals, int64(12000))
 
 	cmd := app.flynn("limit", "-t", "resources")
 	t.Assert(cmd, Succeeds)
 	t.Assert(cmd, OutputContains, "memory=512MB")
+	t.Assert(cmd, OutputContains, "cpu=2000")
 	t.Assert(cmd, OutputContains, "max_fd=12000")
 }
 
@@ -888,29 +941,53 @@ func (s *CLISuite) TestRunLimits(t *c.C) {
 	t.Assert(cmd, Succeeds)
 	defaults := resource.Defaults()
 	limits := strings.Split(strings.TrimSpace(cmd.Output), "\n")
-	t.Assert(limits, c.HasLen, 2)
+	t.Assert(limits, c.HasLen, 3)
 	t.Assert(limits[0], c.Equals, strconv.FormatInt(*defaults[resource.TypeMemory].Limit, 10))
-	t.Assert(limits[1], c.Equals, strconv.FormatInt(*defaults[resource.TypeMaxFD].Limit, 10))
+	t.Assert(limits[1], c.Equals, strconv.FormatInt(1024, 10))
+	t.Assert(limits[2], c.Equals, strconv.FormatInt(*defaults[resource.TypeMaxFD].Limit, 10))
 }
 
 func (s *CLISuite) TestExportImport(t *c.C) {
 	srcApp := "app-export" + random.String(8)
 	dstApp := "app-import" + random.String(8)
 
-	// create and push app+db
+	// create app
 	r := s.newGitRepo(t, "http")
 	t.Assert(r.flynn("create", srcApp), Succeeds)
+
+	// exporting the app without a release should work
+	file := filepath.Join(t.MkDir(), "export.tar")
+	t.Assert(r.flynn("export", "-f", file), Succeeds)
+	assertExportContains := func(paths ...string) {
+		cmd := r.sh(fmt.Sprintf("tar --list --file=%s --strip=1 --show-transformed", file))
+		t.Assert(cmd, Outputs, strings.Join(paths, "\n")+"\n")
+	}
+	assertExportContains("app.json", "routes.json")
+
+	// exporting the app with an artifact-less release should work
+	t.Assert(r.flynn("env", "set", "FOO=BAR"), Succeeds)
+	t.Assert(r.flynn("export", "-f", file), Succeeds)
+	assertExportContains("app.json", "routes.json", "release.json")
+
+	// release the app and provision some dbs
 	t.Assert(r.git("push", "flynn", "master"), Succeeds)
 	t.Assert(r.flynn("resource", "add", "postgres"), Succeeds)
 	t.Assert(r.flynn("pg", "psql", "--", "-c",
 		"CREATE table foos (data text); INSERT INTO foos (data) VALUES ('foobar')"), Succeeds)
+	t.Assert(r.flynn("resource", "add", "mysql"), Succeeds)
+	t.Assert(r.flynn("mysql", "console", "--", "-e",
+		"CREATE TABLE foos (data TEXT); INSERT INTO foos (data) VALUES ('foobar')"), Succeeds)
 
 	// export app
-	file := filepath.Join(t.MkDir(), "export.tar")
 	t.Assert(r.flynn("export", "-f", file), Succeeds)
+	assertExportContains(
+		"app.json", "routes.json", "release.json", "artifact.json",
+		"formation.json", "slug.tar.gz", "postgres.dump", "mysql.dump",
+	)
 
-	// remove db table from source app
+	// remove db tables from source app
 	t.Assert(r.flynn("pg", "psql", "--", "-c", "DROP TABLE foos"), Succeeds)
+	t.Assert(r.flynn("mysql", "console", "--", "-e", "DROP TABLE foos"), Succeeds)
 
 	// remove the git remote
 	t.Assert(r.git("remote", "remove", "flynn"), Succeeds)
@@ -918,8 +995,10 @@ func (s *CLISuite) TestExportImport(t *c.C) {
 	// import app
 	t.Assert(r.flynn("import", "--name", dstApp, "--file", file), Succeeds)
 
-	// test db was imported
+	// test dbs were imported
 	query := r.flynn("-a", dstApp, "pg", "psql", "--", "-c", "SELECT * FROM foos")
+	t.Assert(query, SuccessfulOutputContains, "foobar")
+	query = r.flynn("-a", dstApp, "mysql", "console", "--", "-e", "SELECT * FROM foos")
 	t.Assert(query, SuccessfulOutputContains, "foobar")
 
 	// wait for it to start
@@ -961,4 +1040,350 @@ func (s *CLISuite) TestDeploy(t *c.C) {
 	deploy := r.flynn("deployment")
 	t.Assert(deploy, Succeeds)
 	t.Assert(deploy.Output, Matches, "complete")
+}
+
+func (s *CLISuite) TestDeployTimeout(t *c.C) {
+	timeout := flynn(t, "/", "-a", "status", "deployment", "timeout")
+	t.Assert(timeout, Succeeds)
+	t.Assert(timeout.Output, c.Equals, "120\n")
+
+	t.Assert(flynn(t, "/", "-a", "status", "deployment", "timeout", "150"), Succeeds)
+	timeout = flynn(t, "/", "-a", "status", "deployment", "timeout")
+	t.Assert(timeout, Succeeds)
+	t.Assert(timeout.Output, c.Equals, "150\n")
+}
+
+func (s *CLISuite) TestReleaseDelete(t *c.C) {
+	// create an app and release it twice
+	r := s.newGitRepo(t, "http")
+	app := "release-delete-" + random.String(8)
+	t.Assert(r.flynn("create", app), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+	t.Assert(r.git("commit", "--allow-empty", "--message", "empty commit"), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+
+	// get the releases
+	client := s.controllerClient(t)
+	releases, err := client.AppReleaseList(app)
+	t.Assert(err, c.IsNil)
+	t.Assert(releases, c.HasLen, 2)
+
+	// check the current release cannot be deleted
+	res := r.flynn("release", "delete", "--yes", releases[0].ID)
+	t.Assert(res, c.Not(Succeeds))
+	t.Assert(res.Output, c.Equals, "validation_error: cannot delete current app release\n")
+
+	// associate the initial release with another app
+	otherApp := &ct.App{Name: "release-delete-" + random.String(8)}
+	t.Assert(client.CreateApp(otherApp), c.IsNil)
+	t.Assert(client.PutFormation(&ct.Formation{AppID: otherApp.ID, ReleaseID: releases[1].ID}), c.IsNil)
+
+	// check deleting the initial release just deletes the formation
+	res = r.flynn("release", "delete", "--yes", releases[1].ID)
+	t.Assert(res, Succeeds)
+	t.Assert(res.Output, c.Equals, "Release scaled down for app but not fully deleted (still associated with 1 other apps)\n")
+
+	// check the slug artifact still exists
+	slugArtifact, err := client.GetArtifact(releases[1].FileArtifactIDs()[0])
+	t.Assert(err, c.IsNil)
+	s.assertURI(t, slugArtifact.URI, http.StatusOK)
+
+	// check the inital release can now be deleted
+	res = r.flynn("-a", otherApp.ID, "release", "delete", "--yes", releases[1].ID)
+	t.Assert(res, Succeeds)
+	t.Assert(res.Output, c.Equals, fmt.Sprintf("Deleted release %s (deleted 1 files)\n", releases[1].ID))
+
+	// check the slug artifact was deleted
+	_, err = client.GetArtifact(slugArtifact.ID)
+	t.Assert(err, c.Equals, controller.ErrNotFound)
+	s.assertURI(t, slugArtifact.URI, http.StatusNotFound)
+
+	// check the image artifact was not deleted (since it is shared between both releases)
+	_, err = client.GetArtifact(releases[1].ImageArtifactID())
+	t.Assert(err, c.IsNil)
+}
+
+func (s *CLISuite) TestReleaseRollback(t *c.C) {
+	// create an app and release it
+	r := s.newGitRepo(t, "http")
+	app := "release-rollback-" + random.String(8)
+	t.Assert(r.flynn("create", app), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+
+	// check that rollback fails when there's only a single release
+	res := r.flynn("release", "rollback", "--yes")
+	t.Assert(res, c.Not(Succeeds))
+
+	// create a second release
+	t.Assert(r.git("commit", "--allow-empty", "--message", "empty commit"), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+
+	// get the releases
+	client := s.controllerClient(t)
+	releases, err := client.AppReleaseList(app)
+	t.Assert(err, c.IsNil)
+	t.Assert(releases, c.HasLen, 2)
+
+	// rollback to the second release
+	res = r.flynn("release", "rollback", "--yes")
+	t.Assert(res, Succeeds)
+
+	// revert rollback
+	res = r.flynn("release", "rollback", "--yes", releases[0].ID)
+	t.Assert(res, Succeeds)
+
+	// check that attempting to rollback to the current release fails
+	res = r.flynn("release", "rollback", "--yes", releases[0].ID)
+	t.Assert(res, c.Not(Succeeds))
+}
+
+func (s *CLISuite) TestSlugReleaseGarbageCollection(t *c.C) {
+	client := s.controllerClient(t)
+
+	// create app with gc.max_inactive_slug_releases=3
+	maxInactiveSlugReleases := 3
+	app := &ct.App{Meta: map[string]string{"gc.max_inactive_slug_releases": strconv.Itoa(maxInactiveSlugReleases)}}
+	t.Assert(client.CreateApp(app), c.IsNil)
+
+	// create an image artifact
+	imageArtifact := &ct.Artifact{Type: host.ArtifactTypeDocker, URI: imageURIs["test-apps"]}
+	t.Assert(client.CreateArtifact(imageArtifact), c.IsNil)
+
+	// create 5 slug artifacts
+	var slug bytes.Buffer
+	gz := gzip.NewWriter(&slug)
+	t.Assert(tar.NewWriter(gz).Close(), c.IsNil)
+	t.Assert(gz.Close(), c.IsNil)
+	slugs := []string{
+		"http://blobstore.discoverd/1/slug.tgz",
+		"http://blobstore.discoverd/2/slug.tgz",
+		"http://blobstore.discoverd/3/slug.tgz",
+		"http://blobstore.discoverd/4/slug.tgz",
+		"http://blobstore.discoverd/5/slug.tgz",
+	}
+	slugArtifacts := make([]*ct.Artifact, len(slugs))
+	for i, uri := range slugs {
+		req, err := http.NewRequest("PUT", uri, bytes.NewReader(slug.Bytes()))
+		t.Assert(err, c.IsNil)
+		res, err := http.DefaultClient.Do(req)
+		t.Assert(err, c.IsNil)
+		res.Body.Close()
+		t.Assert(res.StatusCode, c.Equals, http.StatusOK)
+		artifact := &ct.Artifact{
+			Type: host.ArtifactTypeFile,
+			URI:  uri,
+			Meta: map[string]string{"blobstore": "true"},
+		}
+		t.Assert(client.CreateArtifact(artifact), c.IsNil)
+		slugArtifacts[i] = artifact
+	}
+
+	// create 6 releases, the second being scaled up and having the
+	// same slug as the third (so prevents the slug being deleted)
+	releases := make([]*ct.Release, 6)
+	for i, r := range []struct {
+		slug   *ct.Artifact
+		active bool
+	}{
+		{slugArtifacts[0], false},
+		{slugArtifacts[1], true},
+		{slugArtifacts[1], false},
+		{slugArtifacts[2], false},
+		{slugArtifacts[3], false},
+		{slugArtifacts[4], false},
+	} {
+		release := &ct.Release{
+			ArtifactIDs: []string{imageArtifact.ID, r.slug.ID},
+			Processes: map[string]ct.ProcessType{
+				"app": {Args: []string{"/bin/pingserv"}, Ports: []ct.Port{{Proto: "tcp"}}},
+			},
+		}
+		t.Assert(client.CreateRelease(release), c.IsNil)
+		procs := map[string]int{"app": 0}
+		if r.active {
+			procs["app"] = 1
+		}
+		t.Assert(client.PutFormation(&ct.Formation{
+			AppID:     app.ID,
+			ReleaseID: release.ID,
+			Processes: procs,
+		}), c.IsNil)
+		releases[i] = release
+	}
+
+	// scale the last release so we can deploy it
+	lastRelease := releases[len(releases)-1]
+	watcher, err := client.WatchJobEvents(app.ID, lastRelease.ID)
+	t.Assert(err, c.IsNil)
+	defer watcher.Close()
+	t.Assert(client.PutFormation(&ct.Formation{
+		AppID:     app.ID,
+		ReleaseID: lastRelease.ID,
+		Processes: map[string]int{"app": 1},
+	}), c.IsNil)
+	t.Assert(watcher.WaitFor(ct.JobEvents{"app": ct.JobUpEvents(1)}, scaleTimeout, nil), c.IsNil)
+	t.Assert(client.SetAppRelease(app.ID, lastRelease.ID), c.IsNil)
+
+	// subscribe to garbage collection events
+	gcEvents := make(chan *ct.Event)
+	stream, err := client.StreamEvents(ct.StreamEventsOptions{
+		AppID:       app.ID,
+		ObjectTypes: []ct.EventType{ct.EventTypeAppGarbageCollection},
+	}, gcEvents)
+	t.Assert(err, c.IsNil)
+	defer stream.Close()
+
+	// deploy a new release with the same slug as the last release
+	timeoutCh := make(chan struct{})
+	time.AfterFunc(5*time.Minute, func() { close(timeoutCh) })
+	newRelease := *lastRelease
+	newRelease.ID = ""
+	t.Assert(client.CreateRelease(&newRelease), c.IsNil)
+	t.Assert(client.DeployAppRelease(app.ID, newRelease.ID, timeoutCh), c.IsNil)
+
+	// wait for garbage collection
+	select {
+	case event, ok := <-gcEvents:
+		if !ok {
+			t.Fatalf("event stream closed unexpectedly: %s", stream.Err())
+		}
+		var e ct.AppGarbageCollectionEvent
+		t.Assert(json.Unmarshal(event.Data, &e), c.IsNil)
+		if e.Error != "" {
+			t.Fatalf("garbage collection failed: %s", e.Error)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("timed out waiting for garbage collection")
+	}
+
+	// check we have 4 distinct slug releases (so 5 in total, only 3 are
+	// inactive)
+	list, err := client.AppReleaseList(app.ID)
+	t.Assert(err, c.IsNil)
+	t.Assert(list, c.HasLen, maxInactiveSlugReleases+2)
+	distinctSlugs := make(map[string]struct{}, len(list))
+	for _, release := range list {
+		files := release.FileArtifactIDs()
+		t.Assert(files, c.HasLen, 1)
+		distinctSlugs[files[0]] = struct{}{}
+	}
+	t.Assert(distinctSlugs, c.HasLen, maxInactiveSlugReleases+1)
+
+	// check the first and third releases got deleted, but the rest remain
+	assertDeleted := func(release *ct.Release, deleted bool) {
+		_, err := client.GetRelease(release.ID)
+		if deleted {
+			t.Assert(err, c.Equals, controller.ErrNotFound)
+		} else {
+			t.Assert(err, c.IsNil)
+		}
+	}
+	assertDeleted(releases[0], true)
+	assertDeleted(releases[1], false)
+	assertDeleted(releases[2], true)
+	assertDeleted(releases[3], false)
+	assertDeleted(releases[4], false)
+	assertDeleted(releases[5], false)
+	assertDeleted(&newRelease, false)
+
+	// check the first slug got deleted, but the rest remain
+	s.assertURI(t, slugs[0], http.StatusNotFound)
+	for i := 1; i < len(slugs); i++ {
+		s.assertURI(t, slugs[i], http.StatusOK)
+	}
+}
+
+func (s *CLISuite) TestDockerPush(t *c.C) {
+	// build image with ENV and CMD
+	repo := "cli-test-push"
+	s.buildDockerImage(t, repo,
+		`ENV FOO=BAR`,
+		`CMD ["/bin/pingserv"]`,
+	)
+
+	// create app
+	client := s.controllerClient(t)
+	app := &ct.App{Name: "cli-test-docker-push"}
+	t.Assert(client.CreateApp(app), c.IsNil)
+
+	// flynn docker push image
+	t.Assert(flynn(t, "/", "-a", app.Name, "docker", "push", repo), Succeeds)
+
+	// check app was released with correct env, meta and process type
+	release, err := client.GetAppRelease(app.ID)
+	t.Assert(err, c.IsNil)
+	t.Assert(release.Env["FOO"], c.Equals, "BAR")
+	t.Assert(release.Meta["docker-receive"], c.Equals, "true")
+	t.Assert(release.Processes, c.HasLen, 1)
+	proc, ok := release.Processes["app"]
+	if !ok {
+		t.Fatal(`release missing "app" process type`)
+	}
+	t.Assert(proc.Args, c.DeepEquals, []string{"/bin/pingserv"})
+
+	// check updated env vars are not overwritten
+	//
+	// need to remove the tag before pushing as we are using Docker 1.9
+	// which does not overwrite tags.
+	// TODO: remove this when upgrading Docker > 1.9
+	u, err := url.Parse(s.clusterConf(t).DockerPushURL)
+	t.Assert(err, c.IsNil)
+	tag := fmt.Sprintf("%s/%s:latest", u.Host, app.Name)
+	t.Assert(run(t, exec.Command("docker", "rmi", tag)), Succeeds)
+	t.Assert(flynn(t, "/", "-a", app.Name, "env", "set", "FOO=BAZ"), Succeeds)
+	t.Assert(flynn(t, "/", "-a", app.Name, "docker", "push", repo), Succeeds)
+	t.Assert(flynn(t, "/", "-a", app.Name, "env", "get", "FOO"), Outputs, "BAZ\n")
+
+	// check the release can be scaled up
+	t.Assert(flynn(t, "/", "-a", app.Name, "scale", "app=1"), Succeeds)
+
+	// check the job is reachable with the app's name in discoverd
+	instances, err := s.discoverdClient(t).Instances(app.Name+"-web", 10*time.Second)
+	t.Assert(err, c.IsNil)
+	res, err := http.Get("http://" + instances[0].Addr)
+	t.Assert(err, c.IsNil)
+	defer res.Body.Close()
+	body, err := ioutil.ReadAll(res.Body)
+	t.Assert(err, c.IsNil)
+	t.Assert(string(body), c.Equals, "OK")
+}
+
+func (s *CLISuite) TestDockerExportImport(t *c.C) {
+	// release via docker-receive
+	client := s.controllerClient(t)
+	app := &ct.App{Name: "cli-test-docker-export"}
+	t.Assert(client.CreateApp(app), c.IsNil)
+	repo := "cli-test-export"
+	s.buildDockerImage(t, repo, `CMD ["/bin/pingserv"]`)
+	t.Assert(flynn(t, "/", "-a", app.Name, "docker", "push", repo), Succeeds)
+	t.Assert(flynn(t, "/", "-a", app.Name, "scale", "app=1"), Succeeds)
+	defer flynn(t, "/", "-a", app.Name, "scale", "app=0")
+
+	// export the app
+	file := filepath.Join(t.MkDir(), "export.tar")
+	t.Assert(flynn(t, "/", "-a", app.Name, "export", "-f", file), Succeeds)
+
+	// delete the image from the registry
+	release, err := client.GetAppRelease(app.Name)
+	t.Assert(err, c.IsNil)
+	artifact, err := client.GetArtifact(release.ImageArtifactID())
+	t.Assert(err, c.IsNil)
+	u, err := url.Parse(s.clusterConf(t).DockerPushURL)
+	t.Assert(err, c.IsNil)
+	uri := fmt.Sprintf("http://%s/v2/%s/manifests/%s", u.Host, app.Name, artifact.Meta["docker-receive.digest"])
+	req, err := http.NewRequest("DELETE", uri, nil)
+	req.SetBasicAuth("", s.clusterConf(t).Key)
+	t.Assert(err, c.IsNil)
+	res, err := http.DefaultClient.Do(req)
+	t.Assert(err, c.IsNil)
+	res.Body.Close()
+
+	// import to another app
+	importApp := "cli-test-docker-import"
+	t.Assert(flynn(t, "/", "import", "--name", importApp, "--file", file), Succeeds)
+	defer flynn(t, "/", "-a", importApp, "scale", "app=0")
+
+	// wait for it to start
+	_, err = s.discoverdClient(t).Instances(importApp+"-web", 10*time.Second)
+	t.Assert(err, c.IsNil)
 }

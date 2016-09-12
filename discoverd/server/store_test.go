@@ -271,6 +271,38 @@ func TestStore_AddInstance_LeaderEvent(t *testing.T) {
 	}
 }
 
+// Ensure the store sends a "leader" event when setting the leader.
+func TestStore_SetLeader_Event(t *testing.T) {
+	s := MustOpenStore()
+	defer s.Close()
+	if err := s.AddService("service0", &discoverd.ServiceConfig{LeaderType: discoverd.LeaderTypeManual}); err != nil {
+		t.Fatal(err)
+	} else if err := s.AddInstance("service0", &discoverd.Instance{ID: "inst0"}); err != nil {
+		t.Fatal(err)
+	} else if err := s.AddInstance("service0", &discoverd.Instance{ID: "inst1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add subscription.
+	ch := make(chan *discoverd.Event, 1)
+	s.Subscribe("service0", false, discoverd.EventKindLeader, ch)
+
+	// Update instance.
+	if err := s.SetServiceLeader("service0", "inst1"); err != nil {
+		t.Fatal(err)
+		t.Fatal(err)
+	}
+
+	// Verify "leader" event was received.
+	if e := <-ch; !reflect.DeepEqual(e, &discoverd.Event{
+		Service:  "service0",
+		Kind:     discoverd.EventKindLeader,
+		Instance: &discoverd.Instance{ID: "inst1", Index: 4},
+	}) {
+		t.Fatalf("unexpected event: %#v", e)
+	}
+}
+
 // Ensure the store can remove an instance from a service.
 func TestStore_RemoveInstance(t *testing.T) {
 	s := MustOpenStore()
@@ -529,6 +561,52 @@ func TestStore_SetServiceMeta_ErrNotFound(t *testing.T) {
 	}
 }
 
+// Ensure the store can set metadata and a leader at the same time for the service.
+func TestStore_SetServiceMeta_Leader(t *testing.T) {
+	s := MustOpenStore()
+	defer s.Close()
+	if err := s.AddService("service0", &discoverd.ServiceConfig{LeaderType: discoverd.LeaderTypeManual}); err != nil {
+		t.Fatal(err)
+	} else if err := s.AddInstance("service0", &discoverd.Instance{ID: "inst0"}); err != nil {
+		t.Fatal(err)
+	} else if err := s.AddInstance("service0", &discoverd.Instance{ID: "inst1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add subscription.
+	ch := make(chan *discoverd.Event, 2)
+	s.Subscribe("service0", false, discoverd.EventKindLeader|discoverd.EventKindServiceMeta, ch)
+
+	// Set metadata and leader.
+	if err := s.SetServiceMeta("service0", &discoverd.ServiceMeta{Data: []byte(`"foo"`), LeaderID: "inst1", Index: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := &discoverd.ServiceMeta{Data: []byte(`"foo"`), Index: 5}
+	// Verify metadata was updated.
+	if m := s.ServiceMeta("service0"); !reflect.DeepEqual(m, expected) {
+		t.Fatalf("unexpected meta: %#v", m)
+	}
+
+	// Verify service meta event was received.
+	if e := <-ch; !reflect.DeepEqual(e, &discoverd.Event{
+		Service:     "service0",
+		Kind:        discoverd.EventKindServiceMeta,
+		ServiceMeta: expected,
+	}) {
+		t.Fatalf("unexpected event: %#v", e)
+	}
+
+	// Verify leader event was received.
+	if e := <-ch; !reflect.DeepEqual(e, &discoverd.Event{
+		Service:  "service0",
+		Kind:     discoverd.EventKindLeader,
+		Instance: &discoverd.Instance{ID: "inst1", Index: 4},
+	}) {
+		t.Fatalf("unexpected event: %#v", e)
+	}
+}
+
 // Ensure the store can manually set a leader for a manual service.
 func TestStore_SetLeader(t *testing.T) {
 	s := MustOpenStore()
@@ -690,8 +768,11 @@ func (s *Store) MustWaitForLeader() {
 // MockStore represents a mock implementation of Handler.Store.
 type MockStore struct {
 	LeaderFn           func() string
+	IsLeaderFn         func() bool
+	GetPeersFn         func() ([]string, error)
 	AddPeerFn          func(peer string) error
 	RemovePeerFn       func(peer string) error
+	LastIndexFn        func() uint64
 	AddServiceFn       func(service string, config *discoverd.ServiceConfig) error
 	RemoveServiceFn    func(service string) error
 	SetServiceMetaFn   func(service string, meta *discoverd.ServiceMeta) error
@@ -706,9 +787,12 @@ type MockStore struct {
 }
 
 func (s *MockStore) Leader() string { return s.LeaderFn() }
+func (s *MockStore) IsLeader() bool { return s.IsLeaderFn() }
 
+func (s *MockStore) GetPeers() ([]string, error)  { return s.GetPeersFn() }
 func (s *MockStore) AddPeer(peer string) error    { return s.AddPeerFn(peer) }
 func (s *MockStore) RemovePeer(peer string) error { return s.RemovePeerFn(peer) }
+func (s *MockStore) LastIndex() uint64            { return s.LastIndexFn() }
 
 func (s *MockStore) AddService(service string, config *discoverd.ServiceConfig) error {
 	return s.AddServiceFn(service, config)
@@ -752,19 +836,4 @@ func (s *MockStore) ServiceLeader(service string) (*discoverd.Instance, error) {
 
 func (s *MockStore) Subscribe(service string, sendCurrent bool, kinds discoverd.EventKind, ch chan *discoverd.Event) stream.Stream {
 	return s.SubscribeFn(service, sendCurrent, kinds, ch)
-}
-
-// MustRandomPort returns a random port.
-func MustRandomPort() string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(err)
-	}
-	defer ln.Close()
-
-	_, port, err := net.SplitHostPort(ln.Addr().String())
-	if err != nil {
-		panic(err)
-	}
-	return port
 }

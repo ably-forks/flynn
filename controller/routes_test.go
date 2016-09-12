@@ -5,13 +5,13 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/stream"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	. "github.com/flynn/go-check"
 )
 
 func newFakeRouter() routerc.Client {
@@ -71,6 +71,26 @@ func (r *fakeRouter) UpdateRoute(route *router.Route) error {
 
 func (r *fakeRouter) StreamEvents(output chan *router.StreamEvent) (stream.Stream, error) {
 	return &fakeStream{}, nil
+}
+
+func (r *fakeRouter) CreateCert(cert *router.Certificate) error {
+	return nil
+}
+
+func (r *fakeRouter) GetCert(id string) (*router.Certificate, error) {
+	return nil, nil
+}
+
+func (r *fakeRouter) DeleteCert(id string) error {
+	return nil
+}
+
+func (r *fakeRouter) ListCerts() ([]*router.Certificate, error) {
+	return nil, nil
+}
+
+func (r *fakeRouter) ListCertRoutes(id string) ([]*router.Route, error) {
+	return nil, nil
 }
 
 type sortedRoutes []*router.Route

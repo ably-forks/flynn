@@ -6,6 +6,7 @@ import (
 
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/stream"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type Registrar interface {
@@ -19,12 +20,16 @@ type Registration struct {
 	Monitor   func(Check, chan MonitorEvent) stream.Stream
 	Check     Check
 	Events    chan MonitorEvent
+	Logger    log15.Logger
 }
 
 func (r *Registration) Register() discoverd.Heartbeater {
 	events := make(chan MonitorEvent)
 	hb := &heartbeater{Registration: r}
 	hb.stream = r.Monitor(r.Check, events)
+	if r.Logger != nil {
+		hb.l = r.Logger.New("component", "registrar", "addr", r.Instance.Addr)
+	}
 	go hb.run(events)
 	return hb
 }
@@ -34,6 +39,7 @@ type heartbeater struct {
 
 	sync.Mutex
 	hb discoverd.Heartbeater
+	l  log15.Logger
 	*Registration
 }
 
@@ -51,6 +57,9 @@ func (h *heartbeater) run(events chan MonitorEvent) {
 		case MonitorStatusDown:
 			h.Lock()
 			if h.hb != nil {
+				if h.l != nil {
+					h.l.Info("monitor status down, stopping heartbeater")
+				}
 				h.hb.Close()
 				h.hb = nil
 			}
@@ -82,9 +91,18 @@ func (h *heartbeater) register(stop chan struct{}) {
 				return
 			}
 			h.hb, err = h.Registrar.RegisterInstance(h.Service, h.Instance)
+			if err != nil {
+				h.hb = nil
+			}
 		}()
 		if err == nil {
+			if h.l != nil {
+				h.l.Info("created heartbeater")
+			}
 			return
+		}
+		if h.l != nil {
+			h.l.Error("error creating heartbeater", "err", err)
 		}
 		time.Sleep(registerErrWait)
 	}

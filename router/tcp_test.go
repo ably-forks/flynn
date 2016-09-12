@@ -1,14 +1,16 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"strconv"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/discoverd/testutil"
 	"github.com/flynn/flynn/router/types"
+	. "github.com/flynn/go-check"
 )
 
 func NewTCPTestServer(prefix string) *TCPTestServer {
@@ -45,16 +47,13 @@ func (s *TCPTestServer) Serve() {
 
 func (s *TCPTestServer) Close() error { return s.l.Close() }
 
-const firstTCPPort, lastTCPPort = 10001, 10010
-
 func (s *S) newTCPListener(t testutil.TestingT) *TCPListener {
 	l := &TCPListener{
 		IP:        "127.0.0.1",
-		startPort: firstTCPPort,
-		endPort:   lastTCPPort,
 		ds:        NewPostgresDataStore("tcp", s.pgx),
 		discoverd: s.discoverd,
 	}
+	l.startPort, l.endPort = allocatePortRange(10)
 	if err := l.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +74,10 @@ func assertTCPConn(c *C, addr, prefix string) {
 }
 
 func (s *S) TestAddTCPRoute(c *C) {
-	const addr, port, portInt = "127.0.0.1:45000", "45000", 45000
+	portInt := allocatePort()
+	port := strconv.Itoa(portInt)
+	addr := "127.0.0.1:" + port
+
 	srv1 := NewTCPTestServer("1")
 	srv2 := NewTCPTestServer("2")
 	defer srv1.Close()
@@ -116,8 +118,48 @@ func addTCPRoute(c *C, l *TCPListener, port int) *router.TCPRoute {
 	return r.TCPRoute()
 }
 
+func (s *S) TestTCPLeaderRouting(c *C) {
+	portInt := allocatePort()
+	port := strconv.Itoa(portInt)
+	addr := "127.0.0.1:" + port
+
+	srv1 := NewTCPTestServer("1")
+	srv2 := NewTCPTestServer("2")
+	defer srv1.Close()
+	defer srv2.Close()
+
+	l := s.newTCPListener(c)
+	defer l.Close()
+
+	client := l.discoverd
+	err := client.AddService("leader-routing-tcp", &discoverd.ServiceConfig{
+		LeaderType: discoverd.LeaderTypeManual,
+	})
+	c.Assert(err, IsNil)
+
+	wait := waitForEvent(c, l, "set", "")
+	r := router.TCPRoute{
+		Service: "leader-routing-tcp",
+		Port:    portInt,
+		Leader:  true,
+	}.ToRoute()
+	err = l.AddRoute(r)
+	c.Assert(err, IsNil)
+	wait()
+
+	discoverdRegisterTCPService(c, l, "leader-routing-tcp", srv1.Addr)
+	discoverdRegisterTCPService(c, l, "leader-routing-tcp", srv2.Addr)
+
+	discoverdSetLeaderTCP(c, l, "leader-routing-tcp", md5sum("tcp-"+srv1.Addr))
+	assertTCPConn(c, addr, "1")
+
+	discoverdSetLeaderTCP(c, l, "leader-routing-tcp", md5sum("tcp-"+srv2.Addr))
+	assertTCPConn(c, addr, "2")
+}
+
 func (s *S) TestInitialTCPSync(c *C) {
-	const addr, port = "127.0.0.1:45000", 45000
+	port := allocatePort()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	l := s.newTCPListener(c)
 	addTCPRoute(c, l, port)
 	l.Close()
@@ -140,7 +182,7 @@ func (s *S) TestTCPPortAllocation(c *C) {
 		ports := make([]string, 0, 10)
 		for j := 0; j < 10; j++ {
 			route := addTCPRoute(c, l, 0)
-			c.Assert(route.Port >= firstTCPPort && route.Port <= lastTCPPort, Equals, true)
+			c.Assert(route.Port >= l.startPort && route.Port <= l.endPort, Equals, true)
 
 			port := strconv.Itoa(route.Port)
 			ports = append(ports, route.ID)

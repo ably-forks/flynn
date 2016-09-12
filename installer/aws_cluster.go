@@ -12,17 +12,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/aws"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/cloudformation"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/ec2"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/route53"
+	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/gen/cloudformation"
+	"github.com/awslabs/aws-sdk-go/gen/ec2"
+	"github.com/awslabs/aws-sdk-go/gen/route53"
 	"github.com/flynn/flynn/pkg/awsutil"
 	"github.com/flynn/flynn/pkg/sshkeygen"
 	"github.com/flynn/flynn/util/release/types"
 )
 
 var DisallowedEC2InstanceTypes = []string{"t1.micro", "t2.micro", "t2.small", "m1.small"}
-var DefaultInstanceType = "m3.medium"
+var DefaultInstanceType = "m4.large"
 var StackNotFoundError = errors.New("Stack does not exist")
 
 func (c *AWSCluster) Type() string {
@@ -158,13 +158,14 @@ func (c *AWSCluster) Run() {
 			c.createStack,
 			c.fetchStackOutputs,
 			c.configureDNS,
+			c.base.uploadBackup,
 			c.bootstrap,
 			c.base.waitForDNS,
 		}
 
 		for _, step := range steps {
 			if err := step(); err != nil {
-				if c.base.State != "deleting" {
+				if c.base.getState() != "deleting" {
 					c.base.setState("error")
 					c.base.SendError(err)
 				}
@@ -245,13 +246,25 @@ func (c *AWSCluster) loadKeyPair(name string) error {
 }
 
 func (c *AWSCluster) createKeyPair() error {
+	keypairNames := listSSHKeyNames()
+	if c.base.SSHKeyName != "" {
+		newKeypairNames := make([]string, len(keypairNames)+1)
+		newKeypairNames[0] = c.base.SSHKeyName
+		for i, name := range keypairNames {
+			newKeypairNames[i+1] = name
+		}
+		keypairNames = newKeypairNames
+	}
+	for _, name := range keypairNames {
+		if err := c.loadKeyPair(name); err == nil {
+			c.base.SendLog(fmt.Sprintf("Using saved key pair (%s)", c.base.SSHKeyName))
+			return nil
+		}
+	}
+
 	keypairName := "flynn"
 	if c.base.SSHKeyName != "" {
 		keypairName = c.base.SSHKeyName
-	}
-	if err := c.loadKeyPair(keypairName); err == nil {
-		c.base.SendLog(fmt.Sprintf("Using saved key pair (%s)", c.base.SSHKeyName))
-		return nil
 	}
 
 	keypair, err := loadSSHKey(keypairName)
@@ -451,7 +464,7 @@ func (c *AWSCluster) createStack() error {
 			StackName:        aws.String(c.StackName),
 			Tags:             []cloudformation.Tag{},
 			TemplateBody:     aws.String(stackTemplateString),
-			TimeoutInMinutes: aws.Integer(10),
+			TimeoutInMinutes: aws.Integer(30),
 			Parameters:       parameters,
 		})
 		return err

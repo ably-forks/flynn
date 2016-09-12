@@ -32,7 +32,7 @@ var GithubAuth = React.createClass({
 
 						<ol>
 							<li>
-								<ExternalLink href={"https://github.com/settings/tokens/new"+ QueryParams.serializeParams([{
+								<ExternalLink href={Config.github_token_url + QueryParams.serializeParams([{
 									scopes: "repo,read:org,read:public_key",
 									description: "Flynn Dashboard"
 								}])} className="btn-green connect-with-github" onClick={this.__handleGenerateTokenBtnClick}>
@@ -132,7 +132,8 @@ var GithubAuth = React.createClass({
 			name: 'UPDATE_APP_ENV',
 			appID: this.state.app.id,
 			prevRelease: this.state.release,
-			data: env
+			data: env,
+			deployTimeout: this.state.app.deploy_timeout
 		});
 	},
 

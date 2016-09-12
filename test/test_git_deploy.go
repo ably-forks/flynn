@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"fmt"
@@ -8,13 +9,16 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
+	"syscall"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/attempt"
+	c "github.com/flynn/go-check"
 )
 
 type GitDeploySuite struct {
@@ -51,22 +55,7 @@ func (s *GitDeploySuite) TestEmptyRelease(t *c.C) {
 }
 
 func (s *GitDeploySuite) TestBuildCaching(t *c.C) {
-	r := s.newGitRepo(t, "build-cache")
-	t.Assert(r.flynn("create"), Succeeds)
-	t.Assert(r.flynn("env", "set", "BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline"), Succeeds)
-
-	r.git("commit", "-m", "bump", "--allow-empty")
-	push := r.git("push", "flynn", "master")
-	t.Assert(push, Succeeds)
-	t.Assert(push, c.Not(OutputContains), "cached")
-
-	r.git("commit", "-m", "bump", "--allow-empty")
-	push = r.git("push", "flynn", "master")
-	t.Assert(push, SuccessfulOutputContains, "cached: 0")
-
-	r.git("commit", "-m", "bump", "--allow-empty")
-	push = r.git("push", "flynn", "master")
-	t.Assert(push, SuccessfulOutputContains, "cached: 1")
+	s.testBuildCaching(t)
 }
 
 func (s *GitDeploySuite) TestAppRecreation(t *c.C) {
@@ -145,11 +134,10 @@ func (s *GitDeploySuite) runBuildpackTestWithResponsePattern(t *c.C, name string
 
 	push := r.git("push", "flynn", "master")
 	t.Assert(push, SuccessfulOutputContains, "Creating release")
-	t.Assert(push, SuccessfulOutputContains, "Application deployed")
-	t.Assert(push, SuccessfulOutputContains, "Waiting for web job to start...")
+	t.Assert(push, SuccessfulOutputContains, "Scaling initial release to web=1")
 	t.Assert(push, SuccessfulOutputContains, "* [new branch]      master -> master")
-	t.Assert(push, c.Not(OutputContains), "timed out waiting for scale")
-	t.Assert(push, SuccessfulOutputContains, "=====> Default web formation scaled to 1")
+	t.Assert(push, SuccessfulOutputContains, "Initial web job started")
+	t.Assert(push, SuccessfulOutputContains, "Application deployed")
 
 	watcher.WaitFor(ct.JobEvents{"web": {ct.JobStateUp: 1}}, scaleTimeout, nil)
 
@@ -256,4 +244,121 @@ func (s *GitDeploySuite) TestGitSubmodules(t *c.C) {
 	t.Assert(r.flynn("create"), Succeeds)
 	t.Assert(r.git("push", "flynn", "master"), Succeeds)
 	t.Assert(r.flynn("run", "ls", "go-flynn-example"), SuccessfulOutputContains, "main.go")
+}
+
+func (s *GitDeploySuite) TestCancel(t *c.C) {
+	r := s.newGitRepo(t, "cancel-hang")
+	t.Assert(r.flynn("create", "cancel-hang"), Succeeds)
+	t.Assert(r.flynn("env", "set", "FOO=bar", "BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline"), Succeeds)
+
+	// start watching for slugbuilder events
+	watcher, err := s.controllerClient(t).WatchJobEvents("cancel-hang", "")
+	t.Assert(err, c.IsNil)
+
+	// start push
+	cmd := exec.Command("git", "push", "flynn", "master")
+	// put the command in its own process group (to emulate the way shells handle Ctrl-C)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Dir = r.dir
+	var stdout io.Reader
+	stdout, _ = cmd.StdoutPipe()
+	cmd.Stderr = cmd.Stdout
+	out := &bytes.Buffer{}
+	stdout = io.TeeReader(stdout, out)
+	err = cmd.Start()
+	t.Assert(err, c.IsNil)
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			cmd.Process.Signal(syscall.SIGTERM)
+			cmd.Wait()
+			t.Fatal("git push timed out")
+		}
+	}()
+
+	// wait for sentinel
+	sc := bufio.NewScanner(stdout)
+	found := false
+	for sc.Scan() {
+		if strings.Contains(sc.Text(), "hanging...") {
+			found = true
+			break
+		}
+	}
+	t.Log(out.String())
+	t.Assert(found, c.Equals, true)
+
+	// send Ctrl-C to git process group
+	syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
+	t.Assert(err, c.IsNil)
+	go io.Copy(ioutil.Discard, stdout)
+	cmd.Wait()
+	close(done)
+
+	// check that slugbuilder exits immediately
+	err = watcher.WaitFor(ct.JobEvents{"slugbuilder": {ct.JobStateUp: 1, ct.JobStateDown: 1}}, 10*time.Second, nil)
+	t.Assert(err, c.IsNil)
+}
+
+func (s *GitDeploySuite) TestCrashingApp(t *c.C) {
+	// create a crashing app
+	r := s.newGitRepo(t, "crash")
+	app := "crashing-app"
+	t.Assert(r.flynn("create", app), Succeeds)
+	t.Assert(r.flynn("env", "set", "BUILDPACK_URL=https://github.com/kr/heroku-buildpack-inline"), Succeeds)
+
+	// check the push is rejected as the job won't start
+	push := r.git("push", "flynn", "master")
+	t.Assert(push, c.Not(Succeeds))
+	t.Assert(push, OutputContains, "web job failed to start")
+
+	// check the formation was scaled down
+	client := s.controllerClient(t)
+	release, err := client.GetAppRelease(app)
+	t.Assert(err, c.IsNil)
+	formation, err := client.GetFormation(app, release.ID)
+	t.Assert(err, c.IsNil)
+	t.Assert(formation.Processes["web"], c.Equals, 0)
+}
+
+func (s *GitDeploySuite) TestSlugignore(t *c.C) {
+	r := s.newGitRepo(t, "slugignore")
+	t.Assert(r.flynn("create", "slugignore"), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+
+	run := r.flynn("run", "ls")
+	t.Assert(run, Succeeds)
+	t.Assert(run, Outputs, "existing\n")
+}
+
+func (s *GitDeploySuite) TestNonMasterPush(t *c.C) {
+	r := s.newGitRepo(t, "empty")
+	t.Assert(r.flynn("create"), Succeeds)
+	push := r.git("push", "flynn", "master:foo")
+	t.Assert(push, c.Not(Succeeds))
+	t.Assert(push, OutputContains, "push must include a change to the master branch")
+}
+
+func (s *GitDeploySuite) TestProcfileChange(t *c.C) {
+	for _, strategy := range []string{"all-at-once", "one-by-one"} {
+		r := s.newGitRepo(t, "http")
+		name := "procfile-change-" + strategy
+		t.Assert(r.flynn("create", name), Succeeds)
+		t.Assert(s.controllerClient(t).UpdateApp(&ct.App{ID: name, Strategy: strategy}), c.IsNil)
+		t.Assert(r.git("push", "flynn", "master"), Succeeds)
+
+		// add a new web process type
+		t.Assert(r.sh("echo new-web: http >> Procfile"), Succeeds)
+		t.Assert(r.git("commit", "-a", "-m", "add new-web process"), Succeeds)
+		t.Assert(r.git("push", "flynn", "master"), Succeeds)
+		t.Assert(r.flynn("scale", "new-web=1"), Succeeds)
+
+		// remove the new web process type
+		t.Assert(r.sh("sed -i '/new-web: http/d' Procfile"), Succeeds)
+		t.Assert(r.git("commit", "-a", "-m", "remove new-web process"), Succeeds)
+		t.Assert(r.git("push", "flynn", "master"), Succeeds)
+	}
 }

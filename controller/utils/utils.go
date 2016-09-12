@@ -1,10 +1,7 @@
 package utils
 
 import (
-	"encoding/base64"
-	"errors"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -39,24 +36,37 @@ func JobConfig(f *ct.ExpandedFormation, name, hostID string, uuid string) *host.
 	metadata["flynn-controller.app"] = f.App.ID
 	metadata["flynn-controller.app_name"] = f.App.Name
 	metadata["flynn-controller.release"] = f.Release.ID
+	metadata["flynn-controller.formation"] = "true"
 	metadata["flynn-controller.type"] = name
 	job := &host.Job{
 		ID:       id,
 		Metadata: metadata,
-		Artifact: host.Artifact{
-			Type: f.Artifact.Type,
-			URI:  f.Artifact.URI,
-		},
 		Config: host.ContainerConfig{
-			Cmd:         t.Cmd,
+			Args:        t.Args,
 			Env:         env,
 			HostNetwork: t.HostNetwork,
 		},
 		Resurrect: t.Resurrect,
 		Resources: t.Resources,
 	}
-	if len(t.Entrypoint) > 0 {
-		job.Config.Entrypoint = t.Entrypoint
+
+	// job.Config.Args may be empty if restoring from an old backup which
+	// still uses the deprecated Entrypoint / Cmd fields
+	if len(job.Config.Args) == 0 {
+		job.Config.Args = append(t.DeprecatedEntrypoint, t.DeprecatedCmd...)
+	}
+
+	if f.App.Meta["flynn-system-app"] == "true" {
+		job.Partition = "system"
+	}
+	if f.ImageArtifact != nil {
+		job.ImageArtifact = f.ImageArtifact.HostArtifact()
+	}
+	if len(f.FileArtifacts) > 0 {
+		job.FileArtifacts = make([]*host.Artifact, len(f.FileArtifacts))
+		for i, artifact := range f.FileArtifacts {
+			job.FileArtifacts[i] = artifact.HostArtifact()
+		}
 	}
 	job.Config.Ports = make([]host.Port, len(t.Ports))
 	for i, p := range t.Ports {
@@ -99,6 +109,10 @@ func NewFormationKey(appID, releaseID string) FormationKey {
 	return FormationKey{AppID: appID, ReleaseID: releaseID}
 }
 
+func (f FormationKey) String() string {
+	return fmt.Sprintf("%s:%s", f.AppID, f.ReleaseID)
+}
+
 func ExpandFormation(c ControllerClient, f *ct.Formation) (*ct.ExpandedFormation, error) {
 	app, err := c.GetApp(f.AppID)
 	if err != nil {
@@ -110,9 +124,18 @@ func ExpandFormation(c ControllerClient, f *ct.Formation) (*ct.ExpandedFormation
 		return nil, fmt.Errorf("error getting release: %s", err)
 	}
 
-	artifact, err := c.GetArtifact(release.ArtifactID)
+	imageArtifact, err := c.GetArtifact(release.ImageArtifactID())
 	if err != nil {
-		return nil, fmt.Errorf("error getting artifact: %s", err)
+		return nil, fmt.Errorf("error getting image artifact: %s", err)
+	}
+
+	fileArtifacts := make([]*ct.Artifact, len(release.FileArtifactIDs()))
+	for i, fileArtifactID := range release.FileArtifactIDs() {
+		artifact, err := c.GetArtifact(fileArtifactID)
+		if err != nil {
+			return nil, fmt.Errorf("error getting file artifact: %s", err)
+		}
+		fileArtifacts[i] = artifact
 	}
 
 	procs := make(map[string]int)
@@ -121,12 +144,13 @@ func ExpandFormation(c ControllerClient, f *ct.Formation) (*ct.ExpandedFormation
 	}
 
 	ef := &ct.ExpandedFormation{
-		App:       app,
-		Release:   release,
-		Artifact:  artifact,
-		Processes: procs,
-		Tags:      f.Tags,
-		UpdatedAt: time.Now(),
+		App:           app,
+		Release:       release,
+		ImageArtifact: imageArtifact,
+		FileArtifacts: fileArtifacts,
+		Processes:     procs,
+		Tags:          f.Tags,
+		UpdatedAt:     time.Now(),
 	}
 	if f.UpdatedAt != nil {
 		ef.UpdatedAt = *f.UpdatedAt
@@ -202,29 +226,6 @@ func (c clusterClientWrapper) StreamHostEvents(ch chan *discoverd.Event) (stream
 }
 
 var AppNamePattern = regexp.MustCompile(`^[a-z\d]+(-[a-z\d]+)*$`)
-
-func ParseBasicAuth(h http.Header) (username, password string, err error) {
-	s := strings.SplitN(h.Get("Authorization"), " ", 2)
-
-	if len(s) != 2 {
-		return "", "", errors.New("failed to parse authentication string")
-	}
-	if s[0] != "Basic" {
-		return "", "", fmt.Errorf("authorization scheme is %v, not Basic", s[0])
-	}
-
-	c, err := base64.StdEncoding.DecodeString(s[1])
-	if err != nil {
-		return "", "", errors.New("failed to parse base64 basic credentials")
-	}
-
-	s = strings.SplitN(string(c), ":", 2)
-	if len(s) != 2 {
-		return "", "", errors.New("failed to parse basic credentials")
-	}
-
-	return s[0], s[1], nil
-}
 
 func FormationTagsEqual(a, b map[string]map[string]string) bool {
 	if len(a) != len(b) {

@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/oauth2"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/pkg/azure"
 	"github.com/flynn/flynn/pkg/sshkeygen"
+	"github.com/flynn/oauth2"
+	"golang.org/x/net/context"
 )
 
 func (i *Installer) azureClient(creds *Credential) *azure.Client {
@@ -89,14 +89,6 @@ func (c *AzureCluster) SetDefaultsAndValidate() error {
 	return nil
 }
 
-func (c *AzureCluster) saveField(field string, value interface{}) error {
-	c.base.installer.dbMtx.Lock()
-	defer c.base.installer.dbMtx.Unlock()
-	return c.base.installer.txExec(fmt.Sprintf(`
-  UPDATE azure_clusters SET %s = $2 WHERE ClusterID == $1
-  `, field), c.ClusterID, value)
-}
-
 func (c *AzureCluster) Run() {
 	go func() {
 		defer c.base.handleDone()
@@ -107,13 +99,14 @@ func (c *AzureCluster) Run() {
 			c.createTemplateDeployment,
 			c.base.allocateDomain,
 			c.configureDNS,
+			c.base.uploadBackup,
 			c.installFlynn,
 			c.bootstrap,
 		}
 
 		for _, step := range steps {
 			if err := step(); err != nil {
-				if c.base.State != "deleting" {
+				if c.base.getState() != "deleting" {
 					c.base.setState("error")
 					c.base.SendError(err)
 				}
@@ -276,7 +269,7 @@ func (c *AzureCluster) wrapRequest(runRequest func() error) error {
 }
 
 func (c *AzureCluster) Delete() {
-	prevState := c.base.State
+	prevState := c.base.getState()
 	c.base.setState("deleting")
 
 	if prevState != "deleting" {

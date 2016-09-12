@@ -1,0 +1,42 @@
+[
+  { "title": "Installation", "path": "/docs/installation", "children": [
+    { "title": "Cloud", "path": "/docs/installation/cloud" },
+    { "title": "Vagrant", "path": "/docs/installation/vagrant" },
+    { "title": "Manual", "path": "/docs/installation/manual" },
+    { "title": "Releases", "path": "https://releases.flynn.io" }
+  ] },
+  { "title": "Using", "children": [
+    { "title": "Basics", "path": "/docs/basics" },
+    { "title": "Apps", "path": "/docs/apps" },
+    { "title": "Databases", "path": "/docs/databases", "children": [
+          { "title": "PostgreSQL", "path": "/docs/databases/postgres" },
+          { "title": "MySQL", "path": "/docs/databases/mysql" },
+          { "title": "MongoDB", "path": "/docs/databases/mongodb" },
+          { "title": "Redis", "path": "/docs/databases/redis" }
+    ] },
+    { "title": "Languages", "children": [
+      { "title": "Go", "path": "/docs/languages/go" },
+      { "title": "Java", "path": "/docs/languages/java" },
+      { "title": "Node.js", "path": "/docs/languages/nodejs" },
+      { "title": "PHP", "path": "/docs/languages/php" },
+      { "title": "Python", "path": "/docs/languages/python" },
+      { "title": "Ruby", "path": "/docs/languages/ruby" }
+    ] },
+    { "title": "Dashboard", "path": "/docs/dashboard" },
+    { "title": "Docker", "path": "/docs/docker" },
+    { "title": "Command Line Interface", "path": "/docs/cli" }
+  ] },
+  { "title": "Operating", "children": [
+    { "title": "Production", "path": "/docs/production" },
+    { "title": "Stability", "path": "/docs/stability" },
+    { "title": "Security", "path": "/docs/security" }
+  ] },
+  { "title": "Reference", "children": [
+    { "title": "Architecture", "path": "/docs/architecture" },
+    { "title": "Roadmap", "path": "/docs/roadmap" },
+    { "title": "Contributing", "path": "/docs/contributing" },
+    { "title": "Development", "path": "/docs/development" },
+    { "title": "Controller API", "path": "/docs/api/controller" },
+    { "title": "Trademark Guidelines", "path": "/docs/trademark-guidelines" }
+  ] }
+]

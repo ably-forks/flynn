@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/flynn/flynn/Godeps/_workspace/src/github.com/golang/glog"
 	disc "github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/flannel/backend"
 	"github.com/flynn/flynn/flannel/backend/alloc"
@@ -26,8 +25,10 @@ import (
 	"github.com/flynn/flynn/flannel/pkg/ip"
 	"github.com/flynn/flynn/flannel/pkg/task"
 	"github.com/flynn/flynn/flannel/subnet"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/status"
 	"github.com/flynn/flynn/pkg/version"
+	log "github.com/golang/glog"
 )
 
 type CmdLineOpts struct {
@@ -110,9 +111,10 @@ func notifyWebhook(sn *backend.SubnetDef) error {
 	net := sn.Net
 	net.IP += 1
 	data := struct {
+		JobID  string `json:"job_id"`
 		Subnet string `json:"subnet"`
 		MTU    int    `json:"mtu"`
-	}{net.String(), sn.MTU}
+	}{os.Getenv("FLYNN_JOB_ID"), net.String(), sn.MTU}
 	payload, _ := json.Marshal(data)
 	res, err := http.Post(opts.notifyURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -220,8 +222,8 @@ func httpServer(sn *subnet.SubnetManager, publicIP, port string) error {
 	status.AddHandler(status.SimpleHandler(func() error {
 		return pingLeases(sn.Leases())
 	}))
-	go http.Serve(overlayListener, nil)
-	go http.Serve(publicListener, nil)
+	go http.Serve(keepalive.Listener(overlayListener), nil)
+	go http.Serve(keepalive.Listener(publicListener), nil)
 	return nil
 }
 

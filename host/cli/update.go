@@ -13,15 +13,15 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/term"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
-	tuf "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/client"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/pinkerton/layer"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/exec"
 	"github.com/flynn/flynn/pkg/tufutil"
 	"github.com/flynn/flynn/pkg/version"
+	"github.com/flynn/go-docopt"
+	tuf "github.com/flynn/go-tuf/client"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 func init() {
@@ -40,6 +40,19 @@ Options:
 
 Update Flynn components`)
 }
+
+// minVersion is the minimum version that can be updated from.
+//
+// The current minimum version is v20160711.0 since versions prior to that used
+// the libvirt-lxc container runtime with an nsumount binary which no longer
+// exists.
+var minVersion = "v20160711.0"
+
+var ErrIncompatibleVersion = fmt.Errorf(`
+Versions prior to %s cannot be updated in-place to this version of Flynn.
+In order to update to this version a cluster backup/restore is required.
+Please see the updating documentation at https://flynn.io/docs/production#backup/restore.
+`[1:], minVersion)
 
 func runUpdate(args *docopt.Args) error {
 	log := log15.New()
@@ -104,6 +117,23 @@ func runUpdate(args *docopt.Args) error {
 			}
 		}
 		return
+	}
+
+	log.Info("checking host version compatibility")
+	if err := eachHost(func(host *cluster.Host, log log15.Logger) error {
+		status, err := host.GetStatus()
+		if err != nil {
+			log.Error("error getting host status", "err", err)
+			return err
+		}
+		v := version.Parse(status.Version)
+		if v.Before(version.Parse(minVersion)) && !v.Dev {
+			log.Error(ErrIncompatibleVersion.Error(), "version", status.Version)
+			return ErrIncompatibleVersion
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	var mtx sync.Mutex
@@ -177,10 +207,6 @@ func runUpdate(args *docopt.Args) error {
 	if !ok {
 		return fmt.Errorf("missing flynn-init binary")
 	}
-	flynnNSUmount, ok := binaries["flynn-nsumount"]
-	if !ok {
-		return fmt.Errorf("missing flynn-nsumount binary")
-	}
 
 	log.Info("updating flynn-host daemon on all hosts")
 	if err := eachHost(func(host *cluster.Host, log log15.Logger) error {
@@ -190,7 +216,6 @@ func runUpdate(args *docopt.Args) error {
 			"daemon",
 			"--id", host.ID(),
 			"--flynn-init", flynnInit,
-			"--nsumount", flynnNSUmount,
 		)
 		if err != nil {
 			log.Error("error updating binaries", "err", err)
@@ -216,7 +241,7 @@ func runUpdate(args *docopt.Args) error {
 
 	// use a flag to determine whether to use a TTY log formatter because actually
 	// assigning a TTY to the job causes reading images via stdin to fail.
-	cmd := exec.Command(exec.DockerImage(updaterImage), fmt.Sprintf("--tty=%t", term.IsTerminal(os.Stdout.Fd())))
+	cmd := exec.Command(exec.DockerImage(updaterImage), "/bin/updater", fmt.Sprintf("--tty=%t", term.IsTerminal(os.Stdout.Fd())))
 	cmd.Stdin = bytes.NewReader(imageJSON)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 
@@ -41,6 +42,13 @@ func (d *DiscoverdManager) Close() error {
 	d.mtx.Lock()
 	defer d.mtx.Unlock()
 	if d.hb != nil {
+		// explicitly indicate in the metadata that the host is
+		// shutting down so that the scheduler removes the host
+		// immediately (rather than treating it as unhealthy for a
+		// short time)
+		d.inst.Meta["shutdown"] = "true"
+		d.hb.SetMeta(d.inst.Meta)
+
 		err := d.hb.Close()
 		d.hb = nil
 		return err
@@ -79,6 +87,8 @@ func (d *DiscoverdManager) ConnectLocal(url string) error {
 	d.local.Store(true)
 
 	d.backend.SetDefaultEnv("DISCOVERD", url)
+	os.Setenv("DISCOVERD", url)
+	discoverd.DefaultClient = discoverd.NewClient()
 
 	go func() {
 		if err := d.mux.StreamToAggregators(discoverd.NewClientWithURL(url).Service("logaggregator")); err != nil {

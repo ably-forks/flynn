@@ -1,3 +1,4 @@
+import { extend } from 'marbles/utils';
 import State from 'marbles/state';
 import Store from '../store';
 import Config from '../config';
@@ -24,6 +25,7 @@ var AppRoutes = Store.createClass({
 
 	getInitialState: function () {
 		return {
+			fetched: false,
 			routes: []
 		};
 	},
@@ -76,7 +78,10 @@ var AppRoutes = Store.createClass({
 		return this.__getClient().getAppRoutes(this.props.appId).then(function (args) {
 			var res = args[0];
 			this.setState({
-				routes: res
+				fetched: true,
+				routes: res.filter(function (route) {
+					return route.type === 'http';
+				})
 			});
 		}.bind(this));
 	},
@@ -93,4 +98,9 @@ AppRoutes.isValidId = function (id) {
 
 AppRoutes.registerWithDispatcher(Dispatcher);
 
+var shouldHTTPS = function (route) {
+	return route.type === 'http' && !!route.certificate || !!route.domain.match(new RegExp('^[^.]+\\.'+ Config.default_route_domain.replace('.', '\\.') +'$'));
+};
+
+export { shouldHTTPS };
 export default AppRoutes;

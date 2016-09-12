@@ -24,22 +24,23 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/aws"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/s3"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/boltdb/bolt"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/tail"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/thoj/go-ircevent"
+	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/gen/s3"
+	"github.com/boltdb/bolt"
 	"github.com/flynn/flynn/pkg/attempt"
 	"github.com/flynn/flynn/pkg/iotool"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/sse"
+	"github.com/flynn/flynn/pkg/stream"
 	"github.com/flynn/flynn/pkg/tlsconfig"
 	"github.com/flynn/flynn/pkg/typeconv"
 	"github.com/flynn/flynn/test/arg"
 	"github.com/flynn/flynn/test/buildlog"
 	"github.com/flynn/flynn/test/cluster"
+	"github.com/flynn/tail"
+	"github.com/julienschmidt/httprouter"
+	"github.com/thoj/go-ircevent"
 )
 
 var logBucket = "flynn-ci-logs"
@@ -89,6 +90,19 @@ func (b *Build) Finished() bool {
 	return b.State != "pending"
 }
 
+func (b *Build) StateLabelClass() string {
+	switch b.State {
+	case "success":
+		return "label-success"
+	case "pending":
+		return "label-info"
+	case "failure":
+		return "label-danger"
+	default:
+		return ""
+	}
+}
+
 func newBuild(commit, branch, description string, merge bool) *Build {
 	now := time.Now()
 	return &Build{
@@ -114,13 +128,12 @@ type Runner struct {
 	buildCh     chan struct{}
 	clusters    map[string]*cluster.Cluster
 	authKey     string
+	runEnv      map[string]string
 	subnet      uint64
 	ircMsgs     chan string
 }
 
 var args *arg.Args
-
-const maxConcurrentBuilds = 2
 
 func init() {
 	args = arg.Parse()
@@ -133,9 +146,10 @@ func main() {
 		bc:       args.BootConfig,
 		events:   make(chan Event),
 		networks: make(map[string]struct{}),
-		buildCh:  make(chan struct{}, maxConcurrentBuilds),
+		buildCh:  make(chan struct{}, args.ConcurrentBuilds),
 		clusters: make(map[string]*cluster.Cluster),
-		ircMsgs:  make(chan string),
+		ircMsgs:  make(chan string, 100),
+		runEnv:   make(map[string]string),
 	}
 	if err := runner.start(); err != nil {
 		shutdown.Fatal(err)
@@ -146,6 +160,18 @@ func (r *Runner) start() error {
 	r.authKey = os.Getenv("AUTH_KEY")
 	if r.authKey == "" {
 		return errors.New("AUTH_KEY not set")
+	}
+	r.runEnv["TEST_RUNNER_AUTH_KEY"] = r.authKey
+
+	if c := os.Getenv("BLOBSTORE_S3_CONFIG"); c != "" {
+		r.runEnv["BLOBSTORE_S3_CONFIG"] = c
+	} else {
+		return errors.New("BLOBSTORE_S3_CONFIG not set")
+	}
+	if c := os.Getenv("BLOBSTORE_GCS_CONFIG"); c != "" {
+		r.runEnv["BLOBSTORE_GCS_CONFIG"] = c
+	} else {
+		return errors.New("BLOBSTORE_GCS_CONFIG not set")
 	}
 
 	r.githubToken = os.Getenv("GITHUB_TOKEN")
@@ -186,7 +212,7 @@ func (r *Runner) start() error {
 		return fmt.Errorf("could not create builds bucket: %s", err)
 	}
 
-	for i := 0; i < maxConcurrentBuilds; i++ {
+	for i := 0; i < args.ConcurrentBuilds; i++ {
 		r.buildCh <- struct{}{}
 	}
 
@@ -202,6 +228,7 @@ func (r *Runner) start() error {
 	router.Handler("GET", "/", http.RedirectHandler("/builds", 302))
 	router.POST("/", r.handleEvent)
 	router.GET("/builds/:build", r.getBuildLog)
+	router.GET("/builds/:build/download", r.downloadBuildLog)
 	router.POST("/builds/:build/restart", r.restartBuild)
 	router.POST("/builds/:build/explain", r.explainBuild)
 	router.GET("/builds", r.getBuilds)
@@ -257,6 +284,17 @@ func (r *Runner) connectIRC() {
 	}
 }
 
+func (r *Runner) postIRC(format string, v ...interface{}) {
+	go func() {
+		// drop the message if the buffer is full because we are
+		// reconnecting
+		select {
+		case r.ircMsgs <- fmt.Sprintf(format, v...):
+		default:
+		}
+	}()
+}
+
 func (r *Runner) watchEvents() {
 	for event := range r.events {
 		if !needsBuild(event) {
@@ -272,7 +310,7 @@ var testRunScript = template.Must(template.New("test-run").Parse(`
 #!/bin/bash
 set -e -x -o pipefail
 
-echo {{ .Cluster.RouterIP }} {{ .Cluster.ClusterDomain }} {{ .Cluster.ControllerDomain }} {{ .Cluster.GitDomain }} dashboard.{{ .Cluster.ClusterDomain }} | sudo tee -a /etc/hosts
+echo {{ .Cluster.RouterIP }} {{ .Cluster.ClusterDomain }} {{ .Cluster.ControllerDomain }} {{ .Cluster.GitDomain }} dashboard.{{ .Cluster.ClusterDomain }} docker.{{ .Cluster.ClusterDomain }} | sudo tee -a /etc/hosts
 
 # Wait for the Flynn bridge interface to show up so we can use it as the
 # nameserver to resolve discoverd domains
@@ -293,9 +331,12 @@ echo "nameserver ${ip}" | sudo tee /etc/resolv.conf
 
 cd ~/go/src/github.com/flynn/flynn
 
+script/configure-docker "{{ .Cluster.ClusterDomain }}"
+
 cli/bin/flynn cluster add \
   --tls-pin "{{ .Config.TLSPin }}" \
   --git-url "{{ .Config.GitURL }}" \
+  --docker-push-url "{{ .Config.DockerPushURL }}" \
   default \
   {{ .Config.ControllerURL }} \
   {{ .Config.Key }}
@@ -313,7 +354,7 @@ cmd="bin/flynn-test \
   --router-ip {{ .Cluster.RouterIP }} \
   --debug"
 
-timeout --signal=QUIT --kill-after=10 25m $cmd
+timeout --signal=QUIT --kill-after=10 35m $cmd
 `[1:]))
 
 func formatDuration(d time.Duration) string {
@@ -374,11 +415,11 @@ func (r *Runner) build(b *Build) (err error) {
 		if err == nil {
 			log.Printf("build %s passed!\n", b.ID)
 			r.updateStatus(b, "success")
-			r.ircMsgs <- fmt.Sprintf("PASS: %s %s", b.Description, b.URL())
+			r.postIRC("PASS: %s %s", b.Description, b.URL())
 		} else {
 			log.Printf("build %s failed: %s\n", b.ID, err)
 			r.updateStatus(b, "failure")
-			r.ircMsgs <- fmt.Sprintf("FAIL: [%d failure(s)] %s %s", len(b.Failures), b.Description, b.URL())
+			r.postIRC("FAIL: [%d failure(s)] %s %s", len(b.Failures), b.Description, b.URL())
 		}
 	}()
 
@@ -413,10 +454,7 @@ func (r *Runner) build(b *Build) (err error) {
 
 	var script bytes.Buffer
 	testRunScript.Execute(&script, map[string]interface{}{"Cluster": c, "Config": config.Clusters[0], "ListenPort": listenPort})
-	return c.RunWithEnv(script.String(), &cluster.Streams{
-		Stdout: out,
-		Stderr: out,
-	}, map[string]string{"TEST_RUNNER_AUTH_KEY": r.authKey})
+	return c.RunWithEnv(script.String(), &cluster.Streams{Stdout: out, Stderr: out}, r.runEnv)
 }
 
 var s3attempts = attempt.Strategy{
@@ -543,47 +581,87 @@ func (r *Runner) getBuilds(w http.ResponseWriter, req *http.Request, ps httprout
 	json.NewEncoder(w).Encode(builds)
 }
 
-type logLine struct {
-	Filename string `json:"filename"`
-	Text     string `json:"text"`
-}
+func getBuildLogStream(b *Build, ch chan string) (stream.Stream, error) {
+	stream := stream.New()
 
-func serveBuildLogStream(b *Build, w http.ResponseWriter) error {
+	// if the build hasn't finished, tail the log from disk
+	if !b.Finished() {
+		t, err := tail.TailFile(b.LogFile, tail.Config{Follow: true, MustExist: true})
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			defer t.Stop()
+			defer close(ch)
+			for {
+				select {
+				case line, ok := <-t.Lines:
+					if !ok {
+						stream.Error = t.Err()
+						return
+					}
+					select {
+					case ch <- line.Text:
+					case <-stream.StopCh:
+						return
+					}
+					if strings.HasPrefix(line.Text, "build finished") {
+						return
+					}
+				case <-stream.StopCh:
+					return
+				}
+			}
+		}()
+		return stream, nil
+	}
+
+	// get the multipart log from S3 and serve just the "build.log" file
 	res, err := http.Get(b.LogURL)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d getting build log", res.StatusCode)
+		res.Body.Close()
+		return nil, fmt.Errorf("unexpected status %d getting build log", res.StatusCode)
 	}
 	_, params, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil {
-		return err
+		res.Body.Close()
+		return nil, err
 	}
-	ch := make(chan *logLine)
-	stream := sse.NewStream(w, ch, nil)
-	stream.Serve()
 	go func() {
+		defer res.Body.Close()
+		defer close(ch)
+
 		mr := multipart.NewReader(res.Body, params["boundary"])
 		for {
+			select {
+			case <-stream.StopCh:
+				return
+			default:
+			}
+
 			p, err := mr.NextPart()
 			if err != nil {
-				stream.CloseWithError(err)
+				stream.Error = err
 				return
+			}
+			if p.FileName() != "build.log" {
+				continue
 			}
 			s := bufio.NewScanner(p)
 			for s.Scan() {
-				ch <- &logLine{p.FileName(), s.Text()}
+				select {
+				case ch <- s.Text():
+				case <-stream.StopCh:
+					return
+				}
 			}
-			if err := s.Err(); err != nil {
-				stream.CloseWithError(err)
-				return
-			}
+			return
 		}
 	}()
-	stream.Wait()
-	return nil
+	return stream, nil
 }
 
 func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
@@ -599,21 +677,30 @@ func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httpro
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if b.Finished() {
-		if b.Version == BuildVersion1 {
-			http.Redirect(w, req, b.LogURL, http.StatusMovedPermanently)
-			return
-		}
-		if strings.Contains(req.Header.Get("Accept"), "text/event-stream") {
-			if err := serveBuildLogStream(b, w); err != nil {
-				http.Error(w, err.Error(), 500)
-			}
-			return
-		}
-		http.ServeFile(w, req, path.Join(args.AssetsDir, "build-log.html"))
+
+	// if it's a V1 build, redirect to the log in S3
+	if b.Version == BuildVersion1 {
+		http.Redirect(w, req, b.LogURL, http.StatusMovedPermanently)
 		return
 	}
-	t, err := tail.TailFile(b.LogFile, tail.Config{Follow: true, MustExist: true})
+
+	// if it's a browser, serve the build-log.html template
+	if strings.Contains(req.Header.Get("Accept"), "text/html") {
+		tpl, err := template.ParseFiles(path.Join(args.AssetsDir, "build-log.html"))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := tpl.Execute(w, b); err != nil {
+			log.Printf("error executing build-log template: %s", err)
+		}
+		return
+	}
+
+	// serve the build log as either an SSE or plain text stream
+	ch := make(chan string)
+	stream, err := getBuildLogStream(b, ch)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -621,11 +708,24 @@ func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httpro
 	if cn, ok := w.(http.CloseNotifier); ok {
 		go func() {
 			<-cn.CloseNotify()
-			t.Stop()
+			stream.Close()
 		}()
 	} else {
-		defer t.Stop()
+		defer stream.Close()
 	}
+
+	if strings.Contains(req.Header.Get("Accept"), "text/event-stream") {
+		sse.ServeStream(w, ch, nil)
+	} else {
+		servePlainStream(w, ch)
+	}
+
+	if err := stream.Err(); err != nil {
+		log.Println("error serving build log stream:", err)
+	}
+}
+
+func servePlainStream(w http.ResponseWriter, ch chan string) {
 	flush := func() {
 		if fw, ok := w.(http.Flusher); ok {
 			fw.Flush()
@@ -634,16 +734,56 @@ func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httpro
 	w.Header().Set("Content-Type", textPlain)
 	w.WriteHeader(http.StatusOK)
 	flush()
-	for line := range t.Lines {
-		if _, err := io.WriteString(w, line.Text+"\n"); err != nil {
-			log.Printf("serveBuildLog write error: %s\n", err)
+	for line := range ch {
+		if _, err := io.WriteString(w, line+"\n"); err != nil {
+			log.Println("servePlainStream write error:", err)
 			return
 		}
 		flush()
-		if strings.HasPrefix(line.Text, "build finished") {
-			return
-		}
 	}
+}
+
+func (r *Runner) downloadBuildLog(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
+	id := ps.ByName("build")
+	b := &Build{}
+	if err := r.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(dbBucket).Get([]byte(id))
+		if err := json.Unmarshal(v, b); err != nil {
+			return fmt.Errorf("could not decode build %s: %s", v, err)
+		}
+		return nil
+	}); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	res, err := http.Get(b.LogURL)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		http.Error(w, fmt.Sprintf("unexpected status %d getting build log", res.StatusCode), 500)
+		return
+	}
+
+	_, params, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// although the log is multipart, serve it as a single plain text file
+	// to avoid browsers potentially prompting to download each individual
+	// part, but construct valid multipart content, headers included, so
+	// the file can be parsed with tools such as munpack(1).
+	w.Header().Set("Content-Type", textPlain)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"flynn-ci-build-%s\"", path.Base(b.LogURL)))
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=%q\r\n\r\n", params["boundary"])
+	io.Copy(w, res.Body)
 }
 
 func (r *Runner) restartBuild(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {

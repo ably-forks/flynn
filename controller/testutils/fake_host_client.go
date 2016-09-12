@@ -14,8 +14,8 @@ import (
 	"github.com/flynn/flynn/pkg/stream"
 )
 
-func NewFakeHostClient(hostID string) *FakeHostClient {
-	return &FakeHostClient{
+func NewFakeHostClient(hostID string, sync bool) *FakeHostClient {
+	h := &FakeHostClient{
 		hostID:        hostID,
 		stopped:       make(map[string]bool),
 		attach:        make(map[string]attachFunc),
@@ -24,18 +24,24 @@ func NewFakeHostClient(hostID string) *FakeHostClient {
 		eventChannels: make(map[chan<- *host.Event]struct{}),
 		Healthy:       true,
 	}
+	if sync {
+		h.TestEventHook = make(chan struct{})
+	}
+	return h
 }
 
 type FakeHostClient struct {
-	hostID        string
-	stopped       map[string]bool
-	attach        map[string]attachFunc
-	Jobs          map[string]host.ActiveJob
-	cluster       *FakeCluster
-	volumes       map[string]*volume.Info
-	eventChannels map[chan<- *host.Event]struct{}
-	jobsMtx       sync.RWMutex
-	Healthy       bool
+	hostID           string
+	stopped          map[string]bool
+	attach           map[string]attachFunc
+	Jobs             map[string]host.ActiveJob
+	cluster          *FakeCluster
+	volumes          map[string]*volume.Info
+	eventChannelsMtx sync.Mutex
+	eventChannels    map[chan<- *host.Event]struct{}
+	jobsMtx          sync.RWMutex
+	Healthy          bool
+	TestEventHook    chan struct{}
 }
 
 func (c *FakeHostClient) ID() string { return c.hostID }
@@ -63,14 +69,24 @@ func (c *FakeHostClient) ListJobs() (map[string]host.ActiveJob, error) {
 func (c *FakeHostClient) AddJob(job *host.Job) error {
 	c.jobsMtx.Lock()
 	defer c.jobsMtx.Unlock()
-	j := host.ActiveJob{Job: job, HostID: c.hostID, StartedAt: time.Now()}
+	j := host.ActiveJob{
+		Job:       job,
+		HostID:    c.hostID,
+		Status:    host.StatusStarting,
+		StartedAt: time.Now(),
+	}
 	c.Jobs[job.ID] = j
 
+	c.eventChannelsMtx.Lock()
+	defer c.eventChannelsMtx.Unlock()
 	for ch := range c.eventChannels {
 		ch <- &host.Event{
 			Event: host.JobEventStart,
 			JobID: job.ID,
 			Job:   &j,
+		}
+		if c.TestEventHook != nil {
+			<-c.TestEventHook
 		}
 	}
 	return nil
@@ -110,11 +126,16 @@ func (c *FakeHostClient) StopJob(id string) error {
 func (c *FakeHostClient) stop(id string) error {
 	job := c.Jobs[id]
 	delete(c.Jobs, id)
+	c.eventChannelsMtx.Lock()
+	defer c.eventChannelsMtx.Unlock()
 	for ch := range c.eventChannels {
 		ch <- &host.Event{
 			Event: host.JobEventStop,
 			JobID: id,
 			Job:   &job,
+		}
+		if c.TestEventHook != nil {
+			<-c.TestEventHook
 		}
 	}
 	return nil
@@ -159,10 +180,13 @@ func (c *FakeHostClient) CreateVolume(providerID string) (*volume.Info, error) {
 }
 
 func (c *FakeHostClient) StreamEvents(id string, ch chan *host.Event) (stream.Stream, error) {
+	c.eventChannelsMtx.Lock()
 	if _, ok := c.eventChannels[ch]; ok {
+		c.eventChannelsMtx.Unlock()
 		return nil, errors.New("Already streaming that channel")
 	}
 	c.eventChannels[ch] = struct{}{}
+	c.eventChannelsMtx.Unlock()
 
 	for _, j := range c.Jobs {
 		ch <- &host.Event{
@@ -186,11 +210,17 @@ type attachFunc func(req *host.AttachReq, wait bool) (cluster.AttachClient, erro
 
 type HostStream struct {
 	host *FakeHostClient
-	ch   chan<- *host.Event
+	ch   chan *host.Event
 }
 
 func (h *HostStream) Close() error {
+	go func() {
+		for range h.ch {
+		}
+	}()
+	h.host.eventChannelsMtx.Lock()
 	delete(h.host.eventChannels, h.ch)
+	h.host.eventChannelsMtx.Unlock()
 	close(h.ch)
 	return nil
 }

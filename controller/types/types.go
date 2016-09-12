@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/flynn/flynn/host/resource"
@@ -15,12 +16,13 @@ import (
 const RouteParentRefPrefix = "controller/apps/"
 
 type ExpandedFormation struct {
-	App       *App                         `json:"app,omitempty"`
-	Release   *Release                     `json:"release,omitempty"`
-	Artifact  *Artifact                    `json:"artifact,omitempty"`
-	Processes map[string]int               `json:"processes,omitempty"`
-	Tags      map[string]map[string]string `json:"tags,omitempty"`
-	UpdatedAt time.Time                    `json:"updated_at,omitempty"`
+	App           *App                         `json:"app,omitempty"`
+	Release       *Release                     `json:"release,omitempty"`
+	ImageArtifact *Artifact                    `json:"artifact,omitempty"`
+	FileArtifacts []*Artifact                  `json:"file_artifacts,omitempty"`
+	Processes     map[string]int               `json:"processes,omitempty"`
+	Tags          map[string]map[string]string `json:"tags,omitempty"`
+	UpdatedAt     time.Time                    `json:"updated_at,omitempty"`
 }
 
 type App struct {
@@ -39,18 +41,60 @@ func (a *App) System() bool {
 	return ok && v == "true"
 }
 
+func (a *App) RedisAppliance() bool {
+	return a.System() && strings.HasPrefix(a.Name, "redis-")
+}
+
+// Critical apps cannot be completely scaled down by the scheduler
+func (a *App) Critical() bool {
+	v, ok := a.Meta["flynn-system-critical"]
+	return ok && v == "true"
+}
+
 type Release struct {
-	ID         string                 `json:"id,omitempty"`
-	ArtifactID string                 `json:"artifact,omitempty"`
-	Env        map[string]string      `json:"env,omitempty"`
-	Meta       map[string]string      `json:"meta,omitempty"`
-	Processes  map[string]ProcessType `json:"processes,omitempty"`
-	CreatedAt  *time.Time             `json:"created_at,omitempty"`
+	ID          string                 `json:"id,omitempty"`
+	ArtifactIDs []string               `json:"artifacts,omitempty"`
+	Env         map[string]string      `json:"env,omitempty"`
+	Meta        map[string]string      `json:"meta,omitempty"`
+	Processes   map[string]ProcessType `json:"processes,omitempty"`
+	CreatedAt   *time.Time             `json:"created_at,omitempty"`
+
+	// LegacyArtifactID is to support old clients which expect releases
+	// to have a single ArtifactID
+	LegacyArtifactID string `json:"artifact,omitempty"`
+}
+
+func (r *Release) ImageArtifactID() string {
+	if len(r.ArtifactIDs) > 0 {
+		return r.ArtifactIDs[0]
+	}
+	return r.LegacyArtifactID
+}
+
+func (r *Release) SetImageArtifactID(id string) {
+	if len(r.ArtifactIDs) == 0 {
+		r.ArtifactIDs = []string{id}
+	}
+	r.ArtifactIDs[0] = id
+}
+
+func (r *Release) FileArtifactIDs() []string {
+	if len(r.ArtifactIDs) < 1 {
+		return nil
+	}
+	return r.ArtifactIDs[1:len(r.ArtifactIDs)]
+}
+
+func (r *Release) IsGitDeploy() bool {
+	return r.Meta["git"] == "true"
+}
+
+func (r *Release) IsDockerReceiveDeploy() bool {
+	return r.Meta["docker-receive"] == "true"
 }
 
 type ProcessType struct {
-	Cmd         []string           `json:"cmd,omitempty"`
-	Entrypoint  []string           `json:"entrypoint,omitempty"`
+	Args        []string           `json:"args,omitempty"`
 	Env         map[string]string  `json:"env,omitempty"`
 	Ports       []Port             `json:"ports,omitempty"`
 	Data        bool               `json:"data,omitempty"`
@@ -59,6 +103,10 @@ type ProcessType struct {
 	Service     string             `json:"service,omitempty"`
 	Resurrect   bool               `json:"resurrect,omitempty"`
 	Resources   resource.Resources `json:"resources,omitempty"`
+
+	// Entrypoint and Cmd are DEPRECATED: use Args instead
+	DeprecatedCmd        []string `json:"cmd,omitempty"`
+	DeprecatedEntrypoint []string `json:"entrypoint,omitempty"`
 }
 
 type Port struct {
@@ -68,10 +116,22 @@ type Port struct {
 }
 
 type Artifact struct {
-	ID        string     `json:"id,omitempty"`
-	Type      string     `json:"type,omitempty"`
-	URI       string     `json:"uri,omitempty"`
-	CreatedAt *time.Time `json:"created_at,omitempty"`
+	ID        string            `json:"id,omitempty"`
+	Type      host.ArtifactType `json:"type,omitempty"`
+	URI       string            `json:"uri,omitempty"`
+	Meta      map[string]string `json:"meta,omitempty"`
+	CreatedAt *time.Time        `json:"created_at,omitempty"`
+}
+
+func (a *Artifact) HostArtifact() *host.Artifact {
+	return &host.Artifact{
+		URI:  a.URI,
+		Type: a.Type,
+	}
+}
+
+func (a *Artifact) Blobstore() bool {
+	return a.Meta["blobstore"] == "true"
 }
 
 type Formation struct {
@@ -107,7 +167,7 @@ type Job struct {
 	ReleaseID  string            `json:"release,omitempty"`
 	Type       string            `json:"type,omitempty"`
 	State      JobState          `json:"state,omitempty"`
-	Cmd        []string          `json:"cmd,omitempty"`
+	Args       []string          `json:"args,omitempty"`
 	Meta       map[string]string `json:"meta,omitempty"`
 	ExitStatus *int32            `json:"exit_status,omitempty"`
 	HostError  *string           `json:"host_error,omitempty"`
@@ -185,8 +245,7 @@ func JobDownEvents(count int) map[JobState]int {
 type NewJob struct {
 	ReleaseID  string             `json:"release,omitempty"`
 	ReleaseEnv bool               `json:"release_env,omitempty"`
-	Cmd        []string           `json:"cmd,omitempty"`
-	Entrypoint []string           `json:"entrypoint,omitempty"`
+	Args       []string           `json:"args,omitempty"`
 	Env        map[string]string  `json:"env,omitempty"`
 	Meta       map[string]string  `json:"meta,omitempty"`
 	TTY        bool               `json:"tty,omitempty"`
@@ -194,9 +253,13 @@ type NewJob struct {
 	Lines      int                `json:"tty_lines,omitempty"`
 	DisableLog bool               `json:"disable_log,omitempty"`
 	Resources  resource.Resources `json:"resources,omitempty"`
+
+	// Entrypoint and Cmd are DEPRECATED: use Args instead
+	DeprecatedCmd        []string `json:"cmd,omitempty"`
+	DeprecatedEntrypoint []string `json:"entrypoint,omitempty"`
 }
 
-const DefaultDeployTimeout = 30 // seconds
+const DefaultDeployTimeout = 120 // seconds
 
 type Deployment struct {
 	ID            string         `json:"id,omitempty"`
@@ -288,22 +351,26 @@ type LogOpts struct {
 type EventType string
 
 const (
-	EventTypeApp              EventType = "app"
-	EventTypeAppDeletion      EventType = "app_deletion"
-	EventTypeAppRelease       EventType = "app_release"
-	EventTypeDeployment       EventType = "deployment"
-	EventTypeJob              EventType = "job"
-	EventTypeScale            EventType = "scale"
-	EventTypeRelease          EventType = "release"
-	EventTypeArtifact         EventType = "artifact"
-	EventTypeProvider         EventType = "provider"
-	EventTypeResource         EventType = "resource"
-	EventTypeResourceDeletion EventType = "resource_deletion"
-	EventTypeKey              EventType = "key"
-	EventTypeKeyDeletion      EventType = "key_deletion"
-	EventTypeRoute            EventType = "route"
-	EventTypeRouteDeletion    EventType = "route_deletion"
-	EventTypeDomainMigration  EventType = "domain_migration"
+	EventTypeApp                  EventType = "app"
+	EventTypeAppDeletion          EventType = "app_deletion"
+	EventTypeAppRelease           EventType = "app_release"
+	EventTypeDeployment           EventType = "deployment"
+	EventTypeJob                  EventType = "job"
+	EventTypeScale                EventType = "scale"
+	EventTypeRelease              EventType = "release"
+	EventTypeReleaseDeletion      EventType = "release_deletion"
+	EventTypeArtifact             EventType = "artifact"
+	EventTypeProvider             EventType = "provider"
+	EventTypeResource             EventType = "resource"
+	EventTypeResourceDeletion     EventType = "resource_deletion"
+	EventTypeResourceAppDeletion  EventType = "resource_app_deletion"
+	EventTypeKey                  EventType = "key"
+	EventTypeKeyDeletion          EventType = "key_deletion"
+	EventTypeRoute                EventType = "route"
+	EventTypeRouteDeletion        EventType = "route_deletion"
+	EventTypeDomainMigration      EventType = "domain_migration"
+	EventTypeClusterBackup        EventType = "cluster_backup"
+	EventTypeAppGarbageCollection EventType = "app_garbage_collection"
 )
 
 type Event struct {
@@ -331,6 +398,7 @@ type AppDeletion struct {
 	AppID            string          `json:"app"`
 	DeletedRoutes    []*router.Route `json:"deleted_routes"`
 	DeletedResources []*Resource     `json:"deleted_resources"`
+	DeletedReleases  []*Release      `json:"deleted_releases"`
 }
 
 type AppDeletionEvent struct {
@@ -341,4 +409,65 @@ type AppDeletionEvent struct {
 type DomainMigrationEvent struct {
 	DomainMigration *DomainMigration `json:"domain_migration"`
 	Error           string           `json:"error,omitempty"`
+}
+
+const (
+	ClusterBackupStatusRunning  string = "running"
+	ClusterBackupStatusComplete string = "complete"
+	ClusterBackupStatusError    string = "error"
+)
+
+type ClusterBackup struct {
+	ID          string     `json:"id,omitempty"`
+	Status      string     `json:"status"`
+	SHA512      string     `json:"sha512,omitempty"`
+	Size        int64      `json:"size,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	CreatedAt   *time.Time `json:"created_at,omitempty"`
+	UpdatedAt   *time.Time `json:"updated_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+}
+
+type ReleaseDeletion struct {
+	AppID         string   `json:"app"`
+	ReleaseID     string   `json:"release"`
+	RemainingApps []string `json:"remaining_apps"`
+	DeletedFiles  []string `json:"deleted_files"`
+}
+
+type ReleaseDeletionEvent struct {
+	ReleaseDeletion *ReleaseDeletion `json:"release_deletion"`
+	Error           string           `json:"error"`
+}
+
+type JobWatcher interface {
+	WaitFor(expected JobEvents, timeout time.Duration, callback func(*Job) error) error
+	Close() error
+}
+
+type ListEventsOptions struct {
+	AppID       string
+	ObjectTypes []EventType
+	ObjectID    string
+	BeforeID    *int64
+	SinceID     *int64
+	Count       int
+}
+
+type StreamEventsOptions struct {
+	AppID       string
+	ObjectTypes []EventType
+	ObjectID    string
+	Past        bool
+	Count       int
+}
+
+type AppGarbageCollection struct {
+	AppID           string   `json:"app_id"`
+	DeletedReleases []string `json:"deleted_releases"`
+}
+
+type AppGarbageCollectionEvent struct {
+	AppGarbageCollection *AppGarbageCollection `json:"app_garbage_collection"`
+	Error                string                `json:"error"`
 }

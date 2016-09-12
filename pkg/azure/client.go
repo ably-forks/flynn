@@ -10,13 +10,12 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/oauth2"
 	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/oauth2"
 )
 
 const (
 	jsonAPIVersion  = "2015-01-01"
-	xmlAPIVersion   = "2014-10-01"
 	JSONAPIResource = "https://management.azure.com/"
 	XMLAPIResource  = "https://management.core.windows.net/"
 )

@@ -3,10 +3,10 @@ package main
 import (
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/types"
+	c "github.com/flynn/go-check"
 )
 
 type DeployerSuite struct {
@@ -97,7 +97,7 @@ loop:
 				break loop
 			}
 			debugf(t, "got deployment event: %s %s", e.JobType, e.JobState)
-		case <-time.After(15 * time.Second):
+		case <-time.After(60 * time.Second):
 			t.Fatal("timed out waiting for deployment event")
 		}
 	}
@@ -210,7 +210,7 @@ func (s *DeployerSuite) TestRollbackFailedJob(t *c.C) {
 	client := s.controllerClient(t)
 	release.ID = ""
 	printer := release.Processes["printer"]
-	printer.Cmd = []string{"this-is-gonna-fail"}
+	printer.Args = []string{"this-is-gonna-fail"}
 	release.Processes["printer"] = printer
 	t.Assert(client.CreateRelease(release), c.IsNil)
 	deployment, err := client.CreateDeployment(app.ID, release.ID)

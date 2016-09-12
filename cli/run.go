@@ -11,12 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/term"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -28,7 +28,7 @@ Run a job.
 Options:
 	-d, --detached    run job without connecting io streams (implies --enable-log)
 	-r <release>      id of release to run (defaults to current app release)
-	-e <entrypoint>   overwrite the default entrypoint of the release's image
+	-e <entrypoint>   [DEPRECATED] overwrite the default entrypoint of the release's image
 	-l, --enable-log  send output to log streams
 `)
 	cmd.optsFirst = true
@@ -37,7 +37,7 @@ Options:
 // Declared here for Windows portability
 const SIGWINCH syscall.Signal = 28
 
-func runRun(args *docopt.Args, client *controller.Client) error {
+func runRun(args *docopt.Args, client controller.Client) error {
 	config := runConfig{
 		App:        mustApp(),
 		Detached:   args.Bool["--detached"],
@@ -55,10 +55,14 @@ func runRun(args *docopt.Args, client *controller.Client) error {
 		if err != nil {
 			return err
 		}
+		if release.ImageArtifactID() == "" {
+			return errors.New("App release has no image, push a release first")
+		}
 		config.Release = release.ID
 	}
 	if e := args.String["-e"]; e != "" {
-		config.Entrypoint = []string{e}
+		fmt.Fprintln(os.Stderr, "WARN: The -e flag is deprecated and will be removed in future versions, use <command> as the entrypoint")
+		config.Args = append([]string{e}, config.Args...)
 	}
 	return runJob(client, config)
 }
@@ -68,7 +72,6 @@ type runConfig struct {
 	Detached   bool
 	Release    string
 	ReleaseEnv bool
-	Entrypoint []string
 	Args       []string
 	Env        map[string]string
 	Stdin      io.Reader
@@ -78,16 +81,33 @@ type runConfig struct {
 	Exit       bool
 }
 
-func runJob(client *controller.Client, config runConfig) error {
+func runJob(client controller.Client, config runConfig) error {
 	req := &ct.NewJob{
-		Cmd:        config.Args,
+		Args:       config.Args,
 		TTY:        config.Stdin == nil && config.Stdout == nil && term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()) && !config.Detached,
 		ReleaseID:  config.Release,
-		Entrypoint: config.Entrypoint,
 		Env:        config.Env,
 		ReleaseEnv: config.ReleaseEnv,
 		DisableLog: config.DisableLog,
 	}
+
+	// ensure slug apps from old clusters use /runner/init
+	release, err := client.GetRelease(req.ReleaseID)
+	if err != nil {
+		return err
+	}
+	if release.IsGitDeploy() && (len(req.Args) == 0 || req.Args[0] != "/runner/init") {
+		req.Args = append([]string{"/runner/init"}, req.Args...)
+	}
+
+	// set deprecated Entrypoint and Cmd for old clusters
+	if len(req.Args) > 0 {
+		req.DeprecatedEntrypoint = []string{req.Args[0]}
+	}
+	if len(req.Args) > 1 {
+		req.DeprecatedCmd = req.Args[1:]
+	}
+
 	if config.Stdin == nil {
 		config.Stdin = os.Stdin
 	}

@@ -7,11 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/controller/schema"
 	ct "github.com/flynn/flynn/controller/types"
-	"github.com/flynn/flynn/controller/utils"
 	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
@@ -19,6 +16,8 @@ import (
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/jackc/pgx"
+	"golang.org/x/net/context"
 )
 
 /* Job Stuff */
@@ -59,21 +58,8 @@ func (r *JobRepo) Add(job *ct.Job) error {
 		job.RunAt,
 		job.Restarts,
 	).Scan(&job.CreatedAt, &job.UpdatedAt)
-	if postgres.IsUniquenessError(err, "") {
-		err = r.db.QueryRow(
-			"job_update",
-			job.UUID,
-			job.ID,
-			job.HostID,
-			string(job.State),
-			job.ExitStatus,
-			job.HostError,
-			job.RunAt,
-			job.Restarts,
-		).Scan(&job.CreatedAt, &job.UpdatedAt)
-		if postgres.IsPostgresCode(err, postgres.CheckViolation) {
-			return ct.ValidationError{Field: "state", Message: err.Error()}
-		}
+	if postgres.IsPostgresCode(err, postgres.CheckViolation) {
+		return ct.ValidationError{Field: "state", Message: err.Error()}
 	}
 	if err != nil {
 		return err
@@ -82,9 +68,6 @@ func (r *JobRepo) Add(job *ct.Job) error {
 	// create a job event, ignoring possible duplications
 	uniqueID := strings.Join([]string{job.UUID, string(job.State)}, "|")
 	err = r.db.Exec("event_insert_unique", job.AppID, job.UUID, uniqueID, string(ct.EventTypeJob), job)
-	if postgres.IsUniquenessError(err, "") {
-		return nil
-	}
 	return err
 }
 
@@ -151,18 +134,6 @@ func (r *JobRepo) ListActive() ([]*ct.Job, error) {
 	return jobs, nil
 }
 
-func (c *controllerAPI) connectHost(ctx context.Context) (utils.HostClient, *ct.Job, error) {
-	params, _ := ctxhelper.ParamsFromContext(ctx)
-	job, err := c.jobRepo.Get(params.ByName("jobs_id"))
-	if err != nil {
-		return nil, nil, err
-	} else if job.HostID == "" {
-		return nil, nil, errors.New("controller: cannot connect host, job has not been placed in the cluster")
-	}
-	host, err := c.clusterClient.Host(job.HostID)
-	return host, job, err
-}
-
 func (c *controllerAPI) ListJobs(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	app := c.getApp(ctx)
 	list, err := c.jobRepo.List(app.ID)
@@ -216,7 +187,17 @@ func (c *controllerAPI) PutJob(ctx context.Context, w http.ResponseWriter, req *
 }
 
 func (c *controllerAPI) KillJob(ctx context.Context, w http.ResponseWriter, req *http.Request) {
-	client, job, err := c.connectHost(ctx)
+	params, _ := ctxhelper.ParamsFromContext(ctx)
+	job, err := c.jobRepo.Get(params.ByName("jobs_id"))
+	if err != nil {
+		respondWithError(w, err)
+		return
+	} else if job.HostID == "" {
+		httphelper.ValidationError(w, "", "cannot kill a job which has not been placed on a host")
+		return
+	}
+
+	client, err := c.clusterClient.Host(job.HostID)
 	if err != nil {
 		respondWithError(w, err)
 		return
@@ -249,12 +230,10 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 		return
 	}
 	release := data.(*ct.Release)
-	data, err = c.artifactRepo.Get(release.ArtifactID)
-	if err != nil {
-		respondWithError(w, err)
+	if release.ImageArtifactID() == "" {
+		httphelper.ValidationError(w, "release.ImageArtifact", "must be set")
 		return
 	}
-	artifact := data.(*ct.Artifact)
 	attach := strings.Contains(req.Header.Get("Upgrade"), "flynn-attach/0")
 
 	hosts, err := c.clusterClient.Hosts()
@@ -295,12 +274,7 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 	job := &host.Job{
 		ID:       id,
 		Metadata: metadata,
-		Artifact: host.Artifact{
-			Type: artifact.Type,
-			URI:  artifact.URI,
-		},
 		Config: host.ContainerConfig{
-			Cmd:        newJob.Cmd,
 			Env:        env,
 			TTY:        newJob.TTY,
 			Stdin:      attach,
@@ -309,8 +283,25 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 		Resources: newJob.Resources,
 	}
 	resource.SetDefaults(&job.Resources)
-	if len(newJob.Entrypoint) > 0 {
-		job.Config.Entrypoint = newJob.Entrypoint
+	if len(newJob.Args) > 0 {
+		job.Config.Args = newJob.Args
+	}
+	if len(release.ArtifactIDs) > 0 {
+		artifacts, err := c.artifactRepo.ListIDs(release.ArtifactIDs...)
+		if err != nil {
+			respondWithError(w, err)
+			return
+		}
+		job.ImageArtifact = artifacts[release.ImageArtifactID()].HostArtifact()
+		job.FileArtifacts = make([]*host.Artifact, len(release.FileArtifactIDs()))
+		for i, id := range release.FileArtifactIDs() {
+			job.FileArtifacts[i] = artifacts[id].HostArtifact()
+		}
+	}
+
+	// ensure slug apps use /runner/init
+	if release.IsGitDeploy() && (len(job.Config.Args) == 0 || job.Config.Args[0] != "/runner/init") {
+		job.Config.Args = append([]string{"/runner/init"}, job.Config.Args...)
 	}
 
 	var attachClient cluster.AttachClient
@@ -335,6 +326,9 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 	}
 
 	if attach {
+		// TODO(titanous): This Wait could block indefinitely if something goes
+		// wrong, a context should be threaded in that cancels if the client
+		// goes away.
 		if err := attachClient.Wait(); err != nil {
 			respondWithError(w, fmt.Errorf("attach wait failed: %s", err.Error()))
 			return
@@ -355,7 +349,10 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 		}
 		go cp(conn, attachClient.Conn())
 		go cp(attachClient.Conn(), conn)
-		<-done
+
+		// Wait for one of the connections to be closed or interrupted. EOF is
+		// framed inside the attach protocol, so a read/write error indicates
+		// that we're done and should clean up.
 		<-done
 
 		return
@@ -365,7 +362,7 @@ func (c *controllerAPI) RunJob(ctx context.Context, w http.ResponseWriter, req *
 			UUID:      uuid,
 			HostID:    hostID,
 			ReleaseID: newJob.ReleaseID,
-			Cmd:       newJob.Cmd,
+			Args:      newJob.Args,
 		})
 	}
 }

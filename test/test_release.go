@@ -11,10 +11,12 @@ import (
 	"strings"
 	"text/template"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/controller/client"
+	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/host/types"
 	tc "github.com/flynn/flynn/test/cluster"
 	"github.com/flynn/flynn/updater/types"
+	c "github.com/flynn/go-check"
 )
 
 type ReleaseSuite struct {
@@ -50,7 +52,7 @@ src="${GOPATH}/src/github.com/flynn/flynn"
   pushd "${src}" >/dev/null
   sed "s/{{TUF-ROOT-KEYS}}/$(tuf --dir test/release root-keys)/g" host/cli/root_keys.go.tmpl > host/cli/root_keys.go
   vpkg="github.com/flynn/flynn/pkg/version"
-  go build -o host/bin/flynn-host -ldflags="-X ${vpkg}.commit notdev -X ${vpkg}.branch dev -X ${vpkg}.tag v20150131.0-test -X ${vpkg}.dirty false" ./host
+  go build -o host/bin/flynn-host -ldflags="-X ${vpkg}.commit notdev -X ${vpkg}.branch dev -X ${vpkg}.tag v20160711.0-test -X ${vpkg}.dirty false" ./host
   gzip -9 --keep --force host/bin/flynn-host
   sed "s/{{FLYNN-HOST-CHECKSUM}}/$(sha512sum host/bin/flynn-host.gz | cut -d " " -f 1)/g" script/install-flynn.tmpl > script/install-flynn
 
@@ -63,22 +65,22 @@ src="${GOPATH}/src/github.com/flynn/flynn"
   util/release/flynn-release manifest util/release/version_template.json > version.json
   popd >/dev/null
 
-  "${src}/script/export-components" "${src}/test/release"
-  "${src}/script/release-channel" --tuf-dir "${src}/test/release" --no-sync "stable" "v20150131.0-test"
+  "${src}/script/export-components" --no-compress "${src}/test/release"
+  "${src}/script/release-channel" --tuf-dir "${src}/test/release" --no-sync --no-changelog "stable" "v20160711.0-test"
 
   dir=$(mktemp --directory)
   ln -s "${src}/test/release/repository" "${dir}/tuf"
   ln -s "${src}/script/install-flynn" "${dir}/install-flynn"
 
-  # start a blobstore to serve the exported components
+  # create a slug for testing slug based app updates
+  tar c -C "${src}/test/apps/http" . | docker run -i -a stdin -a stdout -a stderr flynn/slugbuilder - > "${dir}/slug.tgz"
+
+  # start a file server to serve the exported components
   sudo start-stop-daemon \
     --start \
     --background \
-    --exec "${src}/blobstore/bin/flynn-blobstore" \
-    -- \
-    -d=false \
-    -s="${dir}" \
-    -p=8080
+    --chdir "${dir}" \
+    --exec "${src}/test/bin/flynn-test-file-server"
 ) >&2
 
 cat "${src}/version.json"
@@ -139,7 +141,7 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 	// check the flynn-host version is correct
 	var hostVersion bytes.Buffer
 	t.Assert(installHost.Run("flynn-host version", &tc.Streams{Stdout: &hostVersion}), c.IsNil)
-	t.Assert(strings.TrimSpace(hostVersion.String()), c.Equals, "v20150131.0-test")
+	t.Assert(strings.TrimSpace(hostVersion.String()), c.Equals, "v20160711.0-test")
 
 	// check rebuilt images were downloaded
 	for name, id := range versions {
@@ -149,10 +151,54 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 		}
 	}
 
-	// installing on an instance with Flynn running should not fail
+	// installing on an instance with Flynn running should fail
 	script.Reset()
 	installScript.Execute(&script, blobstore)
-	t.Assert(buildHost.Run("sudo bash -ex", &tc.Streams{Stdin: &script, Stdout: logWriter, Stderr: logWriter}), c.IsNil)
+	installOutput.Reset()
+	err := buildHost.Run("sudo bash -ex", &tc.Streams{Stdin: &script, Stdout: out, Stderr: out})
+	if err == nil || !strings.Contains(installOutput.String(), "ERROR: Flynn is already installed.") {
+		t.Fatal("expected Flynn install to fail but it didn't")
+	}
+
+	// create a controller client for the release cluster
+	pin, err := base64.StdEncoding.DecodeString(releaseCluster.ControllerPin)
+	t.Assert(err, c.IsNil)
+	client, err := controller.NewClientWithConfig(
+		"https://"+buildHost.IP,
+		releaseCluster.ControllerKey,
+		controller.Config{Pin: pin, Domain: releaseCluster.ControllerDomain},
+	)
+	t.Assert(err, c.IsNil)
+
+	// deploy a slug based app + Redis resource
+	slugApp := &ct.App{}
+	t.Assert(client.CreateApp(slugApp), c.IsNil)
+	gitreceive, err := client.GetAppRelease("gitreceive")
+	t.Assert(err, c.IsNil)
+	imageArtifact, err := client.GetArtifact(gitreceive.Env["SLUGRUNNER_IMAGE_ID"])
+	t.Assert(err, c.IsNil)
+	slugArtifact := &ct.Artifact{Type: host.ArtifactTypeFile, URI: fmt.Sprintf("http://%s:8080/slug.tgz", buildHost.IP)}
+	t.Assert(client.CreateArtifact(slugArtifact), c.IsNil)
+	resource, err := client.ProvisionResource(&ct.ResourceReq{ProviderID: "redis", Apps: []string{slugApp.ID}})
+	t.Assert(err, c.IsNil)
+	release := &ct.Release{
+		ArtifactIDs: []string{imageArtifact.ID, slugArtifact.ID},
+		Processes:   map[string]ct.ProcessType{"web": {Args: []string{"/runner/init", "bin/http"}}},
+		Meta:        map[string]string{"git": "true"},
+		Env:         resource.Env,
+	}
+	t.Assert(client.CreateRelease(release), c.IsNil)
+	t.Assert(client.SetAppRelease(slugApp.ID, release.ID), c.IsNil)
+	watcher, err := client.WatchJobEvents(slugApp.ID, release.ID)
+	t.Assert(err, c.IsNil)
+	defer watcher.Close()
+	t.Assert(client.PutFormation(&ct.Formation{
+		AppID:     slugApp.ID,
+		ReleaseID: release.ID,
+		Processes: map[string]int{"web": 1},
+	}), c.IsNil)
+	err = watcher.WaitFor(ct.JobEvents{"web": {ct.JobStateUp: 1}}, scaleTimeout, nil)
+	t.Assert(err, c.IsNil)
 
 	// run a cluster update from the blobstore
 	updateHost := releaseCluster.Instances[1]
@@ -172,15 +218,11 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 		}
 	}
 
-	// create a controller client for the new cluster
-	pin, err := base64.StdEncoding.DecodeString(releaseCluster.ControllerPin)
-	t.Assert(err, c.IsNil)
-	client, err := controller.NewClientWithConfig(
-		"https://"+buildHost.IP,
-		releaseCluster.ControllerKey,
-		controller.Config{Pin: pin, Domain: releaseCluster.ControllerDomain},
-	)
-	t.Assert(err, c.IsNil)
+	assertImage := func(uri, image string) {
+		u, err := url.Parse(uri)
+		t.Assert(err, c.IsNil)
+		t.Assert(u.Query().Get("id"), c.Equals, versions[image])
+	}
 
 	// check system apps were deployed correctly
 	for _, app := range updater.SystemApps {
@@ -198,11 +240,32 @@ func (s *ReleaseSuite) TestReleaseImages(t *c.C) {
 		release, err := client.GetAppRelease(app.Name)
 		t.Assert(err, c.IsNil)
 		debugf(t, "new %s release ID: %s", app.Name, release.ID)
-		artifact, err := client.GetArtifact(release.ArtifactID)
+		artifact, err := client.GetArtifact(release.ImageArtifactID())
 		t.Assert(err, c.IsNil)
 		debugf(t, "new %s artifact: %+v", app.Name, artifact)
-		uri, err := url.Parse(artifact.URI)
-		t.Assert(err, c.IsNil)
-		t.Assert(uri.Query().Get("id"), c.Equals, versions[app.Image])
+		assertImage(artifact.URI, app.Image)
 	}
+
+	// check gitreceive has the correct slug env vars
+	gitreceive, err = client.GetAppRelease("gitreceive")
+	t.Assert(err, c.IsNil)
+	for _, name := range []string{"slugbuilder", "slugrunner"} {
+		artifact, err := client.GetArtifact(gitreceive.Env[strings.ToUpper(name)+"_IMAGE_ID"])
+		t.Assert(err, c.IsNil)
+		assertImage(artifact.URI, "flynn/"+name)
+	}
+
+	// check slug based app was deployed correctly
+	release, err = client.GetAppRelease(slugApp.Name)
+	t.Assert(err, c.IsNil)
+	imageArtifact, err = client.GetArtifact(release.ImageArtifactID())
+	t.Assert(err, c.IsNil)
+	assertImage(imageArtifact.URI, "flynn/slugrunner")
+
+	// check Redis app was deployed correctly
+	release, err = client.GetAppRelease(resource.Env["FLYNN_REDIS"])
+	t.Assert(err, c.IsNil)
+	imageArtifact, err = client.GetArtifact(release.ImageArtifactID())
+	t.Assert(err, c.IsNil)
+	assertImage(imageArtifact.URI, "flynn/redis")
 }

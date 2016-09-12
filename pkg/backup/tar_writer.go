@@ -16,17 +16,24 @@ import (
 	"github.com/flynn/flynn/pkg/cluster"
 )
 
-type TarWriter struct {
-	*tar.Writer
-	uid  int
-	name string
+type ProgressBar interface {
+	Add(int) int
+	io.Writer
 }
 
-func NewTarWriter(name string, w io.Writer) *TarWriter {
+type TarWriter struct {
+	*tar.Writer
+	uid      int
+	name     string
+	progress ProgressBar
+}
+
+func NewTarWriter(name string, w io.Writer, progress ProgressBar) *TarWriter {
 	return &TarWriter{
-		Writer: tar.NewWriter(w),
-		uid:    syscall.Getuid(),
-		name:   name,
+		Writer:   tar.NewWriter(w),
+		uid:      syscall.Getuid(),
+		name:     name,
+		progress: progress,
 	}
 }
 
@@ -54,10 +61,13 @@ func (t *TarWriter) WriteJSON(name string, v interface{}) error {
 		return err
 	}
 	_, err = t.Write([]byte("\n"))
+	if t.progress != nil {
+		t.progress.Add(len(data) + 1)
+	}
 	return err
 }
 
-func (t *TarWriter) WriteCommandOutput(client *controller.Client, name string, app string, newJob *ct.NewJob) error {
+func (t *TarWriter) WriteCommandOutput(client controller.Client, name string, app string, newJob *ct.NewJob) error {
 	f, err := ioutil.TempFile("", name)
 	if err != nil {
 		return fmt.Errorf("error creating temp file: %s", err)
@@ -65,8 +75,12 @@ func (t *TarWriter) WriteCommandOutput(client *controller.Client, name string, a
 	defer f.Close()
 	defer os.Remove(f.Name())
 
-	if err := t.runJob(client, app, newJob, f); err != nil {
-		return fmt.Errorf("error running export: %s", err)
+	var dest io.Writer = f
+	if t.progress != nil {
+		dest = io.MultiWriter(f, t.progress)
+	}
+	if err := t.runJob(client, app, newJob, dest); err != nil {
+		return fmt.Errorf("error running %s export: %s", app, err)
 	}
 
 	length, err := f.Seek(0, os.SEEK_CUR)
@@ -85,7 +99,15 @@ func (t *TarWriter) WriteCommandOutput(client *controller.Client, name string, a
 	return nil
 }
 
-func (t *TarWriter) runJob(client *controller.Client, app string, req *ct.NewJob, out io.Writer) error {
+func (t *TarWriter) runJob(client controller.Client, app string, req *ct.NewJob, out io.Writer) error {
+	// set deprecated Entrypoint and Cmd for old clusters
+	if len(req.Args) > 0 {
+		req.DeprecatedEntrypoint = []string{req.Args[0]}
+	}
+	if len(req.Args) > 1 {
+		req.DeprecatedCmd = req.Args[1:]
+	}
+
 	rwc, err := client.RunJobAttached(app, req)
 	if err != nil {
 		return err
@@ -93,6 +115,12 @@ func (t *TarWriter) runJob(client *controller.Client, app string, req *ct.NewJob
 	defer rwc.Close()
 	attachClient := cluster.NewAttachClient(rwc)
 	attachClient.CloseWrite()
-	_, err = attachClient.Receive(out, os.Stderr)
-	return err
+	exit, err := attachClient.Receive(out, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if exit != 0 {
+		return fmt.Errorf("unexpected command exit status %d", exit)
+	}
+	return nil
 }

@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/bootstrap/discovery"
 	"github.com/flynn/flynn/host/cli"
 	"github.com/flynn/flynn/host/config"
@@ -24,38 +24,54 @@ import (
 	zfsVolume "github.com/flynn/flynn/host/volume/zfs"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/version"
+	"github.com/flynn/go-docopt"
+	"github.com/opencontainers/runc/libcontainer"
+	_ "github.com/opencontainers/runc/libcontainer/nsenter"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const configFile = "/etc/flynn/host.json"
-
-var logger = log15.New("app", "host", "pid", os.Getpid())
 
 func init() {
 	cli.Register("daemon", runDaemon, `
 usage: flynn-host daemon [options]
 
 options:
-  --http-port=PORT       HTTP port [default: 1113]
-  --external-ip=IP       external IP of host
-  --listen-ip=IP         bind host network services to this IP
-  --state=PATH           path to state file [default: /var/lib/flynn/host-state.bolt]
-  --id=ID                host id
-  --tags=TAGS            host tags (comma separated list of KEY=VAL pairs, used for job constraints in the scheduler)
-  --force                kill all containers booted by flynn-host before starting
-  --volpath=PATH         directory to create volumes in [default: /var/lib/flynn/volumes]
-  --vol-provider=VOL     volume provider [default: zfs]
-  --backend=BACKEND      runner backend [default: libvirt-lxc]
-  --flynn-init=PATH      path to flynn-init binary [default: /usr/local/bin/flynn-init]
-  --nsumount=PATH        path to flynn-nsumount binary [default: /usr/local/bin/flynn-nsumount]
-  --log-dir=DIR          directory to store job logs [default: /var/log/flynn]
-  --discovery=TOKEN      join cluster with discovery token
-  --peer-ips=IPLIST      join existing cluster using IPs
-  --bridge-name=NAME     network bridge name [default: flynnbr0]
-  --no-resurrect         disable cluster resurrection
+  --http-port=PORT           HTTP port [default: 1113]
+  --external-ip=IP           external IP of host
+  --listen-ip=IP             bind host network services to this IP
+  --state=PATH               path to state file [default: /var/lib/flynn/host-state.bolt]
+  --id=ID                    host id
+  --tags=TAGS                host tags (comma separated list of KEY=VAL pairs, used for job constraints in the scheduler)
+  --force                    kill all containers booted by flynn-host before starting
+  --volpath=PATH             directory to create volumes in [default: /var/lib/flynn/volumes]
+  --vol-provider=VOL         volume provider [default: zfs]
+  --backend=BACKEND          runner backend [default: libcontainer]
+  --flynn-init=PATH          path to flynn-init binary [default: /usr/local/bin/flynn-init]
+  --log-dir=DIR              directory to store job logs [default: /var/log/flynn]
+  --discovery=TOKEN          join cluster with discovery token
+  --peer-ips=IPLIST          join existing cluster using IPs
+  --bridge-name=NAME         network bridge name [default: flynnbr0]
+  --no-resurrect             disable cluster resurrection
+  --max-job-concurrency=NUM  maximum number of jobs to start concurrently
+  --partitions=PARTITIONS    specify resource partitions for host [default: system=cpu_shares:4096 background=cpu_shares:4096 user=cpu_shares:8192]
 	`)
 }
 
 func main() {
+	// when starting a container with libcontainer, we first exec the
+	// current binary with libcontainer-init as the first argument,
+	// which triggers the following code to initialise the container
+	// environment (namespaces, network etc.) then exec containerinit
+	if len(os.Args) > 1 && os.Args[1] == "libcontainer-init" {
+		runtime.GOMAXPROCS(1)
+		runtime.LockOSThread()
+		factory, _ := libcontainer.New("")
+		if err := factory.StartInitialization(); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	defer shutdown.Exit()
 
 	usage := `usage: flynn-host [-h|--help] [--version] <command> [<args>...]
@@ -82,6 +98,7 @@ Commands:
   version                    Show current version
   fix                        Fix a broken cluster
   tags                       Manage flynn-host daemon tags
+  discover                   Return low-level information about a service
 
 See 'flynn-host help <command>' for more information on a specific command.
 `
@@ -150,10 +167,14 @@ func runDaemon(args *docopt.Args) {
 	volProvider := args.String["--vol-provider"]
 	backendName := args.String["--backend"]
 	flynnInit := args.String["--flynn-init"]
-	nsumount := args.String["--nsumount"]
 	logDir := args.String["--log-dir"]
 	discoveryToken := args.String["--discovery"]
 	bridgeName := args.String["--bridge-name"]
+
+	logger, err := setupLogger(logDir)
+	if err != nil {
+		shutdown.Fatalf("error setting up logger: %s", err)
+	}
 
 	var peerIPs []string
 	if args.String["--peer-ips"] != "" {
@@ -162,6 +183,29 @@ func runDaemon(args *docopt.Args) {
 
 	if hostID == "" {
 		hostID = strings.Replace(hostname, "-", "", -1)
+	}
+
+	var maxJobConcurrency uint64 = 4
+	if m, err := strconv.ParseUint(args.String["--max-job-concurrency"], 10, 64); err == nil {
+		maxJobConcurrency = m
+	}
+
+	var partitionCGroups = make(map[string]int64) // name -> cpu shares
+	for _, p := range strings.Split(args.String["--partitions"], " ") {
+		nameShares := strings.Split(p, "=cpu_shares:")
+		if len(nameShares) != 2 {
+			shutdown.Fatalf("invalid partition specifier: %q", p)
+		}
+		shares, err := strconv.ParseInt(nameShares[1], 10, 64)
+		if err != nil || shares < 2 {
+			shutdown.Fatalf("invalid cpu shares specifier: %q", shares)
+		}
+		partitionCGroups[nameShares[0]] = shares
+	}
+	for _, s := range []string{"user", "system", "background"} {
+		if _, ok := partitionCGroups[s]; !ok {
+			shutdown.Fatalf("missing mandatory resource partition: %s", s)
+		}
 	}
 
 	log := logger.New("fn", "runDaemon", "host.id", hostID)
@@ -242,10 +286,9 @@ func runDaemon(args *docopt.Args) {
 
 	log.Info("initializing job backend", "type", backendName)
 	var backend Backend
-	var err error
 	switch backendName {
-	case "libvirt-lxc":
-		backend, err = NewLibvirtLXCBackend(state, vman, bridgeName, flynnInit, nsumount, mux)
+	case "libcontainer":
+		backend, err = NewLibcontainerBackend(state, vman, bridgeName, flynnInit, mux, partitionCGroups, logger.New("host.id", hostID, "component", "backend", "backend", "libcontainer"))
 	case "mock":
 		backend = MockBackend{}
 	default:
@@ -275,7 +318,10 @@ func runDaemon(args *docopt.Args) {
 		vman:    vman,
 		discMan: discoverdManager,
 		log:     logger.New("host.id", hostID),
+
+		maxJobConcurrency: maxJobConcurrency,
 	}
+	backend.SetHost(host)
 
 	// restore the host status if set in the environment
 	if statusEnv := os.Getenv("FLYNN_HOST_STATUS"); statusEnv != "" {
@@ -375,28 +421,6 @@ func runDaemon(args *docopt.Args) {
 		}
 		stopJobs()
 	})
-	shutdown.BeforeExit(func() {
-		log.Info("marking jobs for resurrection")
-		if err := state.MarkForResurrection(); err != nil {
-			log.Error("error marking jobs for resurrection", "err", err)
-		}
-	})
-
-	// configure network and discoverd if config set in host status
-	if config := host.status.Network; config != nil {
-		log.Info("configuring network", "subnet", config.Subnet, "mtu", config.MTU, "resolvers", config.Resolvers)
-		if err := backend.ConfigureNetworking(config); err != nil {
-			log.Error("error configuring network", "err", err)
-			shutdown.Fatal(err)
-		}
-	}
-	if config := host.status.Discoverd; config != nil && config.URL != "" {
-		log.Info("connecting to service discovery", "url", config.URL)
-		if err := discoverdManager.ConnectLocal(config.URL); err != nil {
-			log.Error("error connecting to service discovery", "err", err)
-			shutdown.Fatal(err)
-		}
-	}
 
 	log.Info("serving HTTP requests")
 	host.ServeHTTP()
@@ -446,10 +470,18 @@ func runDaemon(args *docopt.Args) {
 		log.Info("got cluster peer IPs", "peers", peerIPs)
 	}
 	log.Info("connecting to cluster peers")
-	if err := discoverdManager.ConnectPeer(peerIPs); err != nil && !args.Bool["--no-resurrect"] {
-		log.Info("no cluster peers available, resurrecting jobs")
+	if err := discoverdManager.ConnectPeer(peerIPs); err != nil {
+		log.Info("no cluster peers available")
+	}
+
+	if !args.Bool["--no-resurrect"] {
+		log.Info("resurrecting jobs")
 		resurrect()
 	}
+
+	monitor := NewMonitor(host.discMan, externalIP, logger)
+	shutdown.BeforeExit(func() { monitor.Shutdown() })
+	go monitor.Run()
 
 	log.Info("blocking main goroutine")
 	<-make(chan struct{})
@@ -466,4 +498,17 @@ func parseTagArgs(args string) map[string]string {
 		}
 	}
 	return tags
+}
+
+func setupLogger(logDir string) (log15.Logger, error) {
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(logDir, "flynn-host.log")
+	handler, err := log15.FileHandler(path, log15.LogfmtFormat())
+	if err != nil {
+		return nil, err
+	}
+	log15.Root().SetHandler(handler)
+	return log15.New("app", "host", "pid", os.Getpid()), nil
 }

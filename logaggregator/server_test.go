@@ -6,16 +6,11 @@ import (
 	"net"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/logaggregator/client"
 	"github.com/flynn/flynn/logaggregator/utils"
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 	"github.com/flynn/flynn/pkg/syslog/rfc6587"
-)
-
-const (
-	sampleLogLine1 = `120 <40>1 2012-11-30T06:45:26+00:00 host app web.1 - [flynn seq="1"] Starting process with command bundle exec rackup config.ru -p 24405`
-	sampleLogLine2 = `79 <40>1 2012-11-30T06:45:27+00:00 host app web.2 - [flynn seq="2"] 25 yay this is a message!!!` + "\n"
+	. "github.com/flynn/go-check"
 )
 
 type ServerTestSuite struct{}
@@ -57,6 +52,7 @@ func (s *ServerTestSuite) TestServerDurability(c *C) {
 
 func (s *ServerTestSuite) TestHostCursors(c *C) {
 	srv := testServer(c)
+	srv.testMessageHook = make(chan struct{}, 1)
 	c.Assert(srv.Start(), IsNil)
 	defer srv.Shutdown()
 	cl := testClient(c, srv)
@@ -72,6 +68,7 @@ func (s *ServerTestSuite) TestHostCursors(c *C) {
 	}
 	write := func(msg *rfc5424.Message) {
 		conn.Write(rfc6587.Bytes(msg))
+		<-srv.testMessageHook
 	}
 
 	// write some messages

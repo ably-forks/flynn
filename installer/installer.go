@@ -9,9 +9,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/digitalocean/godo"
-	log "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	"github.com/digitalocean/godo"
 	"github.com/flynn/flynn/pkg/httphelper"
+	"github.com/flynn/flynn/pkg/shutdown"
+	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 var ClusterNotFoundError = errors.New("Cluster not found")
@@ -24,7 +25,7 @@ type Installer struct {
 	logger        log.Logger
 
 	dbMtx        sync.RWMutex
-	eventsMtx    sync.Mutex
+	eventsMtx    sync.RWMutex
 	subscribeMtx sync.Mutex
 	clustersMtx  sync.RWMutex
 }
@@ -36,10 +37,13 @@ func NewInstaller(l log.Logger) *Installer {
 		logger:        l,
 	}
 	if err := installer.openDB(); err != nil {
-		panic(err)
+		if err.Error() == "resource temporarily unavailable" {
+			shutdown.Fatal("Error: Another `flynn install` process is already running.")
+		}
+		shutdown.Fatalf("Error opening database: %s", err)
 	}
 	if err := installer.loadEventsFromDB(); err != nil {
-		panic(err)
+		shutdown.Fatalf("Error loading events from database: %s", err)
 	}
 	return installer
 }
@@ -248,6 +252,13 @@ func (i *Installer) LaunchCluster(c Cluster) error {
 		Cluster:   base,
 		ClusterID: base.ID,
 	})
+	if base.IsRestoringBackup() {
+		base.SendProgress(&ProgressEvent{
+			ID:          "upload-backup",
+			Description: "Upload pending cluster start...",
+			Percent:     0,
+		})
+	}
 	c.Run()
 	return nil
 }
@@ -294,7 +305,10 @@ func (i *Installer) ListAzureRegions(creds *Credential) (interface{}, error) {
 	return locs, nil
 }
 
-func (i *Installer) dbMarshalItem(tableName string, item interface{}) ([]interface{}, error) {
+func (i *Installer) dbMarshalItem(tableName string, item interface{}, typeMap map[string]interface{}) ([]interface{}, error) {
+	if typeMap == nil {
+		typeMap = make(map[string]interface{})
+	}
 	rows, err := i.db.Query(fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableName))
 	if err != nil {
 		return nil, err
@@ -308,6 +322,9 @@ func (i *Installer) dbMarshalItem(tableName string, item interface{}) ([]interfa
 	fields := make([]interface{}, len(cols))
 	for idx, c := range cols {
 		fields[idx] = v.FieldByName(c).Interface()
+		if t, ok := typeMap[c]; ok {
+			fields[idx] = reflect.ValueOf(fields[idx]).Convert(reflect.TypeOf(t)).Interface()
+		}
 	}
 	return fields, nil
 }
@@ -321,7 +338,7 @@ func (i *Installer) SaveCluster(c Cluster) error {
 	base.Type = c.Type()
 	base.Name = base.ID
 
-	baseFields, err := i.dbMarshalItem("clusters", base)
+	baseFields, err := i.dbMarshalItem("clusters", base, nil)
 	if err != nil {
 		return err
 	}
@@ -331,7 +348,7 @@ func (i *Installer) SaveCluster(c Cluster) error {
 	}
 
 	tableName := strings.Join([]string{base.Type, "clusters"}, "_")
-	clusterFields, err := i.dbMarshalItem(tableName, c)
+	clusterFields, err := i.dbMarshalItem(tableName, c, nil)
 	if err != nil {
 		return err
 	}

@@ -10,30 +10,38 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/websocket"
+	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/discoverd/testutil"
 	"github.com/flynn/flynn/pkg/httpclient"
+	"github.com/flynn/flynn/pkg/tlscert"
+	"github.com/flynn/flynn/router/schema"
 	"github.com/flynn/flynn/router/types"
+	. "github.com/flynn/go-check"
+	"github.com/jackc/pgx"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/websocket"
 )
 
 const UUIDRegex = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 var httpClient = newHTTPClient("example.com")
 
-// borrowed from net/http/httptest/server.go
-// localhostCert is a PEM-encoded TLS cert with SAN IPs
-// "127.0.0.1" and "[::1]", expiring at the last second of 2049 (the end
-// of ASN.1 time).
-// generated from src/pkg/crypto/tls:
-// go run generate_cert.go  --rsa-bits 512 --host 127.0.0.1,::1,example.com,*.example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
-var localhostCert = []byte(`-----BEGIN CERTIFICATE-----
+var tlsCerts = map[string]*tlscert.Cert{
+	"example.com": {
+		// borrowed from net/http/httptest/server.go
+		// PEM-encoded TLS cert with SAN IPs
+		// "127.0.0.1" and "[::1]", expiring at the last second of 2049 (the end
+		// of ASN.1 time).
+		// generated from src/pkg/crypto/tls:
+		// go run generate_cert.go  --rsa-bits 512 --host 127.0.0.1,::1,example.com,*.example.com --ca --start-date "Jan 1 00:00:00 1970" --duration=1000000h
+		Cert: `-----BEGIN CERTIFICATE-----
 MIIBmjCCAUagAwIBAgIRAP5DRqWA/pgvAnbC6gnl82kwCwYJKoZIhvcNAQELMBIx
 EDAOBgNVBAoTB0FjbWUgQ28wIBcNNzAwMTAxMDAwMDAwWhgPMjA4NDAxMjkxNjAw
 MDBaMBIxEDAOBgNVBAoTB0FjbWUgQ28wXDANBgkqhkiG9w0BAQEFAANLADBIAkEA
@@ -43,10 +51,8 @@ BAwwCgYIKwYBBQUHAwEwDwYDVR0TAQH/BAUwAwEB/zA9BgNVHREENjA0ggtleGFt
 cGxlLmNvbYINKi5leGFtcGxlLmNvbYcEfwAAAYcQAAAAAAAAAAAAAAAAAAAAATAL
 BgkqhkiG9w0BAQsDQQBJxy1zotHYLZpyoockAlJWRa88hs1PrroUNMlueRtzNkpx
 9heaebvotwUkFlnNYJZsfPnO23R0lUlzLJ3p1RNz
------END CERTIFICATE-----`)
-
-// localhostKey is the private key for localhostCert.
-var localhostKey = []byte(`-----BEGIN RSA PRIVATE KEY-----
+-----END CERTIFICATE-----`,
+		PrivateKey: `-----BEGIN RSA PRIVATE KEY-----
 MIIBOQIBAAJBALfSVyYOnwjMbwSnywrpB+3ZxdZyHQgbrq418VTOvRNvvext2gwU
 yJu617cYpQGImwcMwbYKj81FZ4G5ituXILkCAwEAAQJAXvmhp3skdkJSFgCv6qou
 O5kqG7uH/nl3DnG2iA/tJw3SlEPftQyzNk5jcIFSxvr8pu1pj+L1vw5pR68/7fre
@@ -54,7 +60,62 @@ xQIhAMM0/bYtVbzW+PPjqAev3TKhMyWkY3t9Qvw5OtgmBQ+PAiEA8RGk9OvMxBbR
 8zJmOXminEE2VVE1VF0K0OiFLDG+JzcCIHurptE0B42L5E0ffeTg1hKtben7K8ug
 oD+LQmyOKcahAiB05Btab2QQyQfwpsWOpP5GShCwefoj+CGgfr7kWRJdLQIgTMZe
 ++SKD8ascROyDnZ0Td8wbrFnO0YRPEkwlhn6h0U=
------END RSA PRIVATE KEY-----`)
+-----END RSA PRIVATE KEY-----`,
+	},
+}
+
+var tlsCertsMux sync.Mutex
+
+func normalizeDomain(domain string) string {
+	domain = strings.ToLower(domain)
+	if d, _, err := net.SplitHostPort(domain); err == nil {
+		domain = d
+	}
+	uri, err := url.Parse("http://" + domain)
+	if err != nil {
+		panic(err)
+	}
+	domain = uri.Host
+	if strings.HasSuffix(domain, ".example.com") {
+		domain = "example.com"
+	}
+	return domain
+}
+
+func tlsConfigForDomain(domain string) *tlscert.Cert {
+	tlsCertsMux.Lock()
+	defer tlsCertsMux.Unlock()
+	domain = normalizeDomain(domain)
+	parts := strings.SplitAfter(domain, ".")
+	wildcard := "*."
+	for i := 1; i < len(parts); i++ {
+		wildcard += parts[i]
+	}
+	if c, ok := tlsCerts[domain]; ok {
+		return c
+	}
+	if c, ok := tlsCerts[wildcard]; ok {
+		return c
+	}
+	c, err := tlscert.Generate([]string{domain})
+	if err != nil {
+		panic(err)
+	}
+	tlsCerts[domain] = c
+	return c
+}
+
+func refreshTLSConfigForDomain(domain string) *tlscert.Cert {
+	tlsCertsMux.Lock()
+	defer tlsCertsMux.Unlock()
+	domain = normalizeDomain(domain)
+	c, err := tlscert.Generate([]string{domain})
+	if err != nil {
+		panic(err)
+	}
+	tlsCerts[domain] = c
+	return c
+}
 
 func httpTestHandler(id string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -63,8 +124,13 @@ func httpTestHandler(id string) http.Handler {
 }
 
 func newHTTPClient(serverName string) *http.Client {
+	cert := tlsConfigForDomain(serverName)
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(localhostCert)
+	if len(cert.CACert) > 0 {
+		pool.AppendCertsFromPEM([]byte(cert.CACert))
+	} else {
+		pool.AppendCertsFromPEM([]byte(cert.Cert))
+	}
 
 	if strings.Contains(serverName, ":") {
 		serverName, _, _ = net.SplitHostPort(serverName)
@@ -72,12 +138,33 @@ func newHTTPClient(serverName string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{ServerName: serverName, RootCAs: pool},
+			TLSNextProto:    map[string]func(authority string, c *tls.Conn) http.RoundTripper{}, // disable HTTP/2
+		},
+	}
+}
+
+func newHTTP2Client(serverName string) *http.Client {
+	cert := tlsConfigForDomain(serverName)
+	pool := x509.NewCertPool()
+	if len(cert.CACert) > 0 {
+		pool.AppendCertsFromPEM([]byte(cert.CACert))
+	} else {
+		pool.AppendCertsFromPEM([]byte(cert.Cert))
+	}
+
+	if strings.Contains(serverName, ":") {
+		serverName, _, _ = net.SplitHostPort(serverName)
+	}
+	return &http.Client{
+		Transport: &http2.Transport{
+			TLSClientConfig: &tls.Config{ServerName: serverName, RootCAs: pool},
 		},
 	}
 }
 
 func (s *S) newHTTPListener(t testutil.TestingT) *HTTPListener {
-	pair, err := tls.X509KeyPair(localhostCert, localhostKey)
+	cert := tlsConfigForDomain("example.com")
+	pair, err := tls.X509KeyPair([]byte(cert.Cert), []byte(cert.PrivateKey))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,6 +243,217 @@ func (s *S) TestAddHTTPRoute(c *C) {
 	res.Body.Close()
 }
 
+func (s *S) TestAddHTTPRouteWithCert(c *C) {
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	defer srv1.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	domain := "foo.example.org"
+	addHTTPRouteForDomain(domain, c, l)
+
+	unregister := discoverdRegisterHTTP(c, l, srv1.Listener.Addr().String())
+
+	assertGet(c, "http://"+l.Addr, domain, "1")
+	assertGet(c, "https://"+l.TLSAddr, domain, "1")
+
+	res, err := newHTTP2Client(domain).Do(newReq("https://"+l.TLSAddr, domain))
+	c.Assert(err, IsNil)
+	defer res.Body.Close()
+	c.Assert(res.StatusCode, Equals, 200)
+	data, err := ioutil.ReadAll(res.Body)
+	c.Assert(err, IsNil)
+	c.Assert(string(data), Equals, "1")
+
+	unregister()
+}
+
+func (s *S) TestAddHTTPRouteWithInvalidCert(c *C) {
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	c1, _ := tlscert.Generate([]string{"1.example.com"})
+	c2, _ := tlscert.Generate([]string{"2.example.com"})
+
+	err := l.AddRoute(router.HTTPRoute{
+		Domain:  "example.com",
+		Service: "test",
+		Certificate: &router.Certificate{
+			Cert: c1.Cert,
+			Key:  c2.PrivateKey,
+		},
+	}.ToRoute())
+	c.Assert(err, Not(IsNil))
+}
+
+func (s *S) TestAddHTTPRouteWithExistingCert(c *C) {
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	srv2 := httptest.NewServer(httpTestHandler("2"))
+	defer srv1.Close()
+	defer srv2.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	tlsCert := tlsConfigForDomain("*.bar.example.org")
+
+	domain := "1.bar.example.org"
+	r1 := addRoute(c, l, router.HTTPRoute{
+		Domain:  domain,
+		Service: "test",
+		Certificate: &router.Certificate{
+			Cert: "  \n  \n " + tlsCert.Cert + "  \n",
+			Key:  "\n\n" + tlsCert.PrivateKey + "\n   ",
+		},
+	}.ToRoute())
+	unregister := discoverdRegisterHTTP(c, l, srv1.Listener.Addr().String())
+	assertGet(c, "http://"+l.Addr, domain, "1")
+	assertGet(c, "https://"+l.TLSAddr, domain, "1")
+	unregister()
+
+	domain = "2.bar.example.org"
+	r2 := addHTTPRouteForDomain(domain, c, l)
+	unregister = discoverdRegisterHTTP(c, l, srv2.Listener.Addr().String())
+	assertGet(c, "http://"+l.Addr, domain, "2")
+	assertGet(c, "https://"+l.TLSAddr, domain, "2")
+	unregister()
+
+	c.Assert(r1.Certificate, DeepEquals, r2.Certificate)
+}
+
+func (s *S) TestAddAndDeleteCert(c *C) {
+	api := s.newTestAPIServer(c)
+	defer api.Close()
+
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	defer srv1.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	domain := "chip.example.org"
+	r := addHTTPRouteForDomain(domain, c, l)
+
+	unregister := discoverdRegisterHTTP(c, l, srv1.Listener.Addr().String())
+	defer unregister()
+
+	assertGet(c, "http://"+l.Addr, domain, "1")
+	assertGet(c, "https://"+l.TLSAddr, domain, "1")
+
+	tlsCert := refreshTLSConfigForDomain(domain)
+	cert := &router.Certificate{
+		Routes: []string{r.ID},
+		Cert:   tlsCert.Cert,
+		Key:    tlsCert.PrivateKey,
+	}
+	wait := waitForEvent(c, l, "set", "")
+	err := api.CreateCert(cert)
+	c.Assert(err, IsNil)
+	wait()
+
+	assertGet(c, "http://"+l.Addr, domain, "1")
+	assertGet(c, "https://"+l.TLSAddr, domain, "1")
+
+	wait = waitForEvent(c, l, "set", "")
+	err = api.DeleteCert(cert.ID)
+	c.Assert(err, IsNil)
+	wait()
+
+	r, err = api.GetRoute(r.Type, r.ID)
+	c.Assert(err, IsNil)
+	c.Assert(r.Certificate, IsNil)
+}
+
+func (s *S) TestGetCert(c *C) {
+	api := s.newTestAPIServer(c)
+	defer api.Close()
+
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	defer srv1.Close()
+	l := s.newHTTPListener(c)
+	defer l.Close()
+	domain := "oof.example.org"
+	r := addHTTPRouteForDomain(domain, c, l)
+
+	tlsCert, err := tlscert.Generate([]string{domain})
+	c.Assert(err, IsNil)
+	cert := &router.Certificate{
+		Routes: []string{r.ID},
+		Cert:   tlsCert.Cert,
+		Key:    tlsCert.PrivateKey,
+	}
+	err = api.CreateCert(cert)
+	c.Assert(err, IsNil)
+
+	gotCert, err := api.GetCert(cert.ID)
+	c.Assert(err, IsNil)
+	c.Assert(gotCert.ID, Equals, cert.ID)
+	c.Assert(gotCert.Cert, Equals, cert.Cert)
+	c.Assert(gotCert.Key, Equals, cert.Key)
+	c.Assert(gotCert.Routes, DeepEquals, cert.Routes)
+}
+
+func (s *S) TestListCerts(c *C) {
+	api := s.newTestAPIServer(c)
+	defer api.Close()
+
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	defer srv1.Close()
+	l := s.newHTTPListener(c)
+	defer l.Close()
+	domain := "oof.example.org"
+	r := addHTTPRouteForDomain(domain, c, l)
+
+	tlsCert, err := tlscert.Generate([]string{domain})
+	c.Assert(err, IsNil)
+	cert := &router.Certificate{
+		Routes: []string{r.ID},
+		Cert:   tlsCert.Cert,
+		Key:    tlsCert.PrivateKey,
+	}
+	err = api.CreateCert(cert)
+	c.Assert(err, IsNil)
+
+	gotCerts, err := api.ListCerts()
+	c.Assert(err, IsNil)
+	c.Assert(len(gotCerts), Equals, 2)
+	gotCert := gotCerts[1] // the first cert was created with the route
+	c.Assert(gotCert.ID, Equals, cert.ID)
+	c.Assert(gotCert.Cert, Equals, cert.Cert)
+	c.Assert(gotCert.Key, Equals, cert.Key)
+	c.Assert(gotCert.Routes, DeepEquals, cert.Routes)
+}
+
+func (s *S) TestListCertRoutes(c *C) {
+	api := s.newTestAPIServer(c)
+	defer api.Close()
+
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	defer srv1.Close()
+	l := s.newHTTPListener(c)
+	defer l.Close()
+	domain := "oof.example.org"
+	r := addHTTPRouteForDomain(domain, c, l)
+
+	tlsCert, err := tlscert.Generate([]string{domain})
+	c.Assert(err, IsNil)
+	cert := &router.Certificate{
+		Routes: []string{r.ID},
+		Cert:   tlsCert.Cert,
+		Key:    tlsCert.PrivateKey,
+	}
+	err = api.CreateCert(cert)
+	c.Assert(err, IsNil)
+
+	gotRoutes, err := api.ListCertRoutes(cert.ID)
+	c.Assert(err, IsNil)
+	c.Assert(len(gotRoutes), Equals, 1)
+	gotRoute := gotRoutes[0]
+	c.Assert(gotRoute.ID, Equals, r.ID)
+	c.Assert(gotRoute.Certificate, IsNil)
+}
+
 func newReq(url, host string) *http.Request {
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Host = host
@@ -182,11 +480,18 @@ func assertGetCookies(c *C, url, host, expected string, cookies []*http.Cookie) 
 }
 
 func addHTTPRoute(c *C, l *HTTPListener) *router.Route {
+	return addHTTPRouteForDomain("example.com", c, l)
+}
+
+func addHTTPRouteForDomain(domain string, c *C, l *HTTPListener) *router.Route {
+	cert := tlsConfigForDomain(domain)
 	return addRoute(c, l, router.HTTPRoute{
-		Domain:  "example.com",
+		Domain:  domain,
 		Service: "test",
-		TLSCert: string(localhostCert),
-		TLSKey:  string(localhostKey),
+		Certificate: &router.Certificate{
+			Cert: cert.Cert,
+			Key:  cert.PrivateKey,
+		},
 	}.ToRoute())
 }
 
@@ -233,6 +538,38 @@ func (s *S) TestWildcardRouting(c *C) {
 	assertGet(c, "http://"+l.Addr, "foo.bar", "1")
 	assertGet(c, "http://"+l.Addr, "flynn.foo.bar", "2")
 	assertGet(c, "http://"+l.Addr, "dev.foo.bar", "3")
+}
+
+func (s *S) TestLeaderRouting(c *C) {
+	srv1 := httptest.NewServer(httpTestHandler("1"))
+	srv2 := httptest.NewServer(httpTestHandler("2"))
+	defer srv1.Close()
+	defer srv2.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	client := l.discoverd
+	err := client.AddService("leader-routing-http", &discoverd.ServiceConfig{
+		LeaderType: discoverd.LeaderTypeManual,
+	})
+	c.Assert(err, IsNil)
+
+	addRoute(c, l, router.HTTPRoute{
+		Domain:  "foo.bar",
+		Service: "leader-routing-http",
+		Leader:  true,
+	}.ToRoute())
+
+	discoverdRegisterHTTPService(c, l, "leader-routing-http", srv1.Listener.Addr().String())
+	discoverdRegisterHTTPService(c, l, "leader-routing-http", srv2.Listener.Addr().String())
+
+	discoverdSetLeaderHTTP(c, l, "leader-routing-http", md5sum("tcp-"+srv1.Listener.Addr().String()))
+	assertGet(c, "http://"+l.Addr, "foo.bar", "1")
+
+	discoverdSetLeaderHTTP(c, l, "leader-routing-http", md5sum("tcp-"+srv2.Listener.Addr().String()))
+	c.Assert(err, IsNil)
+	assertGet(c, "http://"+l.Addr, "foo.bar", "2")
 }
 
 func (s *S) TestPathRouting(c *C) {
@@ -325,7 +662,7 @@ func (s *S) TestHTTPResync(c *C) {
 		cmu.Lock()
 		defer cmu.Unlock()
 		connPids = append(connPids, conn.Pid)
-		return nil
+		return schema.PrepareStatements(conn)
 	}
 	pgxpool, err := pgx.NewConnPool(poolConfig)
 	if err != nil {
@@ -394,9 +731,11 @@ func (s *S) TestHTTPResync(c *C) {
 			c.Fatal(fmt.Errorf("Unable to remove route after disconnecting sync"))
 		}
 		err = l.RemoveRoute(route.ID)
-		if e, ok := err.(*net.OpError); ok && e.Err == syscall.EPIPE {
-			attempts++
-			continue
+		if e, ok := err.(*net.OpError); ok {
+			if ee, ok := e.Err.(*os.SyscallError); ok && ee.Err == syscall.EPIPE || e.Err == syscall.EPIPE {
+				attempts++
+				continue
+			}
 		}
 		if err == pgx.ErrDeadConn {
 			attempts++
@@ -979,10 +1318,7 @@ func (s *S) TestClosedBackendRetriesAnotherBackend(c *C) {
 	tests := []ts{
 		{method: "GET", upgrade: false},
 		{method: "GET", upgrade: true},
-		// XXX(jpg): Something causing this to fail in Go 1.4.3 upgrade
-		// must investigate if this is an actual problem or a change in
-		// behavior that doesn't harm the actual function of the router
-		// {method: "POST", upgrade: false},
+		{method: "POST", upgrade: false},
 		{method: "POST", upgrade: true},
 	}
 
@@ -1315,4 +1651,42 @@ func (s *S) TestHTTPHijackUpgrade(c *C) {
 	pong, err := ioutil.ReadAll(rwc)
 	c.Assert(err, IsNil)
 	c.Assert(string(pong), Equals, "pong!\n")
+}
+
+func (s *S) TestHTTPCloseNotify(c *C) {
+	success := make(chan struct{})
+	done := make(chan struct{})
+	cancel := make(chan struct{})
+	defer close(done)
+	h := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		select {
+		case <-w.(http.CloseNotifier).CloseNotify():
+			close(success)
+		case <-done:
+		}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	addHTTPRoute(c, l)
+	discoverdRegisterHTTP(c, l, srv.Listener.Addr().String())
+
+	req := newReq("http://"+l.Addr, "example.com")
+	req.Method = "POST"
+	req.Cancel = cancel
+	res, err := httpClient.Do(req)
+	c.Assert(err, IsNil)
+	defer res.Body.Close()
+	close(cancel)
+
+	select {
+	case <-success:
+	case <-time.After(10 * time.Second):
+		c.Fatal("CloseNotify not called")
+	}
 }

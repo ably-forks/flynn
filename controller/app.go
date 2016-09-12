@@ -10,9 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/controller/name"
 	"github.com/flynn/flynn/controller/schema"
 	ct "github.com/flynn/flynn/controller/types"
@@ -25,6 +22,9 @@ import (
 	"github.com/flynn/flynn/pkg/sse"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	"github.com/flynn/que-go"
+	"github.com/jackc/pgx"
+	"golang.org/x/net/context"
 )
 
 type AppRepo struct {
@@ -190,6 +190,22 @@ func (r *AppRepo) Update(id string, data map[string]interface{}) (interface{}, e
 				tx.Rollback()
 				return nil, err
 			}
+		case "deploy_timeout":
+			timeout, ok := v.(json.Number)
+			if !ok {
+				tx.Rollback()
+				return nil, fmt.Errorf("controller: expected json.Number, got %T", v)
+			}
+			t, err := timeout.Int64()
+			if err != nil {
+				tx.Rollback()
+				return nil, fmt.Errorf("controller: unable to decode json.Number: %s", err)
+			}
+			app.DeployTimeout = int32(t)
+			if err := tx.Exec("app_update_deploy_timeout", app.ID, app.DeployTimeout); err != nil {
+				tx.Rollback()
+				return nil, err
+			}
 		}
 	}
 
@@ -303,6 +319,23 @@ func (c *controllerAPI) DeleteApp(ctx context.Context, w http.ResponseWriter, re
 	}
 }
 
+func (c *controllerAPI) ScheduleAppGarbageCollection(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+	gc := &ct.AppGarbageCollection{AppID: c.getApp(ctx).ID}
+	args, err := json.Marshal(gc)
+	if err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	job := &que.Job{Type: "app_garbage_collection", Args: args}
+	if err := c.que.Enqueue(job); err != nil {
+		respondWithError(w, err)
+		return
+	}
+
+	w.WriteHeader(200)
+}
+
 func (c *controllerAPI) AppLog(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -328,9 +361,10 @@ func (c *controllerAPI) AppLog(ctx context.Context, w http.ResponseWriter, req *
 	}
 
 	if cn, ok := w.(http.CloseNotifier); ok {
+		ch := cn.CloseNotify()
 		go func() {
 			select {
-			case <-cn.CloseNotify():
+			case <-ch:
 				rc.Close()
 			case <-ctx.Done():
 			}

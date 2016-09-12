@@ -45,47 +45,47 @@ type Job struct {
 	// We only use the UUID part due to the fact that a cluster job only
 	// has a HostID once a host has been picked to run the job on, and we
 	// need to track it before that happens.
-	ID string
+	ID string `json:"id"`
 
-	Type      string
-	AppID     string
-	ReleaseID string
+	Type      string `json:"type"`
+	AppID     string `json:"app_id"`
+	ReleaseID string `json:"release_id"`
 
 	// HostID is the ID of the host the job has been placed on, and is set
 	// when a StartJob goroutine makes a placement request to the scheduler
 	// loop
-	HostID string
+	HostID string `json:"host_id"`
 
 	// JobID is the ID of the cluster job that this in-memory job
 	// represents, and is set either by a StartJob goroutine when it makes
 	// a placement request to the scheduler loop, or when an event is
 	// received for a yet unknown job (e.g. one started by the controller)
-	JobID string
+	JobID string `json:"job_id"`
 
 	// Formation is the formation this job belongs to
-	Formation *Formation
+	Formation *Formation `json:"-"`
 
-	// restarts is the number of times this job has been restarted and is
+	// Restarts is the number of times this job has been restarted and is
 	// used to calculate the amount of time to wait before restarting the
 	// job again when it stops (see scheduler.restartJob)
-	restarts uint
+	Restarts uint `json:"restarts"`
 
 	// restartTimer is a timer set when scheduling a job to start in the
 	// future
 	restartTimer *time.Timer
 
-	// runAt is the time we expect this job to be started at if it is the
+	// RunAt is the time we expect this job to be started at if it is the
 	// restart of a crashed job.
-	runAt *time.Time
+	RunAt *time.Time `json:"run_at,omitempty"`
 
-	// startedAt is the time the job started in the cluster, assigned
+	// StartedAt is the time the job started in the cluster, assigned
 	// whenever a host event is received for the job, and is used to sort
 	// jobs when deciding which job to stop when a formation is scaled down
-	startedAt time.Time
+	StartedAt time.Time `json:"started_at"`
 
-	// state is the job's current in-memory state and should only be
+	// State is the job's current in-memory state and should only be
 	// referenced from within the main scheduler loop
-	state JobState
+	State JobState `json:"state"`
 
 	// metadata is the cluster job's metadata, assigned whenever a host
 	// event is received for the job, and is used when persisting the job
@@ -121,31 +121,16 @@ func (j *Job) needsVolume() bool {
 	return j.Formation.Release.Processes[j.Type].Data
 }
 
-// HasTypeFromRelease indicates whether the job has a type which is present
-// in the release
-func (j *Job) HasTypeFromRelease() bool {
-	for typ := range j.Formation.Release.Processes {
-		if j.Type == typ {
-			return true
-		}
-	}
-	return false
-}
-
-func (j *Job) IsStopped() bool {
-	return j.state == JobStateStopping || j.state == JobStateStopped
-}
-
 func (j *Job) IsRunning() bool {
-	return j.state == JobStateStarting || j.state == JobStateRunning
-}
-
-func (j *Job) IsSchedulable() bool {
-	return j.Formation != nil && j.Type != ""
+	return j.State == JobStateStarting || j.State == JobStateRunning
 }
 
 func (j *Job) IsInFormation(key utils.FormationKey) bool {
-	return !j.IsStopped() && j.Formation != nil && j.Formation.key() == key && j.HasTypeFromRelease()
+	return j.State != JobStateStopped && j.Formation != nil && j.Formation.key() == key
+}
+
+func (j *Job) IsInApp(appID string) bool {
+	return j.Formation != nil && j.Formation.key().AppID == appID
 }
 
 func (j *Job) ControllerJob() *ct.Job {
@@ -158,10 +143,10 @@ func (j *Job) ControllerJob() *ct.Job {
 		Type:      j.Type,
 		Meta:      utils.JobMetaFromMetadata(j.metadata),
 		HostError: j.hostError,
-		RunAt:     j.runAt,
+		RunAt:     j.RunAt,
 	}
 
-	switch j.state {
+	switch j.State {
 	case JobStatePending:
 		job.State = ct.JobStatePending
 	case JobStateStarting:
@@ -175,8 +160,8 @@ func (j *Job) ControllerJob() *ct.Job {
 	if j.exitStatus != nil {
 		job.ExitStatus = typeconv.Int32Ptr(int32(*j.exitStatus))
 	}
-	if j.restarts > 0 {
-		job.Restarts = typeconv.Int32Ptr(int32(j.restarts))
+	if j.Restarts > 0 {
+		job.Restarts = typeconv.Int32Ptr(int32(j.Restarts))
 	}
 
 	return job
@@ -198,18 +183,19 @@ func (j Jobs) WithFormationAndType(f *Formation, typ string) sortJobs {
 	return jobs
 }
 
-// sortJobs sorts Jobs in reverse chronological order based on their startedAt time
+// sortJobs sorts Jobs in reverse chronological order based on their StartedAt time
 type sortJobs []*Job
 
 func (s sortJobs) Len() int           { return len(s) }
-func (s sortJobs) Less(i, j int) bool { return s[i].startedAt.Sub(s[j].startedAt) > 0 }
+func (s sortJobs) Less(i, j int) bool { return s[i].StartedAt.Sub(s[j].StartedAt) > 0 }
 func (s sortJobs) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 func (s sortJobs) Sort()              { sort.Sort(s) }
+func (s sortJobs) SortReverse()       { sort.Sort(sort.Reverse(s)) }
 
 func (j Jobs) GetHostJobCounts(key utils.FormationKey, typ string) map[string]int {
 	counts := make(map[string]int)
 	for _, job := range j {
-		if job.IsInFormation(key) && job.Type == typ && job.restartTimer == nil {
+		if job.IsInFormation(key) && job.Type == typ && job.HostID != "" {
 			counts[job.HostID]++
 		}
 	}

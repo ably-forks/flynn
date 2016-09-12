@@ -7,7 +7,14 @@ func (d *DeployJob) deployAllAtOnce() error {
 	log.Info("starting all-at-once deployment")
 
 	expected := make(ct.JobEvents)
+	newProcs := make(map[string]int, len(d.Processes))
 	for typ, n := range d.Processes {
+		// ignore processes which no longer exist in the new
+		// release
+		if _, ok := d.newRelease.Processes[typ]; !ok {
+			continue
+		}
+		newProcs[typ] = n
 		total := n
 		if d.isOmni(typ) {
 			total *= d.hostCount
@@ -26,11 +33,11 @@ func (d *DeployJob) deployAllAtOnce() error {
 	}
 	if expected.Count() > 0 {
 		log := log.New("release_id", d.NewReleaseID)
-		log.Info("creating new formation", "processes", d.Processes)
+		log.Info("creating new formation", "processes", newProcs)
 		if err := d.client.PutFormation(&ct.Formation{
 			AppID:     d.AppID,
 			ReleaseID: d.NewReleaseID,
-			Processes: d.Processes,
+			Processes: newProcs,
 		}); err != nil {
 			log.Error("error creating new formation", "err", err)
 			return err
@@ -58,6 +65,10 @@ func (d *DeployJob) deployAllAtOnce() error {
 		}
 	}
 
+	// the new jobs have now started and they are up, so return
+	// ErrSkipRollback from here on out if an error occurs (rolling
+	// back doesn't make a ton of sense because it involves
+	// stopping the new working jobs).
 	log = log.New("release_id", d.OldReleaseID)
 	log.Info("scaling old formation to zero")
 	if err := d.client.PutFormation(&ct.Formation{
@@ -65,16 +76,13 @@ func (d *DeployJob) deployAllAtOnce() error {
 		ReleaseID: d.OldReleaseID,
 	}); err != nil {
 		log.Error("error scaling old formation to zero", "err", err)
-		return err
+		return ErrSkipRollback{err.Error()}
 	}
 
 	if expected.Count() > 0 {
 		log.Info("waiting for job events", "expected", expected)
 		if err := d.waitForJobEvents(d.OldReleaseID, expected, log); err != nil {
 			log.Error("error waiting for job events", "err", err)
-			// we have started the new jobs (and they are up) and requested that the old jobs stop. at this point
-			// there's not much more we can do. Rolling back doesn't make a ton of sense because it involves
-			// stopping the new (working) jobs.
 			return ErrSkipRollback{err.Error()}
 		}
 	}

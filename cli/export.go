@@ -7,21 +7,25 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"strconv"
+	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/cheggaaa/pb"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/term"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/cheggaaa/pb"
+	"github.com/docker/docker/pkg/term"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/backup"
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/router/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -55,7 +59,7 @@ Options:
 `)
 }
 
-func runExport(args *docopt.Args, client *controller.Client) error {
+func runExport(args *docopt.Args, client controller.Client) error {
 	var dest io.Writer = os.Stdout
 	if filename := args.String["--file"]; filename != "" {
 		f, err := os.Create(filename)
@@ -71,7 +75,19 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 		return fmt.Errorf("error getting app: %s", err)
 	}
 
-	tw := backup.NewTarWriter(app.Name, dest)
+	var bar backup.ProgressBar
+	if !args.Bool["--quiet"] && term.IsTerminal(os.Stderr.Fd()) {
+		b := pb.New(0)
+		b.SetUnits(pb.U_BYTES)
+		b.ShowBar = false
+		b.ShowSpeed = true
+		b.Output = os.Stderr
+		b.Start()
+		defer b.Finish()
+		bar = b
+	}
+
+	tw := backup.NewTarWriter(app.Name, dest, bar)
 	defer tw.Close()
 
 	if err := tw.WriteJSON("app.json", app); err != nil {
@@ -87,7 +103,10 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 	}
 
 	release, err := client.GetAppRelease(mustApp())
-	if err != nil && err != controller.ErrNotFound {
+	if err == controller.ErrNotFound {
+		// if the app has no release then there is nothing more to export
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("error retrieving app: %s", err)
 	} else if err == nil {
 		// Do not allow the exporting of passwords.
@@ -98,12 +117,15 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 		}
 	}
 
-	artifact, err := client.GetArtifact(release.ArtifactID)
-	if err != nil && err != controller.ErrNotFound {
-		return fmt.Errorf("error retrieving artifact: %s", err)
-	} else if err == nil {
-		if err := tw.WriteJSON("artifact.json", artifact); err != nil {
-			return fmt.Errorf("error exporting artifact: %s", err)
+	var artifact *ct.Artifact
+	if artifactID := release.ImageArtifactID(); artifactID != "" {
+		artifact, err = client.GetArtifact(artifactID)
+		if err != nil && err != controller.ErrNotFound {
+			return fmt.Errorf("error retrieving artifact: %s", err)
+		} else if err == nil {
+			if err := tw.WriteJSON("artifact.json", artifact); err != nil {
+				return fmt.Errorf("error exporting artifact: %s", err)
+			}
 		}
 	}
 
@@ -116,25 +138,78 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 		}
 	}
 
-	var bar *pb.ProgressBar
-	if !args.Bool["--quiet"] && term.IsTerminal(os.Stderr.Fd()) {
-		bar = pb.New(0)
-		bar.SetUnits(pb.U_BYTES)
-		bar.ShowBar = false
-		bar.ShowSpeed = true
-		bar.Output = os.Stderr
-		bar.Start()
-		defer bar.Finish()
+	// if the release was deployed via docker-receive, pull the docker
+	// image and add it to the export using "docker save"
+	if release.IsDockerReceiveDeploy() && artifact != nil {
+		cluster, err := getCluster()
+		if err != nil {
+			return err
+		}
+		host, err := cluster.DockerPushHost()
+		if err != nil {
+			return err
+		}
+
+		// the artifact will have an internal discoverd URL which will
+		// not work if the Docker daemon is outside the cluster, so
+		// generate a reference using the configured DockerPushURL
+		repo := artifact.Meta["docker-receive.repository"]
+		digest := artifact.Meta["docker-receive.digest"]
+		ref := fmt.Sprintf("%s/%s@%s", host, repo, digest)
+
+		// pull the Docker image
+		cmd := exec.Command("docker", "pull", ref)
+		log.Printf("flynn: pulling Docker image with %q", strings.Join(cmd.Args, " "))
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+
+		// give the image an explicit, random tag so that "docker save"
+		// will export an image that we can reference on import (just
+		// using the digest is not enough as "docker inspect" only
+		// works with tags)
+		tag := fmt.Sprintf("%s:flynn-export-%s", repo, random.String(8))
+		if out, err := exec.Command("docker", "tag", "--force", ref, tag).CombinedOutput(); err != nil {
+			return fmt.Errorf("error tagging docker image: %s: %q", err, out)
+		}
+		defer exec.Command("docker", "rmi", tag).Run()
+
+		if err := dockerSave(tag, tw, bar); err != nil {
+			return fmt.Errorf("error exporting docker image: %s", err)
+		}
+
+		// add the tag to the backup so we know how to reference the
+		// image once it has been imported
+		config := struct {
+			Tag string `json:"tag"`
+		}{tag}
+		if err := tw.WriteJSON("docker-image.json", &config); err != nil {
+			return fmt.Errorf("error exporting docker image: %s", err)
+		}
 	}
 
-	if slug, ok := release.Env["SLUG_URL"]; ok {
+	// expect releases deployed via git to have a slug as their first file
+	// artifact, and legacy releases to have SLUG_URL set
+	var slugURL string
+	if release.IsGitDeploy() && len(release.FileArtifactIDs()) > 0 {
+		slugArtifact, err := client.GetArtifact(release.FileArtifactIDs()[0])
+		if err != nil && err != controller.ErrNotFound {
+			return fmt.Errorf("error retrieving slug artifact: %s", err)
+		} else if err == nil {
+			slugURL = slugArtifact.URI
+		}
+	} else if u, ok := release.Env["SLUG_URL"]; ok {
+		slugURL = u
+	}
+	if slugURL != "" {
 		reqR, reqW := io.Pipe()
 		config := runConfig{
 			App:        mustApp(),
 			Release:    release.ID,
 			DisableLog: true,
-			Entrypoint: []string{"curl"},
-			Args:       []string{"--include", "--raw", slug},
+			Args:       []string{"curl", "--include", "--location", "--raw", slugURL},
 			Stdout:     reqW,
 			Stderr:     ioutil.Discard,
 		}
@@ -146,11 +221,19 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 				shutdown.Fatalf("error retrieving slug: %s", err)
 			}
 		}()
-		res, err := http.ReadResponse(bufio.NewReader(reqR), nil)
-		if err != nil {
-			return fmt.Errorf("error reading slug response: %s", err)
+		req := bufio.NewReader(reqR)
+		var res *http.Response
+		maxRedirects := 5
+		for i := 0; i < maxRedirects; i++ {
+			res, err = http.ReadResponse(req, nil)
+			if err != nil {
+				return fmt.Errorf("error reading slug response: %s", err)
+			}
+			if res.StatusCode != http.StatusFound {
+				break
+			}
 		}
-		if res.StatusCode != 200 {
+		if res.StatusCode != http.StatusOK {
 			return fmt.Errorf("unexpected status getting slug: %d", res.StatusCode)
 		}
 		length, err := strconv.Atoi(res.Header.Get("Content-Length"))
@@ -167,23 +250,34 @@ func runExport(args *docopt.Args, client *controller.Client) error {
 		res.Body.Close()
 	}
 
-	if config, err := getAppPgRunConfig(client); err == nil {
-		configPgDump(config)
-		if err := tw.WriteCommandOutput(client, "postgres.dump", config.App, &ct.NewJob{
-			ReleaseID:  config.Release,
-			Entrypoint: config.Entrypoint,
-			Cmd:        config.Args,
-			Env:        config.Env,
-			DisableLog: config.DisableLog,
+	if pgConfig, err := getAppPgRunConfig(client); err == nil {
+		configPgDump(pgConfig)
+		if err := tw.WriteCommandOutput(client, "postgres.dump", pgConfig.App, &ct.NewJob{
+			ReleaseID:  pgConfig.Release,
+			Args:       pgConfig.Args,
+			Env:        pgConfig.Env,
+			DisableLog: pgConfig.DisableLog,
 		}); err != nil {
 			return fmt.Errorf("error creating postgres dump: %s", err)
+		}
+	}
+
+	if mysqlConfig, err := getAppMysqlRunConfig(client); err == nil {
+		configMysqlDump(mysqlConfig)
+		if err := tw.WriteCommandOutput(client, "mysql.dump", mysqlConfig.App, &ct.NewJob{
+			ReleaseID:  mysqlConfig.Release,
+			Args:       mysqlConfig.Args,
+			Env:        mysqlConfig.Env,
+			DisableLog: mysqlConfig.DisableLog,
+		}); err != nil {
+			return fmt.Errorf("error creating mysql dump: %s", err)
 		}
 	}
 
 	return nil
 }
 
-func runImport(args *docopt.Args, client *controller.Client) error {
+func runImport(args *docopt.Args, client controller.Client) error {
 	var src io.Reader = os.Stdin
 	if filename := args.String["--file"]; filename != "" {
 		f, err := os.Open(filename)
@@ -196,13 +290,20 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 	tr := tar.NewReader(src)
 
 	var (
-		app        *ct.App
-		release    *ct.Release
-		artifact   *ct.Artifact
-		formation  *ct.Formation
-		routes     []router.Route
-		slug       io.Reader
+		app           *ct.App
+		release       *ct.Release
+		imageArtifact *ct.Artifact
+		formation     *ct.Formation
+		routes        []router.Route
+		slug          io.Reader
+		dockerImage   struct {
+			config struct {
+				Tag string `json:"tag"`
+			}
+			archive io.Reader
+		}
 		pgDump     io.Reader
+		mysqlDump  io.Reader
 		uploadSize int64
 	)
 	numResources := 0
@@ -229,13 +330,13 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 				return fmt.Errorf("error decoding release: %s", err)
 			}
 			release.ID = ""
-			release.ArtifactID = ""
+			release.ArtifactIDs = nil
 		case "artifact.json":
-			artifact = &ct.Artifact{}
-			if err := json.NewDecoder(tr).Decode(artifact); err != nil {
-				return fmt.Errorf("error decoding artifact: %s", err)
+			imageArtifact = &ct.Artifact{}
+			if err := json.NewDecoder(tr).Decode(imageArtifact); err != nil {
+				return fmt.Errorf("error decoding image artifact: %s", err)
 			}
-			artifact.ID = ""
+			imageArtifact.ID = ""
 		case "formation.json":
 			formation = &ct.Formation{}
 			if err := json.NewDecoder(tr).Decode(formation); err != nil {
@@ -266,6 +367,25 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 			}
 			slug = f
 			uploadSize += header.Size
+		case "docker-image.json":
+			if err := json.NewDecoder(tr).Decode(&dockerImage.config); err != nil {
+				return fmt.Errorf("error decoding docker image json: %s", err)
+			}
+		case "docker-image.tar":
+			f, err := ioutil.TempFile("", "docker-image.tar")
+			if err != nil {
+				return fmt.Errorf("error creating docker image tempfile: %s", err)
+			}
+			defer f.Close()
+			defer os.Remove(f.Name())
+			if _, err := io.Copy(f, tr); err != nil {
+				return fmt.Errorf("error reading docker image: %s", err)
+			}
+			if _, err := f.Seek(0, os.SEEK_SET); err != nil {
+				return fmt.Errorf("error seeking docker image tempfile: %s", err)
+			}
+			dockerImage.archive = f
+			uploadSize += header.Size
 		case "postgres.dump":
 			f, err := ioutil.TempFile("", "postgres.dump")
 			if err != nil {
@@ -280,6 +400,21 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 				return fmt.Errorf("error seeking db tempfile: %s", err)
 			}
 			pgDump = f
+			uploadSize += header.Size
+		case "mysql.dump":
+			f, err := ioutil.TempFile("", "mysql.dump")
+			if err != nil {
+				return fmt.Errorf("error creating db tempfile: %s", err)
+			}
+			defer f.Close()
+			defer os.Remove(f.Name())
+			if _, err := io.Copy(f, tr); err != nil {
+				return fmt.Errorf("error reading db dump: %s", err)
+			}
+			if _, err := f.Seek(0, os.SEEK_SET); err != nil {
+				return fmt.Errorf("error seeking db tempfile: %s", err)
+			}
+			mysqlDump = f
 			uploadSize += header.Size
 		}
 	}
@@ -337,6 +472,37 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 		}
 	}
 
+	if mysqlDump != nil && release != nil {
+		res, err := client.ProvisionResource(&ct.ResourceReq{
+			ProviderID: "mysql",
+			Apps:       []string{app.ID},
+		})
+		if err != nil {
+			return fmt.Errorf("error provisioning mysql resource: %s", err)
+		}
+		numResources++
+
+		if release.Env == nil {
+			release.Env = make(map[string]string, len(res.Env))
+		}
+		for k, v := range res.Env {
+			release.Env[k] = v
+		}
+
+		config, err := getMysqlRunConfig(client, app.ID, release)
+		if err != nil {
+			return fmt.Errorf("error getting mysql config: %s", err)
+		}
+		config.Stdin = mysqlDump
+		if bar != nil {
+			config.Stdin = bar.NewProxyReader(config.Stdin)
+		}
+		config.Exit = false
+		if err := mysqlRestore(client, config); err != nil {
+			return fmt.Errorf("error restoring mysql database: %s", err)
+		}
+	}
+
 	if release != nil && release.Env["FLYNN_REDIS"] != "" {
 		res, err := client.ProvisionResource(&ct.ResourceReq{
 			ProviderID: "redis",
@@ -355,7 +521,7 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 		}
 	}
 
-	uploadSlug := release != nil && release.Env["SLUG_URL"] != "" && artifact != nil && slug != nil
+	uploadSlug := release != nil && imageArtifact != nil && slug != nil
 
 	if uploadSlug {
 		// Use current slugrunner as the artifact
@@ -363,28 +529,64 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 		if err != nil {
 			return fmt.Errorf("unable to retrieve gitreceive release: %s", err)
 		}
-		artifact = &ct.Artifact{
-			Type: "docker",
-			URI:  gitreceiveRelease.Env["SLUGRUNNER_IMAGE_URI"],
+		if id, ok := gitreceiveRelease.Env["SLUGRUNNER_IMAGE_ID"]; ok {
+			imageArtifact, err = client.GetArtifact(id)
+			if err != nil {
+				return fmt.Errorf("unable to get slugrunner image artifact: %s", err)
+			}
+		} else if uri, ok := gitreceiveRelease.Env["SLUGRUNNER_IMAGE_URI"]; ok {
+			imageArtifact = &ct.Artifact{
+				Type: host.ArtifactTypeDocker,
+				URI:  uri,
+			}
+		} else {
+			return fmt.Errorf("gitreceive env missing slug runner image")
 		}
-		if artifact.URI == "" {
-			return fmt.Errorf("gitreceive env missing SLUGRUNNER_IMAGE_URI")
-		}
-		release.Env["SLUG_URL"] = fmt.Sprintf("http://blobstore.discoverd/%s.tgz", random.UUID())
 	}
 
-	if artifact != nil {
-		if err := client.CreateArtifact(artifact); err != nil {
-			return fmt.Errorf("error creating artifact: %s", err)
+	if dockerImage.config.Tag != "" && dockerImage.archive != nil {
+		// load the docker image into the Docker daemon
+		cmd := exec.Command("docker", "load")
+		cmd.Stdin = dockerImage.archive
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("error running docker load: %s: %q", err, out)
 		}
-		release.ArtifactID = artifact.ID
+
+		// use the tag from the config (which will now be applied to
+		// the loaded image) to push the image to docker-receive
+		cluster, err := getCluster()
+		if err != nil {
+			return err
+		}
+		host, err := cluster.DockerPushHost()
+		if err != nil {
+			return err
+		}
+		tag := fmt.Sprintf("%s/%s:latest", host, app.Name)
+		if out, err := exec.Command("docker", "tag", "--force", dockerImage.config.Tag, tag).CombinedOutput(); err != nil {
+			return fmt.Errorf("error tagging docker image: %s: %q", err, out)
+		}
+
+		artifact, err := dockerPush(client, app.Name, tag)
+		if err != nil {
+			return fmt.Errorf("error pushing docker image: %s", err)
+		}
+
+		release.ArtifactIDs = []string{artifact.ID}
+	} else if imageArtifact != nil {
+		if imageArtifact.ID == "" {
+			if err := client.CreateArtifact(imageArtifact); err != nil {
+				return fmt.Errorf("error creating image artifact: %s", err)
+			}
+		}
+		release.ArtifactIDs = []string{imageArtifact.ID}
 	}
 
 	if release != nil {
 		for t, proc := range release.Processes {
 			for i, port := range proc.Ports {
-				if port.Service != nil && port.Service.Name == oldName+"-web" {
-					proc.Ports[i].Service.Name = app.Name + "-web"
+				if port.Service != nil && strings.HasPrefix(port.Service.Name, oldName) {
+					proc.Ports[i].Service.Name = strings.Replace(port.Service.Name, oldName, app.Name, 1)
 				}
 			}
 			release.Processes[t] = proc
@@ -398,12 +600,12 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 	}
 
 	if uploadSlug {
+		slugURI := fmt.Sprintf("http://blobstore.discoverd/%s/slug.tgz", random.UUID())
 		config := runConfig{
 			App:        app.ID,
 			Release:    release.ID,
 			DisableLog: true,
-			Entrypoint: []string{"curl"},
-			Args:       []string{"--request", "PUT", "--upload-file", "-", release.Env["SLUG_URL"]},
+			Args:       []string{"curl", "--request", "PUT", "--upload-file", "-", slugURI},
 			Stdin:      slug,
 			Stdout:     ioutil.Discard,
 			Stderr:     ioutil.Discard,
@@ -413,6 +615,25 @@ func runImport(args *docopt.Args, client *controller.Client) error {
 		}
 		if err := runJob(client, config); err != nil {
 			return fmt.Errorf("error uploading slug: %s", err)
+		}
+		slugArtifact := &ct.Artifact{
+			Type: host.ArtifactTypeFile,
+			URI:  slugURI,
+		}
+		if err := client.CreateArtifact(slugArtifact); err != nil {
+			return fmt.Errorf("error creating slug artifact: %s", err)
+		}
+		release.ID = ""
+		release.ArtifactIDs = append(release.ArtifactIDs, slugArtifact.ID)
+		if release.Meta == nil {
+			release.Meta = make(map[string]string, 1)
+		}
+		release.Meta["git"] = "true"
+		if err := client.CreateRelease(release); err != nil {
+			return fmt.Errorf("error creating release: %s", err)
+		}
+		if err := client.SetAppRelease(app.ID, release.ID); err != nil {
+			return fmt.Errorf("error setting app release: %s", err)
 		}
 	}
 

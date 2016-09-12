@@ -85,7 +85,7 @@ prune_slugignore() {
     paths=("${paths[@]}" ${build_root}/${glob})
   done
   echo_title "Deleting ${#paths[@]} files matching .slugignore patterns."
-  rm -f ${paths[@]}
+  rm -rf ${paths[@]}
   shopt -u nullglob
 }
 
@@ -104,7 +104,7 @@ if [[ -f "${env_cookie}" ]]; then
 fi
 
 if [[ -n "${BUILD_CACHE_URL}" ]]; then
-  curl "${BUILD_CACHE_URL}" | tar --extract --gunzip --directory "${cache_root}" &>/dev/null || true
+  curl --location "${BUILD_CACHE_URL}" | tar --extract --gunzip --directory "${cache_root}" &>/dev/null || true
 fi
 
 # In heroku, there are two separate directories, and some

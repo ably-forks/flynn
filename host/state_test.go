@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/host/types"
+	. "github.com/flynn/go-check"
 )
 
 func Test(t *testing.T) { TestingT(t) }
@@ -47,4 +47,15 @@ func (S) TestStatePersistRestore(c *C) {
 	if job.HostID != hostID {
 		c.Errorf("expected job.HostID to equal %s, got %s", hostID, job.HostID)
 	}
+}
+
+func (S) TestStateDuplicateID(c *C) {
+	workdir := c.MkDir()
+	hostID := "abc123"
+	state := NewState(hostID, filepath.Join(workdir, "host-state-db"))
+	c.Assert(state.OpenDB(), IsNil)
+	defer state.CloseDB()
+
+	c.Assert(state.AddJob(&host.Job{ID: "a"}), IsNil)
+	c.Assert(state.AddJob(&host.Job{ID: "a"}), Equals, ErrJobExists)
 }

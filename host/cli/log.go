@@ -8,14 +8,14 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
 	Register("log", runLog, `
-usage: flynn-host log [--init] [-f|--follow] [--lines=<number>] ID
+usage: flynn-host log [--init] [-f|--follow] [--lines=<number>] [--split-stderr] ID
 
 Get the logs of a job`)
 }
@@ -35,6 +35,11 @@ func runLog(args *docopt.Args, client *cluster.Client) error {
 		}
 	}
 
+	stderr := os.Stdout
+	if args.Bool["--split-stderr"] {
+		stderr = os.Stderr
+	}
+
 	if lines > 0 {
 		stdoutR, stdoutW := io.Pipe()
 		stderrR, stderrW := io.Pipe()
@@ -44,7 +49,7 @@ func runLog(args *docopt.Args, client *cluster.Client) error {
 			stdoutW.Close()
 			stderrW.Close()
 		}()
-		tailLogs(stdoutR, stderrR, lines, os.Stdout, os.Stderr)
+		tailLogs(stdoutR, stderrR, lines, os.Stdout, stderr)
 		return nil
 	}
 	return getLog(
@@ -54,7 +59,7 @@ func runLog(args *docopt.Args, client *cluster.Client) error {
 		args.Bool["-f"] || args.Bool["--follow"],
 		args.Bool["--init"],
 		os.Stdout,
-		os.Stderr,
+		stderr,
 	)
 }
 
@@ -76,7 +81,7 @@ func getLog(hostID, jobID string, client *cluster.Client, follow, init bool, std
 	attachClient, err := hostClient.Attach(attachReq, false)
 	if err != nil {
 		switch err {
-		case host.ErrJobNotRunning:
+		case host.ErrJobNotRunning, host.ErrAttached:
 			return nil
 		case cluster.ErrWouldWait:
 			return errors.New("no such job")

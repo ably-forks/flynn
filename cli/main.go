@@ -12,12 +12,12 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/units"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/go-units"
 	cfg "github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/controller/client"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/version"
+	"github.com/flynn/go-docopt"
 )
 
 var (
@@ -56,10 +56,13 @@ Commands:
 	meta        manage app metadata
 	route       manage routes
 	pg          manage postgres database
+	mysql       manage mysql database
+	redis       manage redis database
 	provider    manage resource providers
+	docker      deploy Docker images to a Flynn cluster
 	remote      manage git remotes
 	resource    provision a new resource
-	release     add a docker image release
+	release     manage app releases
 	deployment  list deployments
 	export      export app data
 	import      create app from exported data
@@ -138,7 +141,7 @@ var commands = make(map[string]*command)
 
 func register(cmd string, f interface{}, usage string) *command {
 	switch f.(type) {
-	case func(*docopt.Args, *controller.Client) error, func(*docopt.Args) error, func() error, func():
+	case func(*docopt.Args, controller.Client) error, func(*docopt.Args) error, func() error, func():
 	default:
 		panic(fmt.Sprintf("invalid command function %s '%T'", cmd, f))
 	}
@@ -162,7 +165,7 @@ func runCommand(name string, args []string) (err error) {
 	}
 
 	switch f := cmd.f.(type) {
-	case func(*docopt.Args, *controller.Client) error:
+	case func(*docopt.Args, controller.Client) error:
 		// create client and run command
 		client, err := getClusterClient()
 		if err != nil {
@@ -205,7 +208,7 @@ func readConfig() (err error) {
 	return
 }
 
-func getClusterClient() (*controller.Client, error) {
+func getClusterClient() (controller.Client, error) {
 	cluster, err := getCluster()
 	if err != nil {
 		return nil, err

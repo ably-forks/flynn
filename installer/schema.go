@@ -2,18 +2,19 @@ package installer
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/aws"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/cloudformation"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/gen/ec2"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/cznic/ql"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/digitalocean/godo"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/crypto/ssh"
+	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/awslabs/aws-sdk-go/gen/cloudformation"
+	"github.com/awslabs/aws-sdk-go/gen/ec2"
+	"github.com/cznic/ql"
+	"github.com/digitalocean/godo"
 	"github.com/flynn/flynn/pkg/azure"
 	"github.com/flynn/flynn/pkg/knownhosts"
 	"github.com/flynn/flynn/pkg/sshkeygen"
+	"golang.org/x/crypto/ssh"
 )
 
 type Cluster interface {
@@ -85,9 +86,8 @@ type AzureCluster struct {
 	Size           string     `json:"size"`
 	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
 
-	base        *BaseCluster
-	client      *azure.Client
-	startScript string
+	base   *BaseCluster
+	client *azure.Client
 }
 
 type DigitalOceanDroplet struct {
@@ -111,15 +111,14 @@ type SSHCluster struct {
 	Targets     []*TargetServer `json:"targets" ql:"-"`
 	TargetsJSON string          `json:"-"`
 
-	base       *BaseCluster
-	sshAuth    []ssh.AuthMethod
 	knownHosts *knownhosts.KnownHosts
+	base       *BaseCluster
 }
 
 type BaseCluster struct {
 	ID                  string            `json:"id"`
 	CredentialID        string            `json:"credential_id"`
-	Type                string            `json:"type"`                    // enum(aws, digital_ocean, azure)
+	Type                string            `json:"type"`                    // enum(aws, digital_ocean, azure, ssh)
 	State               string            `json:"state" ql:"index xState"` // enum(starting, error, running, deleting)
 	Name                string            `json:"name" ql:"-"`
 	NumInstances        int64             `json:"num_instances"`
@@ -134,13 +133,20 @@ type BaseCluster struct {
 	DiscoveryToken      string            `json:"discovery_token"`
 	InstanceIPs         []string          `json:"instance_ips,omitempty" ql:"-"`
 	DeletedAt           *time.Time        `json:"deleted_at,omitempty"`
+	HasBackup           bool              `json:"has_backup,omitempty" ql:"-"`
 
+	backupPath        string
+	backup            *ClusterBackupReceiver
+	backupMtx         sync.RWMutex
+	oldDomain         string
 	credential        *Credential
 	installer         *Installer
 	pendingPrompt     *Prompt
-	done              bool
+	promptMtx         sync.Mutex
+	aborted           bool
 	passwordPromptMtx sync.Mutex
 	passwordCache     map[string]string
+	stateMtx          sync.RWMutex
 }
 
 type InstanceIPs struct {
@@ -164,15 +170,29 @@ type Event struct {
 
 type Prompt struct {
 	ID        string     `json:"id"`
-	Type      string     `json:"type,omitempty"`
+	Type      PromptType `json:"type,omitempty"`
 	Message   string     `json:"message,omitempty"`
 	Yes       bool       `json:"yes,omitempty"`
 	Input     string     `json:"input,omitempty"`
+	File      io.Reader  `json:"-" ql:"-"`
+	FileSize  int        `json:"-" ql:"-"`
 	Resolved  bool       `json:"resolved,omitempty"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 	resChan   chan *Prompt
+	errChan   chan error
 	cluster   *BaseCluster
 }
+
+type PromptType string
+
+var (
+	PromptTypeYesNo          PromptType = "yes_no"
+	PromptTypeChoice         PromptType = "choice"
+	PromptTypeCredential     PromptType = "credential"
+	PromptTypeInput          PromptType = "input"
+	PromptTypeProtectedInput PromptType = "protected_input"
+	PromptTypeFile           PromptType = "file"
+)
 
 func (i *Installer) updatedbColumns(in interface{}, t string) error {
 	s, err := ql.StructSchema(in)

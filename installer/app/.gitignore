@@ -3,3 +3,8 @@
 /compiler
 /.gitrepos
 /node_modules
+/erb.rb
+/scss.js
+/transformer.js
+/.bundle
+/vendor/bundle

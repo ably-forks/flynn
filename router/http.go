@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/discoverd/cache"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/ctxhelper"
@@ -21,6 +20,8 @@ import (
 	"github.com/flynn/flynn/pkg/tlsconfig"
 	"github.com/flynn/flynn/router/proxy"
 	"github.com/flynn/flynn/router/types"
+	"golang.org/x/net/context"
+	"golang.org/x/net/http2"
 )
 
 type HTTPListener struct {
@@ -52,17 +53,25 @@ type HTTPListener struct {
 
 type DiscoverdClient interface {
 	Service(string) discoverd.Service
+	AddService(string, *discoverd.ServiceConfig) error
 }
 
 func (s *HTTPListener) Close() error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if s.closed {
+		return nil
+	}
 	s.stopSync()
 	for _, service := range s.services {
 		service.sc.Close()
 	}
-	s.listener.Close()
-	s.tlsListener.Close()
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	if s.tlsListener != nil {
+		s.tlsListener.Close()
+	}
 	s.closed = true
 	return nil
 }
@@ -93,11 +102,12 @@ func (s *HTTPListener) Start() error {
 	}
 
 	if err := s.startSync(ctx); err != nil {
+		s.Close()
 		return err
 	}
 
 	if err := s.startListen(); err != nil {
-		s.stopSync()
+		s.Close()
 		return err
 	}
 
@@ -199,6 +209,51 @@ func (s *HTTPListener) RemoveRoute(id string) error {
 	return s.ds.Remove(id)
 }
 
+func (s *HTTPListener) AddCert(cert *router.Certificate) error {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.ds.AddCert(cert)
+}
+
+func (s *HTTPListener) GetCert(id string) (*router.Certificate, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.GetCert(id)
+}
+
+func (s *HTTPListener) GetCertRoutes(id string) ([]*router.Route, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.ListCertRoutes(id)
+}
+
+func (s *HTTPListener) GetCerts() ([]*router.Certificate, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	return s.ds.ListCerts()
+}
+
+func (s *HTTPListener) RemoveCert(id string) error {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.ds.RemoveCert(id)
+}
+
 type httpSyncHandler struct {
 	l *HTTPListener
 }
@@ -216,15 +271,15 @@ func (h *httpSyncHandler) Current() map[string]struct{} {
 func (h *httpSyncHandler) Set(data *router.Route) error {
 	route := data.HTTPRoute()
 	r := &httpRoute{HTTPRoute: route}
+	cert := r.Certificate
 
-	if r.TLSCert != "" && r.TLSKey != "" {
-		kp, err := tls.X509KeyPair([]byte(r.TLSCert), []byte(r.TLSKey))
+	if cert != nil && cert.Cert != "" && cert.Key != "" {
+		kp, err := tls.X509KeyPair([]byte(cert.Cert), []byte(cert.Key))
 		if err != nil {
 			return err
 		}
 		r.keypair = &kp
-		r.TLSCert = ""
-		r.TLSKey = ""
+		r.Certificate = nil
 	}
 
 	h.l.mtx.Lock()
@@ -247,14 +302,21 @@ func (h *httpSyncHandler) Set(data *router.Route) error {
 		if err != nil {
 			return err
 		}
+
 		service = &httpService{
 			name: r.Service,
 			sc:   sc,
-			rp:   proxy.NewReverseProxy(sc.Addrs, h.l.cookieKey, r.Sticky),
 		}
 		h.l.services[r.Service] = service
 	}
 	service.refs++
+	var bf proxy.BackendListFunc
+	if r.Leader {
+		bf = service.sc.LeaderAddr
+	} else {
+		bf = service.sc.Addrs
+	}
+	r.rp = proxy.NewReverseProxy(bf, h.l.cookieKey, r.Sticky, logger)
 	r.service = service
 	h.l.routes[data.ID] = r
 	if data.Path == "/" {
@@ -338,6 +400,7 @@ func (s *HTTPListener) listenAndServeTLS() error {
 	tlsConfig := tlsconfig.SecureCiphers(&tls.Config{
 		GetCertificate: certForHandshake,
 		Certificates:   []tls.Certificate{s.keypair},
+		NextProtos:     []string{http2.NextProtoTLS, "h2-14"},
 	})
 
 	l, err := listenFunc("tcp4", s.TLSAddr)
@@ -346,12 +409,25 @@ func (s *HTTPListener) listenAndServeTLS() error {
 	}
 	s.tlsListener = tls.NewListener(l, tlsConfig)
 
+	handler := fwdProtoHandler{
+		Handler: s,
+		Proto:   "https",
+		Port:    mustPortFromAddr(s.tlsListener.Addr().String()),
+	}
+	http2Server := &http2.Server{}
+	http2Handler := func(hs *http.Server, c *tls.Conn, h http.Handler) {
+		http2Server.ServeConn(c, &http2.ServeConnOpts{
+			Handler:    handler,
+			BaseConfig: hs,
+		})
+	}
+
 	server := &http.Server{
-		Addr: s.tlsListener.Addr().String(),
-		Handler: fwdProtoHandler{
-			Handler: s,
-			Proto:   "https",
-			Port:    mustPortFromAddr(s.tlsListener.Addr().String()),
+		Addr:    s.tlsListener.Addr().String(),
+		Handler: handler,
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){
+			http2.NextProtoTLS: http2Handler,
+			"h2-14":            http2Handler,
 		},
 	}
 
@@ -381,11 +457,6 @@ func (s *HTTPListener) findRoute(host string, path string) *httpRoute {
 	return nil
 }
 
-func failAndClose(w http.ResponseWriter, code int) {
-	w.Header().Set("Connection", "close")
-	fail(w, code)
-}
-
 func fail(w http.ResponseWriter, code int) {
 	msg := []byte(http.StatusText(code) + "\n")
 	w.Header().Set("Content-Length", strconv.Itoa(len(msg)))
@@ -402,7 +473,7 @@ func (s *HTTPListener) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.service.ServeHTTP(ctx, w, req)
+	r.ServeHTTP(ctx, w, req)
 }
 
 // A domain served by a listener, associated TLS certs,
@@ -412,6 +483,7 @@ type httpRoute struct {
 
 	keypair *tls.Certificate
 	service *httpService
+	rp      *proxy.ReverseProxy
 }
 
 // A service definition: name, and set of backends.
@@ -419,16 +491,14 @@ type httpService struct {
 	name string
 	sc   cache.ServiceCache
 	refs int
-
-	rp *proxy.ReverseProxy
 }
 
-func (s *httpService) ServeHTTP(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+func (r *httpRoute) ServeHTTP(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	start, _ := ctxhelper.StartTimeFromContext(ctx)
 	req.Header.Set("X-Request-Start", strconv.FormatInt(start.UnixNano()/int64(time.Millisecond), 10))
 	req.Header.Set("X-Request-Id", random.UUID())
 
-	s.rp.ServeHTTP(w, req)
+	r.rp.ServeHTTP(ctx, w, req)
 }
 
 func mustPortFromAddr(addr string) string {

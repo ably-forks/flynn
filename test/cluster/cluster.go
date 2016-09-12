@@ -10,7 +10,6 @@ import (
 	"os/user"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -33,23 +32,18 @@ type BootConfig struct {
 	Kernel   string
 	Network  string
 	NatIface string
-	Backend  string
 }
 
 type Cluster struct {
-	ID            string        `json:"id"`
-	Instances     instances     `json:"instances"`
-	BackoffPeriod time.Duration `json:"backoff_period"`
-	ClusterDomain string        `json:"cluster_domain"`
-	ControllerPin string        `json:"controller_pin"`
-	ControllerKey string        `json:"controller_key"`
-	RouterIP      string        `json:"router_ip"`
+	ID            string    `json:"id"`
+	Instances     instances `json:"instances"`
+	ClusterDomain string    `json:"cluster_domain"`
+	ControllerPin string    `json:"controller_pin"`
+	ControllerKey string    `json:"controller_key"`
+	RouterIP      string    `json:"router_ip"`
 
 	defaultInstances []*Instance
 	releaseInstances []*Instance
-
-	discMtx sync.Mutex
-	disc    *discoverd.Client
 
 	bc     BootConfig
 	vm     *VMManager
@@ -75,15 +69,6 @@ func (i instances) Get(id string) (*Instance, error) {
 		}
 	}
 	return nil, fmt.Errorf("no such host: %s", id)
-}
-
-func (c *Cluster) discoverdClient(ip string) *discoverd.Client {
-	c.discMtx.Lock()
-	defer c.discMtx.Unlock()
-	if c.disc == nil {
-		c.disc = discoverd.NewClientWithURL(fmt.Sprintf("http://%s:1111", ip))
-	}
-	return c.disc
 }
 
 type Streams struct {
@@ -130,7 +115,7 @@ func (c *Cluster) BuildFlynn(rootFS, commit string, merge bool, runTests bool) (
 		Kernel: c.bc.Kernel,
 		User:   uid,
 		Group:  gid,
-		Memory: "4096",
+		Memory: "16384",
 		Cores:  8,
 		Drives: map[string]*VMDrive{
 			"hda": {FS: rootFS, COW: true, Temp: false},
@@ -250,12 +235,7 @@ func (c *Cluster) RemoveHost(id string) error {
 	c.log("removing host", id)
 
 	// ssh into the host and tell the flynn-host daemon to stop
-	var cmd string
-	switch c.bc.Backend {
-	case "libvirt-lxc":
-		// manually kill containers after stopping flynn-host due to https://github.com/flynn/flynn/issues/1177
-		cmd = "sudo start-stop-daemon --stop --pidfile /var/run/flynn-host.pid --retry 15 && (virsh -c lxc:/// list --name | xargs -L 1 virsh -c lxc:/// destroy || true)"
-	}
+	cmd := "sudo start-stop-daemon --stop --pidfile /var/run/flynn-host.pid --retry 15"
 	return inst.Run(cmd, nil)
 }
 
@@ -271,11 +251,11 @@ func (c *Cluster) startVMs(typ ClusterType, rootFS string, count int, initial bo
 
 	instances := make([]*Instance, count)
 	for i := 0; i < count; i++ {
-		memory := "2048"
+		memory := "8192"
 		if initial && i == 0 {
 			// give the first instance more memory as that is where
 			// the test binary runs, and the tests use a lot of memory
-			memory = "8192"
+			memory = "16384"
 		}
 		inst, err := c.vm.NewInstance(&VMConfig{
 			Kernel: c.bc.Kernel,
@@ -307,10 +287,6 @@ func (c *Cluster) startVMs(typ ClusterType, rootFS string, count int, initial bo
 }
 
 func (c *Cluster) startFlynnHost(inst *Instance, peerInstances []*Instance) error {
-	tmpl, ok := flynnHostScripts[c.bc.Backend]
-	if !ok {
-		return fmt.Errorf("unknown host backend: %s", c.bc.Backend)
-	}
 	peers := make([]string, 0, len(peerInstances))
 	for _, inst := range peerInstances {
 		if !inst.initial {
@@ -324,7 +300,7 @@ func (c *Cluster) startFlynnHost(inst *Instance, peerInstances []*Instance) erro
 		IP:    inst.IP,
 		Peers: strings.Join(peers, ","),
 	}
-	tmpl.Execute(&script, data)
+	flynnHostScript.Execute(&script, data)
 	c.logf("Starting flynn-host on %s [id: %s]\n", inst.IP, inst.ID)
 	return inst.Run("bash", &Streams{Stdin: &script, Stdout: c.out, Stderr: os.Stderr})
 }
@@ -367,6 +343,7 @@ func (c *Cluster) CLIConfig() (*config.Config, error) {
 		Name:          "default",
 		ControllerURL: "https://controller." + c.ClusterDomain,
 		GitURL:        "https://git." + c.ClusterDomain,
+		DockerPushURL: "https://docker." + c.ClusterDomain,
 		Key:           c.ControllerKey,
 		TLSPin:        c.ControllerPin,
 	}
@@ -470,8 +447,7 @@ type hostScriptData struct {
 	Peers string
 }
 
-var flynnHostScripts = map[string]*template.Template{
-	"libvirt-lxc": template.Must(template.New("flynn-host-libvirt").Parse(`
+var flynnHostScript = template.Must(template.New("flynn-host").Parse(`
 if [[ -f /usr/local/bin/debug-info.sh ]]; then
   /usr/local/bin/debug-info.sh &>/tmp/debug-info.log &
 fi
@@ -489,11 +465,10 @@ sudo start-stop-daemon \
   --id {{ .ID }} \
   --external-ip {{ .IP }} \
   --force \
-  --backend libvirt-lxc \
   --peer-ips {{ .Peers }} \
+  --max-job-concurrency 8 \
   &>/tmp/flynn-host.log
-`[1:])),
-}
+`[1:]))
 
 type bootstrapMsg struct {
 	Id    string          `json:"id"`
@@ -510,7 +485,6 @@ func (c *Cluster) bootstrapLayer1(instances []*Instance) error {
 	inst := instances[0]
 	c.ClusterDomain = fmt.Sprintf("flynn-%s.local", random.String(16))
 	c.ControllerKey = random.String(16)
-	c.BackoffPeriod = 5 * time.Second
 	rd, wr := io.Pipe()
 
 	ips := make([]string, len(instances))
@@ -521,8 +495,8 @@ func (c *Cluster) bootstrapLayer1(instances []*Instance) error {
 	var cmdErr error
 	go func() {
 		command := fmt.Sprintf(
-			"CLUSTER_DOMAIN=%s CONTROLLER_KEY=%s BACKOFF_PERIOD=%fs flynn-host bootstrap --json --min-hosts=%d --peer-ips=%s /etc/flynn-bootstrap.json",
-			c.ClusterDomain, c.ControllerKey, c.BackoffPeriod.Seconds(), len(instances), strings.Join(ips, ","),
+			"CLUSTER_DOMAIN=%s CONTROLLER_KEY=%s flynn-host bootstrap --json --min-hosts=%d --peer-ips=%s /etc/flynn-bootstrap.json",
+			c.ClusterDomain, c.ControllerKey, len(instances), strings.Join(ips, ","),
 		)
 		cmdErr = inst.Run(command, &Streams{Stdout: wr, Stderr: c.out})
 		wr.Close()
@@ -596,9 +570,8 @@ func (c *Cluster) DumpLogs(buildLog *buildlog.Log) {
 			fmt.Sprintf("host-logs-%s.log", inst.ID),
 			inst,
 			"ps faux",
-			"cat /tmp/flynn-host.log",
+			"cat /var/log/flynn/flynn-host.log",
 			"cat /tmp/debug-info.log",
-			"sudo cat /var/log/libvirt/libvirtd.log",
 		)
 	}
 
@@ -625,7 +598,7 @@ func (c *Cluster) DumpLogs(buildLog *buildlog.Log) {
 			fields := strings.Split(job, ":")
 			jobID := fields[2]
 			cmds := []string{
-				fmt.Sprintf("timeout 10s flynn-host inspect %s", jobID),
+				fmt.Sprintf("timeout 10s flynn-host inspect --redact-env BACKEND_S3 %s", jobID),
 				fmt.Sprintf("timeout 10s flynn-host log --init %s", jobID),
 			}
 			if err := run(fmt.Sprintf("%s-%s.log", typ, job), instances[0], cmds...); err != nil {

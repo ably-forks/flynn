@@ -4,6 +4,8 @@ import Config from '../config';
 import LoginModel from '../views/models/login';
 import LoginComponent from '../views/login';
 import InstallCertComponent from '../views/install-cert';
+import ClusterBackupComponent from '../views/cluster-backup';
+import ClusterStatusComponent from '../views/cluster-status';
 
 var MainRouter = Router.createClass({
 	displayName: "routers.main",
@@ -11,7 +13,9 @@ var MainRouter = Router.createClass({
 	routes: [
 		{ path: "", handler: "root" },
 		{ path: "login", handler: "login", auth: false },
-		{ path: "installcert", handler: "installCert", auth: false }
+		{ path: "installcert", handler: "installCert", auth: false },
+		{ path: "backup", handler: "clusterBackup" },
+		{ path: "status", handler: "clusterStatus" }
 	],
 
 	root: function (params) {
@@ -64,6 +68,7 @@ var MainRouter = Router.createClass({
 		var handleSubmit = function (e) {
 			e.preventDefault();
 			this.context.__isCertInstalled().then(function () {
+				Config.unfreezeNav();
 				this.history.navigate("/login", {params: params});
 			}.bind(this));
 		}.bind(this);
@@ -71,8 +76,20 @@ var MainRouter = Router.createClass({
 			React.createElement("section", { className: "panel" },
 				React.createElement(
 					InstallCertComponent, {
-						certURL: Config.API_SERVER.replace("https", "http") + "/cert"
+						certURL: Config.endpoints.cert
 					}))), this.context.el);
+	},
+
+	clusterBackup: function () {
+		React.render(
+			React.createElement(ClusterBackupComponent),
+			this.context.el);
+	},
+
+	clusterStatus: function () {
+		React.render(
+			React.createElement(ClusterStatusComponent),
+			this.context.el);
 	}
 
 });

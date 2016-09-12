@@ -8,7 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
-	matrix "github.com/flynn/flynn/Godeps/_workspace/src/github.com/jvatic/asset-matrix-go"
+	matrix "github.com/jvatic/asset-matrix-go"
 )
 
 func main() {
@@ -27,7 +27,7 @@ func main() {
 			{
 				GitRepo:   "git://github.com/flynn/flynn-dashboard-web-icons.git",
 				GitBranch: "master",
-				GitRef:    "4d190ece9dd31a3a662cf2dc9534151d7675a338",
+				GitRef:    "19649ac60d7da571595d54c6368fe1601bb0b79b",
 				Path:      "assets",
 			},
 			{

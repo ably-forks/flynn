@@ -5,22 +5,33 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/daemon/graphdriver"
-	_ "github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/daemon/graphdriver/aufs"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/reexec"
-	tuf "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-tuf/client"
+	"github.com/docker/docker/cliconfig"
+	"github.com/docker/docker/daemon/events"
+	"github.com/docker/docker/daemon/graphdriver"
+	_ "github.com/docker/docker/daemon/graphdriver/aufs"
+	"github.com/docker/docker/graph"
+	"github.com/docker/docker/opts"
+	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/docker/pkg/reexec"
+	"github.com/docker/docker/pkg/term"
+	"github.com/docker/docker/registry"
 	"github.com/flynn/flynn/pinkerton/layer"
-	"github.com/flynn/flynn/pinkerton/registry"
-	"github.com/flynn/flynn/pinkerton/store"
 	"github.com/flynn/flynn/pkg/tufutil"
 	"github.com/flynn/flynn/pkg/version"
+	tuf "github.com/flynn/go-tuf/client"
 )
+
+var internalDockerEndpoints = []string{
+	"docker-receive.discoverd",
+	"100.100.0.0/16",
+}
 
 func init() {
 	// This will run docker-untar and docker-applyLayer in a chroot
@@ -28,54 +39,97 @@ func init() {
 }
 
 type Context struct {
-	*store.Store
+	store  *graph.TagStore
+	graph  *graph.Graph
 	driver graphdriver.Driver
+	mtx    sync.Mutex
 }
 
 func BuildContext(driver, root string) (*Context, error) {
-	d, err := graphdriver.GetDriver(driver, root, nil)
+	d, err := graphdriver.GetDriver(driver, root, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	s, err := store.New(root, d)
+	g, err := graph.NewGraph(filepath.Join(root, "graph"), d, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	return NewContext(s, d), nil
-}
 
-func NewContext(store *store.Store, driver graphdriver.Driver) *Context {
-	return &Context{Store: store, driver: driver}
-}
-
-func (c *Context) PullDocker(url string, progress chan<- layer.PullInfo) error {
-	ref, err := registry.NewRef(url)
-	if err != nil {
-		return err
+	config := &graph.TagStoreConfig{
+		Graph:  g,
+		Events: events.New(),
+		Registry: registry.NewService(&registry.Options{
+			Mirrors:            opts.NewListOpts(nil),
+			InsecureRegistries: *opts.NewListOptsRef(&internalDockerEndpoints, nil),
+		}),
 	}
-	return c.pull(url, registry.NewDockerSession(ref), progress)
+	store, err := graph.NewTagStore(filepath.Join(root, "repositories-"+d.String()), config)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewContext(store, g, d), nil
+}
+
+func NewContext(store *graph.TagStore, graph *graph.Graph, driver graphdriver.Driver) *Context {
+	return &Context{store: store, graph: graph, driver: driver}
+}
+
+func (c *Context) PullDocker(url string, out io.Writer) (string, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	ref, err := NewRef(url)
+	if err != nil {
+		return "", err
+	}
+
+	if ref.imageID != "" && c.graph.Exists(ref.imageID) {
+		return ref.imageID, nil
+	}
+
+	if img, err := c.store.LookupImage(ref.DockerRef()); err == nil && img != nil {
+		return img.ID, nil
+	}
+
+	config := &graph.ImagePullConfig{
+		AuthConfig: &cliconfig.AuthConfig{
+			Username: ref.username,
+			Password: ref.password,
+		},
+		OutStream: out,
+	}
+	if err := c.store.Pull(ref.DockerRepo(), ref.Tag(), config); err != nil {
+		return "", err
+	}
+
+	img, err := c.store.LookupImage(ref.DockerRef())
+	if err != nil {
+		return "", err
+	}
+
+	return img.ID, nil
 }
 
 func (c *Context) PullTUF(url string, client *tuf.Client, progress chan<- layer.PullInfo) error {
-	ref, err := registry.NewRef(url)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	ref, err := NewRef(url)
 	if err != nil {
 		return err
 	}
-	return c.pull(url, registry.NewTUFSession(client, ref), progress)
-}
 
-func (c *Context) pull(url string, session registry.Session, progress chan<- layer.PullInfo) error {
 	defer func() {
 		if progress != nil {
 			close(progress)
 		}
 	}()
-
 	sendProgress := func(id string, typ layer.Type, status layer.Status) {
 		if progress != nil {
 			progress <- layer.PullInfo{
-				Repo:   session.Repo(),
+				Repo:   ref.repo,
 				Type:   typ,
 				ID:     id,
 				Status: status,
@@ -83,40 +137,38 @@ func (c *Context) pull(url string, session registry.Session, progress chan<- lay
 		}
 	}
 
-	if id := session.ImageID(); id != "" && c.Exists(id) {
-		sendProgress(id, layer.TypeImage, layer.StatusExists)
+	if ref.imageID != "" && c.graph.Exists(ref.imageID) {
+		sendProgress(ref.imageID, layer.TypeImage, layer.StatusExists)
 		return nil
 	}
+
+	session := NewTUFSession(client, ref)
 
 	image, err := session.GetImage()
 	if err != nil {
 		return err
 	}
 
-	layers, err := image.Ancestors()
+	layers, err := session.GetAncestors(image.ID())
 	if err != nil {
 		return err
 	}
 
 	for i := len(layers) - 1; i >= 0; i-- {
 		l := layers[i]
-		if c.Exists(l.ID) {
-			sendProgress(l.ID, layer.TypeLayer, layer.StatusExists)
+		if c.graph.Exists(l.ID()) {
+			sendProgress(l.ID(), layer.TypeLayer, layer.StatusExists)
 			continue
 		}
 
 		status := layer.StatusDownloaded
-		if err := c.Add(l); err != nil {
-			if err == store.ErrExists {
-				status = layer.StatusExists
-			} else {
-				return err
-			}
+		if err := c.graph.Register(l, l); err != nil {
+			return err
 		}
-		sendProgress(l.ID, layer.TypeLayer, status)
+		sendProgress(l.ID(), layer.TypeLayer, status)
 	}
 
-	sendProgress(image.ID, layer.TypeImage, layer.StatusDownloaded)
+	sendProgress(image.ID(), layer.TypeImage, layer.StatusDownloaded)
 
 	// TODO: update sizes
 
@@ -124,6 +176,9 @@ func (c *Context) pull(url string, session registry.Session, progress chan<- lay
 }
 
 func (c *Context) Checkout(id, imageID string) (string, error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
 	id = "tmp-" + id
 	if err := c.driver.Create(id, imageID); err != nil {
 		return "", err
@@ -136,7 +191,14 @@ func (c *Context) Checkout(id, imageID string) (string, error) {
 }
 
 func (c *Context) Cleanup(id string) error {
-	return c.driver.Remove("tmp-" + id)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	id = "tmp-" + id
+	if err := c.driver.Put(id); err != nil {
+		return err
+	}
+	return c.driver.Remove(id)
 }
 
 func InfoPrinter(jsonOut bool) chan<- layer.PullInfo {
@@ -152,6 +214,13 @@ func InfoPrinter(jsonOut bool) chan<- layer.PullInfo {
 		}
 	}()
 	return info
+}
+
+func DockerPullPrinter(out io.Writer) io.Writer {
+	rd, wr := io.Pipe()
+	termOut, isTerm := term.GetFdInfo(out)
+	go jsonmessage.DisplayJSONMessagesStream(rd, out, termOut, isTerm)
+	return wr
 }
 
 var ErrNoImageID = errors.New("pinkerton: missing image id")
@@ -176,6 +245,7 @@ func PullImages(tufDB, repository, driver, root, ver string, progress chan<- lay
 	}
 	opts := &tuf.HTTPRemoteOptions{
 		UserAgent: fmt.Sprintf("pinkerton/%s %s-%s pull", version.String(), runtime.GOOS, runtime.GOARCH),
+		Retries:   tuf.DefaultHTTPRetries,
 	}
 	remote, err := tuf.HTTPRemoteStore(repository, opts)
 	if err != nil {

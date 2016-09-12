@@ -3,18 +3,23 @@ package cli
 import (
 	"bytes"
 	"fmt"
-	"io"
+	"io/ioutil"
+	"net/http"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/go-docopt"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var flynnHostLogs = map[string]string{
+	"flynn-host.log": "/var/log/flynn/flynn-host.log",
+
+	// the following two entries are legacy paths from when flynn-host used
+	// to log to stdout (which would be redirected to these files)
 	"upstart-flynn-host.log": "/var/log/upstart/flynn-host.log",
 	"tmp-flynn-host.log":     "/tmp/flynn-host.log",
 }
@@ -27,10 +32,7 @@ var debugCmds = [][]string{
 	{"date"},
 	{"free", "-m"},
 	{"df", "-h"},
-	{"dpkg-query", "-W", "-f", "${Package}: ${Version}\n", "libvirt-bin"},
 	{os.Args[0], "version"},
-	{"virsh", "-c", "lxc:///", "list"},
-	{"virsh", "-c", "lxc:///", "net-list"},
 	{"route", "-n"},
 	{"iptables", "-L", "-v", "-n", "--line-numbers"},
 }
@@ -42,18 +44,12 @@ usage: flynn-host collect-debug-info [options]
 Options:
   --tarball          Create a tarball instead of uploading to a gist
   --include-env      Include sensitive environment variables
-  --job-lines=<num>  Maximum number of lines to fetch from each job [default: 1000]
 
 Collect debug information into an anonymous gist or tarball`)
 }
 
 func runCollectDebugInfo(args *docopt.Args) error {
 	log := log15.New()
-	lines, err := strconv.Atoi(args.String["--job-lines"])
-	if err != nil {
-		return err
-	}
-
 	if args.Bool["--tarball"] {
 		log.Info("creating a tarball containing logs and debug information")
 	} else {
@@ -74,10 +70,15 @@ func runCollectDebugInfo(args *docopt.Args) error {
 		}
 	}
 
+	log.Info("getting scheduler state")
+	if err := captureSchedulerState(gist); err != nil {
+		log.Error("error getting scheduler state", "err", err)
+	}
+
 	log.Info("getting job logs")
-	if err := captureJobs(gist, args.Bool["--include-env"], lines); err != nil {
+	if err := captureJobs(gist, args.Bool["--include-env"]); err != nil {
 		log.Error("error getting job logs, falling back to on-disk logs", "err", err)
-		debugCmds = append(debugCmds, []string{"bash", "-c", fmt.Sprintf("tail -n %d /var/log/flynn/*.log", lines)})
+		debugCmds = append(debugCmds, []string{"bash", "-c", "tail -n+1 /var/log/flynn/*.log"})
 	}
 
 	log.Info("getting system information")
@@ -92,7 +93,11 @@ func runCollectDebugInfo(args *docopt.Args) error {
 	}
 	gist.AddFile("0-debug-output.log", debugOutput)
 
-	if args.Bool["--tarball"] {
+	if gist.Size > GistMaxSize {
+		log.Info(fmt.Sprintf("Total size of %d bytes exceeds gist limit, falling back to tarball.", gist.Size))
+	}
+
+	if args.Bool["--tarball"] || gist.Size > GistMaxSize {
 		path, err := gist.CreateTarball()
 		if err != nil {
 			log.Error("error creating tarball", "err", err)
@@ -120,7 +125,7 @@ func captureCmd(name string, arg ...string) (string, error) {
 	return buf.String(), nil
 }
 
-func captureJobs(gist *Gist, env bool, lines int) error {
+func captureJobs(gist *Gist, env bool) error {
 	client := cluster.NewClient()
 
 	jobs, err := jobList(client, true)
@@ -134,6 +139,9 @@ func captureJobs(gist *Gist, env bool, lines int) error {
 
 	for _, job := range jobs {
 		var name string
+		if system, ok := job.Job.Metadata["flynn-system-app"]; !ok || system != "true" {
+			continue // Skip non-system applications
+		}
 		if app, ok := job.Job.Metadata["flynn-controller.app_name"]; ok {
 			name += app + "-"
 		}
@@ -143,19 +151,32 @@ func captureJobs(gist *Gist, env bool, lines int) error {
 		name += job.Job.ID + ".log"
 
 		var content bytes.Buffer
-		printJobDesc(&job, &content, env)
+		printJobDesc(&job, &content, env, nil)
 		fmt.Fprint(&content, "\n\n***** ***** ***** ***** ***** ***** ***** ***** ***** *****\n\n")
-		stdoutR, stdoutW := io.Pipe()
-		stderrR, stderrW := io.Pipe()
-		go func() {
-			getLog(job.HostID, job.Job.ID, client, false, true, stdoutW, stderrW)
-			stdoutW.Close()
-			stderrW.Close()
-		}()
-		tailLogs(stdoutR, stderrR, lines, &content, &content)
-
+		getLog(job.HostID, job.Job.ID, client, false, true, &content, &content)
 		gist.AddFile(name, content.String())
 	}
 
+	return nil
+}
+
+func captureSchedulerState(gist *Gist) error {
+	leader, err := discoverd.NewService("controller-scheduler").Leader()
+	if err != nil {
+		return err
+	}
+	res, err := http.Get(fmt.Sprintf("http://%s/debug/state", leader.Addr))
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected HTTP status: %s", res.Status)
+	}
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+	gist.AddFile("scheduler-state.json", string(body))
 	return nil
 }

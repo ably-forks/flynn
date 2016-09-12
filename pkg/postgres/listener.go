@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	"github.com/jackc/pgx"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 // Listen creates a listener for the given channel, returning the listener
@@ -23,6 +23,8 @@ func (db *DB) Listen(channel string, log log15.Logger) (*Listener, error) {
 		conn:    conn,
 	}
 	if err := l.conn.Listen(channel); err != nil {
+		l.Close()
+		l.db.Release(l.conn)
 		return nil, err
 	}
 	go l.listen()
@@ -34,29 +36,31 @@ type Listener struct {
 	Err    error
 
 	channel   string
-	closeOnce sync.Once
 	log       log15.Logger
 	db        *DB
 	conn      *pgx.Conn
+	closeOnce sync.Once
 }
 
 func (l *Listener) Close() (err error) {
 	l.closeOnce.Do(func() {
-		l.conn.Close()
-		l.db.Release(l.conn)
+		err = l.conn.Close()
 	})
 	return
 }
 
 func (l *Listener) listen() {
+	defer func() {
+		l.Close()
+		l.db.Release(l.conn)
+		close(l.Notify)
+	}()
 	for {
 		n, err := l.conn.WaitForNotification(10 * time.Second)
 		if err == pgx.ErrNotificationTimeout {
 			continue
-		}
-		if err != nil {
+		} else if err != nil {
 			l.Err = err
-			close(l.Notify)
 			return
 		}
 		l.Notify <- n

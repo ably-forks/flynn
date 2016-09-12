@@ -1,6 +1,8 @@
 package bootstrap
 
 import (
+	"time"
+
 	ct "github.com/flynn/flynn/controller/types"
 )
 
@@ -29,9 +31,6 @@ func interpolateRelease(s *State, r *ct.Release) {
 			if proc.Env[k] == "" {
 				delete(proc.Env, k)
 			}
-		}
-		for i, v := range proc.Cmd {
-			proc.Cmd[i] = interpolate(s, v)
 		}
 	}
 }
@@ -67,7 +66,7 @@ func (a *DeployAppAction) Run(s *State) error {
 			s.Providers[p.Name] = p
 		}
 
-		res, err := client.ProvisionResource(&ct.ResourceReq{ProviderID: p.ID})
+		res, err := client.ProvisionResource(&ct.ResourceReq{ProviderID: p.ID, Apps: []string{a.App.ID}})
 		if err != nil {
 			return err
 		}
@@ -78,12 +77,12 @@ func (a *DeployAppAction) Run(s *State) error {
 		}
 	}
 
-	if err := client.CreateArtifact(a.Artifact); err != nil {
+	if err := client.CreateArtifact(a.ImageArtifact); err != nil {
 		return err
 	}
-	as.Artifact = a.Artifact
+	as.ImageArtifact = a.ImageArtifact
 
-	a.Release.ArtifactID = a.Artifact.ID
+	a.Release.ArtifactIDs = []string{a.ImageArtifact.ID}
 	if err := client.CreateRelease(a.Release); err != nil {
 		return err
 	}
@@ -104,5 +103,7 @@ func (a *DeployAppAction) Run(s *State) error {
 	}
 	as.Formation = formation
 
-	return client.DeployAppRelease(a.App.ID, a.Release.ID)
+	timeoutCh := make(chan struct{})
+	time.AfterFunc(5*time.Minute, func() { close(timeoutCh) })
+	return client.DeployAppRelease(a.App.ID, a.Release.ID, timeoutCh)
 }

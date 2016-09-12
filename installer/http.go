@@ -7,20 +7,22 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/awslabs/aws-sdk-go/aws"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/badgerodon/ioutil"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/oauth2"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/pkg/browser"
-	log "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
+	"github.com/awslabs/aws-sdk-go/aws"
+	"github.com/badgerodon/ioutil"
 	"github.com/flynn/flynn/pkg/azure"
 	"github.com/flynn/flynn/pkg/cors"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/sse"
+	"github.com/flynn/oauth2"
+	"github.com/julienschmidt/httprouter"
+	"github.com/pkg/browser"
+	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 type assetManifest struct {
@@ -59,6 +61,7 @@ func ServeHTTP() error {
 			Endpoints: map[string]string{
 				"clusters":           "/clusters",
 				"cluster":            "/clusters/:id",
+				"upload_backup":      "/clusters/:id/upload-backup",
 				"cert":               "/clusters/:id/ca-cert",
 				"events":             "/events",
 				"prompt":             "/clusters/:id/prompts/:prompt_id",
@@ -83,6 +86,7 @@ func ServeHTTP() error {
 	httpRouter.GET("/credentials", api.ServeTemplate)
 	httpRouter.GET("/credentials/:id", api.ServeTemplate)
 	httpRouter.GET("/clusters/:id", api.ServeTemplate)
+	httpRouter.POST("/clusters/:id/upload-backup", api.ReceiveBackup)
 	httpRouter.GET("/clusters/:id/ca-cert", api.GetCert)
 	httpRouter.GET("/clusters/:id/delete", api.ServeTemplate)
 	httpRouter.GET("/oauth/azure", api.ServeTemplate)
@@ -97,7 +101,13 @@ func ServeHTTP() error {
 	httpRouter.GET("/regions", api.GetCloudRegions)
 	httpRouter.GET("/azure/subscriptions", api.GetAzureSubscriptions)
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	port := os.Getenv("PORT")
+	if port == "" {
+		// if no port is given, use a random one
+		port = "0"
+	}
+
+	l, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
 		return err
 	}
@@ -218,6 +228,25 @@ func (api *httpAPI) LaunchCluster(w http.ResponseWriter, req *http.Request, para
 	httphelper.JSON(w, 200, base)
 }
 
+func (api *httpAPI) ReceiveBackup(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
+	cluster, err := api.Installer.FindBaseCluster(params.ByName("id"))
+	if err != nil {
+		httphelper.ObjectNotFoundError(w, err.Error())
+		return
+	}
+	defer req.Body.Close()
+	size, err := strconv.Atoi(req.Header.Get("Content-Length"))
+	if err != nil {
+		httphelper.Error(w, err)
+		return
+	}
+	if err := cluster.ReceiveBackup(req.Body, size); err != nil {
+		httphelper.Error(w, err)
+		return
+	}
+	w.WriteHeader(200)
+}
+
 func (api *httpAPI) GetCert(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
 	cluster, err := api.Installer.FindBaseCluster(params.ByName("id"))
 	if err != nil {
@@ -261,12 +290,28 @@ func (api *httpAPI) Prompt(w http.ResponseWriter, req *http.Request, params http
 		return
 	}
 
+	defer req.Body.Close()
 	var input *Prompt
-	if err := httphelper.DecodeJSON(req, &input); err != nil {
+	if prompt.Type == PromptTypeFile {
+		size, err := strconv.Atoi(req.Header.Get("Content-Length"))
+		if err != nil {
+			httphelper.Error(w, err)
+			return
+		}
+		input = &Prompt{
+			File:     req.Body,
+			FileSize: size,
+		}
+	} else {
+		if err := httphelper.DecodeJSON(req, &input); err != nil {
+			httphelper.Error(w, err)
+			return
+		}
+	}
+	if err := prompt.Resolve(input); err != nil {
 		httphelper.Error(w, err)
 		return
 	}
-	prompt.Resolve(input)
 	w.WriteHeader(200)
 }
 

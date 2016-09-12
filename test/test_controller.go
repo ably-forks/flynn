@@ -14,18 +14,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/cupcake/jsonschema"
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	"github.com/cupcake/jsonschema"
 	"github.com/flynn/flynn/cli/config"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/exec"
 	"github.com/flynn/flynn/pkg/random"
+	c "github.com/flynn/go-check"
 )
 
 type ControllerSuite struct {
-	schemaPaths []string
 	schemaCache map[string]*jsonschema.Schema
 	Helper
 }
@@ -182,7 +181,7 @@ func (s *ControllerSuite) TestKeyRotation(t *c.C) {
 	t.Assert(set, Succeeds)
 
 	// reconfigure components to use new key
-	for _, app := range []string{"gitreceive", "taffy", "dashboard"} {
+	for _, app := range []string{"gitreceive", "docker-receive", "taffy", "dashboard"} {
 		set := flynn(t, "/", "-a", app, "env", "set", "CONTROLLER_KEY="+newKey)
 		t.Assert(set, Succeeds)
 	}
@@ -213,7 +212,7 @@ func (s *ControllerSuite) TestResourceLimitsOneOffJob(t *c.C) {
 
 	rwc, err := s.controllerClient(t).RunJobAttached(app.ID, &ct.NewJob{
 		ReleaseID: release.ID,
-		Cmd:       []string{"sh", "-c", resourceCmd},
+		Args:      []string{"sh", "-c", resourceCmd},
 		Resources: testResources(),
 	})
 	t.Assert(err, c.IsNil)
@@ -378,6 +377,12 @@ func (s *ControllerSuite) TestAppDeleteCleanup(t *c.C) {
 	numResources := 1
 	t.Assert(resources, c.HasLen, numResources)
 
+	// create another release
+	t.Assert(r.git("commit", "--allow-empty", "--message", "deploy"), Succeeds)
+	t.Assert(r.git("push", "flynn", "master"), Succeeds)
+	releases, err := client.AppReleaseList(app)
+	t.Assert(err, c.IsNil)
+
 	// delete app
 	cmd := r.flynn("delete", "--yes")
 	t.Assert(cmd, Succeeds)
@@ -386,6 +391,13 @@ func (s *ControllerSuite) TestAppDeleteCleanup(t *c.C) {
 	t.Assert(cmd, OutputContains, fmt.Sprintf("removed %d routes", numRoutes))
 	for _, route := range routes {
 		assertRouteStatus(route, 404)
+	}
+
+	// check release cleanup
+	t.Assert(cmd, OutputContains, fmt.Sprintf("deleted %d releases", len(releases)))
+	for _, release := range releases {
+		_, err := client.GetRelease(release.ID)
+		t.Assert(err, c.Equals, controller.ErrNotFound)
 	}
 
 	// check resource cleanup
@@ -432,7 +444,7 @@ func (s *ControllerSuite) TestRouteEvents(t *c.C) {
 
 	// stream events
 	events := make(chan *ct.Event)
-	stream, err := client.StreamEvents(controller.StreamEventsOptions{
+	stream, err := client.StreamEvents(ct.StreamEventsOptions{
 		AppID:       app,
 		ObjectTypes: []ct.EventType{ct.EventTypeRoute, ct.EventTypeRouteDeletion},
 		Past:        true,
@@ -488,7 +500,7 @@ func (s *ControllerSuite) TestAppEvents(t *c.C) {
 	runJob := func(appID, releaseID string) {
 		rwc, err := client.RunJobAttached(appID, &ct.NewJob{
 			ReleaseID:  releaseID,
-			Cmd:        []string{"/bin/true"},
+			Args:       []string{"/bin/true"},
 			DisableLog: true,
 		})
 		t.Assert(err, c.IsNil)
@@ -561,7 +573,7 @@ func (s *ControllerSuite) TestBackup(t *c.C) {
 		t.Assert(ok, c.Equals, true)
 		t.Assert(ef.App, c.Not(c.IsNil))
 		t.Assert(ef.Release, c.Not(c.IsNil))
-		t.Assert(ef.Artifact, c.Not(c.IsNil))
+		t.Assert(ef.ImageArtifact, c.Not(c.IsNil))
 		t.Assert(ef.Processes, c.Not(c.IsNil))
 		t.Assert(ef.App.Name, c.Equals, name)
 	}

@@ -2,8 +2,9 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	c "github.com/flynn/go-check"
 )
 
 type RedisSuite struct {
@@ -14,7 +15,10 @@ var _ = c.ConcurrentSuite(&RedisSuite{})
 
 func (s *RedisSuite) TestDumpRestore(t *c.C) {
 	a := s.newCliTestApp(t)
-	t.Assert(a.flynn("resource", "add", "redis"), Succeeds)
+
+	res := a.flynn("resource", "add", "redis")
+	t.Assert(res, Succeeds)
+	id := strings.Split(res.Output, " ")[2]
 
 	release, err := s.controllerClient(t).GetAppRelease(a.id)
 	t.Assert(err, c.IsNil)
@@ -32,4 +36,6 @@ func (s *RedisSuite) TestDumpRestore(t *c.C) {
 
 	query := a.flynn("redis", "redis-cli", "get", "foo")
 	t.Assert(query, SuccessfulOutputContains, "bar")
+
+	t.Assert(a.flynn("resource", "remove", "redis", id), Succeeds)
 }

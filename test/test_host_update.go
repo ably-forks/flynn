@@ -7,12 +7,12 @@ import (
 	"syscall"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/host/types"
 	logaggc "github.com/flynn/flynn/logaggregator/client"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/dialer"
 	"github.com/flynn/flynn/pkg/exec"
+	c "github.com/flynn/go-check"
 )
 
 type HostUpdateSuite struct {
@@ -26,8 +26,8 @@ func (s *HostUpdateSuite) TestUpdateLogs(t *c.C) {
 		t.Skip("cannot boot new hosts")
 	}
 
-	instance := s.addHost(t)
-	defer s.removeHost(t, instance)
+	instance := s.addHost(t, "router-api")
+	defer s.removeHost(t, instance, "router-api")
 	httpClient := &http.Client{Transport: &http.Transport{Dial: dialer.Retry.Dial}}
 	client := cluster.NewHost(instance.ID, fmt.Sprintf("http://%s:1113", instance.IP), httpClient, nil)
 
@@ -36,7 +36,7 @@ func (s *HostUpdateSuite) TestUpdateLogs(t *c.C) {
 		client,
 		exec.DockerImage(imageURIs["test-apps"]),
 		&host.Job{
-			Config: host.ContainerConfig{Cmd: []string{"/bin/partial-logger"}},
+			Config: host.ContainerConfig{Args: []string{"/bin/partial-logger"}},
 			Metadata: map[string]string{
 				"flynn-controller.app": "partial-logger",
 			},

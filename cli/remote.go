@@ -4,8 +4,8 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -28,7 +28,7 @@ Examples:
 `)
 }
 
-func runRemote(args *docopt.Args, client *controller.Client) error {
+func runRemote(args *docopt.Args, client controller.Client) error {
 	app, err := client.GetApp(mustApp())
 	if err != nil {
 		return err
@@ -44,12 +44,14 @@ func runRemote(args *docopt.Args, client *controller.Client) error {
 		return nil
 	}
 
-	update, err := promptReplaceRemote(remote)
-	if err != nil {
-		return err
-	}
-	if update == false {
-		return nil
+	if !args.Bool["--yes"] {
+		update, err := promptReplaceRemote(remote)
+		if err != nil {
+			return err
+		}
+		if update == false {
+			return nil
+		}
 	}
 
 	// Register git remote

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -9,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	controller "github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/controller/utils"
@@ -23,27 +23,20 @@ import (
 	"github.com/flynn/flynn/pkg/status"
 	"github.com/flynn/flynn/pkg/stream"
 	"github.com/flynn/flynn/pkg/typeconv"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
 	eventBufferSize      = 1000
-	maxJobAttempts       = 30
-	jobAttemptInterval   = 500 * time.Millisecond
 	defaultMaxHostChecks = 10
 )
 
 var (
 	ErrNotLeader        = errors.New("scheduler is not the leader")
 	ErrNoHosts          = errors.New("no hosts found")
-	ErrJobStopped       = errors.New("job has been marked as stopped")
+	ErrJobNotPending    = errors.New("job is no longer pending")
 	ErrNoHostsMatchTags = errors.New("no hosts found matching job tags")
 )
-
-var logger = log15.New("component", "scheduler")
-
-// generateJobUUID generates a UUID for new job IDs and is overridden in tests
-// to make them more predictable
-var generateJobUUID func() string = random.UUID
 
 type Scheduler struct {
 	utils.ControllerClient
@@ -52,35 +45,29 @@ type Scheduler struct {
 	discoverd Discoverd
 	isLeader  *bool
 
-	backoffPeriod time.Duration
+	logger log15.Logger
+
 	maxHostChecks int
 
 	formations Formations
 	hosts      map[string]*Host
 	jobs       Jobs
 
-	// getJobs is used by tests that want to inspect the schedulers jobs
-	// without causing data races (jobs should only be referenced in the
-	// main loop)
-	getJobs chan Jobs
-
 	jobEvents chan *host.Event
-
-	listeners map[chan Event]struct{}
-	listenMtx sync.RWMutex
 
 	stop     chan struct{}
 	stopOnce sync.Once
 
-	syncJobs          chan struct{}
-	syncFormations    chan struct{}
-	syncHosts         chan struct{}
-	hostChecks        chan struct{}
-	rectify           chan struct{}
-	hostEvents        chan *discoverd.Event
-	formationEvents   chan *ct.ExpandedFormation
-	putJobs           chan *ct.Job
-	placementRequests chan *PlacementRequest
+	syncJobs              chan struct{}
+	syncFormations        chan struct{}
+	syncHosts             chan struct{}
+	hostChecks            chan struct{}
+	rectify               chan struct{}
+	hostEvents            chan *discoverd.Event
+	formationEvents       chan *ct.ExpandedFormation
+	putJobs               chan *ct.Job
+	placementRequests     chan *PlacementRequest
+	internalStateRequests chan *InternalStateRequest
 
 	rectifyBatch map[utils.FormationKey]struct{}
 
@@ -95,38 +82,49 @@ type Scheduler struct {
 	// their tags not matching any hosts, and is used to try and place the
 	// jobs when host tags change
 	pendingTagJobs map[string]*Job
+
+	// pause and resume are used by tests to control the main loop
+	pause  chan struct{}
+	resume chan struct{}
+
+	// generateJobUUID generates a UUID for new job IDs and is overridden in tests
+	// to make them more predictable
+	generateJobUUID func() string
 }
 
-func NewScheduler(cluster utils.ClusterClient, cc utils.ControllerClient, disc Discoverd) *Scheduler {
+func NewScheduler(cluster utils.ClusterClient, cc utils.ControllerClient, disc Discoverd, l log15.Logger) *Scheduler {
 	return &Scheduler{
-		ControllerClient:  cc,
-		ClusterClient:     cluster,
-		discoverd:         disc,
-		backoffPeriod:     getBackoffPeriod(),
-		maxHostChecks:     defaultMaxHostChecks,
-		hosts:             make(map[string]*Host),
-		jobs:              make(map[string]*Job),
-		formations:        make(Formations),
-		listeners:         make(map[chan Event]struct{}),
-		jobEvents:         make(chan *host.Event, eventBufferSize),
-		stop:              make(chan struct{}),
-		syncJobs:          make(chan struct{}, 1),
-		syncFormations:    make(chan struct{}, 1),
-		syncHosts:         make(chan struct{}, 1),
-		hostChecks:        make(chan struct{}, 1),
-		rectifyBatch:      make(map[utils.FormationKey]struct{}),
-		rectify:           make(chan struct{}, 1),
-		formationEvents:   make(chan *ct.ExpandedFormation, eventBufferSize),
-		hostEvents:        make(chan *discoverd.Event, eventBufferSize),
-		putJobs:           make(chan *ct.Job, eventBufferSize),
-		placementRequests: make(chan *PlacementRequest, eventBufferSize),
-		formationlessJobs: make(map[utils.FormationKey]map[string]*Job),
-		getJobs:           make(chan Jobs),
-		pendingTagJobs:    make(map[string]*Job),
+		ControllerClient:      cc,
+		ClusterClient:         cluster,
+		discoverd:             disc,
+		logger:                l,
+		maxHostChecks:         defaultMaxHostChecks,
+		hosts:                 make(map[string]*Host),
+		jobs:                  make(map[string]*Job),
+		formations:            make(Formations),
+		jobEvents:             make(chan *host.Event, eventBufferSize),
+		stop:                  make(chan struct{}),
+		syncJobs:              make(chan struct{}, 1),
+		syncFormations:        make(chan struct{}, 1),
+		syncHosts:             make(chan struct{}, 1),
+		hostChecks:            make(chan struct{}, 1),
+		rectifyBatch:          make(map[utils.FormationKey]struct{}),
+		rectify:               make(chan struct{}, 1),
+		formationEvents:       make(chan *ct.ExpandedFormation, eventBufferSize),
+		hostEvents:            make(chan *discoverd.Event, eventBufferSize),
+		putJobs:               make(chan *ct.Job, eventBufferSize),
+		placementRequests:     make(chan *PlacementRequest, eventBufferSize),
+		internalStateRequests: make(chan *InternalStateRequest, eventBufferSize),
+		formationlessJobs:     make(map[utils.FormationKey]map[string]*Job),
+		pendingTagJobs:        make(map[string]*Job),
+		pause:                 make(chan struct{}),
+		resume:                make(chan struct{}),
+		generateJobUUID:       random.UUID,
 	}
 }
 
 func main() {
+	logger := log15.New("component", "scheduler")
 	logger.SetHandler(log15.LvlFilterHandler(log15.LvlInfo, log15.StdoutHandler))
 	log := logger.New("fn", "main")
 
@@ -138,8 +136,15 @@ func main() {
 		log.Error("error creating controller client", "err", err)
 		shutdown.Fatal(err)
 	}
-	s := NewScheduler(clusterClient, controllerClient, newDiscoverdWrapper())
-	log.Info("started scheduler", "backoffPeriod", s.backoffPeriod)
+
+	log.Info("waiting for controller API to come up")
+	if _, err := discoverd.GetInstances("controller", 5*time.Minute); err != nil {
+		log.Error("error waiting for controller API", "err", err)
+		shutdown.Fatal(err)
+	}
+
+	s := NewScheduler(clusterClient, controllerClient, newDiscoverdWrapper(logger), logger)
+	log.Info("started scheduler")
 
 	go s.startHTTPServer(os.Getenv("PORT"))
 
@@ -150,7 +155,7 @@ func main() {
 }
 
 func (s *Scheduler) streamFormationEvents() error {
-	log := logger.New("fn", "streamFormationEvents")
+	log := s.logger.New("fn", "streamFormationEvents")
 
 	var events chan *ct.ExpandedFormation
 	var stream stream.Stream
@@ -213,7 +218,7 @@ func (s *Scheduler) streamFormationEvents() error {
 }
 
 func (s *Scheduler) streamHostEvents() error {
-	log := logger.New("fn", "streamHostEvents")
+	log := s.logger.New("fn", "streamHostEvents")
 
 	var events chan *discoverd.Event
 	var stream stream.Stream
@@ -272,15 +277,21 @@ func (s *Scheduler) streamHostEvents() error {
 }
 
 func (s *Scheduler) Run() error {
-	log := logger.New("fn", "Run")
+	log := s.logger.New("fn", "Run")
 	log.Info("starting scheduler loop")
 	defer log.Info("scheduler loop exited")
+
+	go s.RunPutJobs()
 
 	// stream host events (which will start watching job events on
 	// all current hosts before returning) *before* registering in
 	// service discovery so that there is always at least one scheduler
 	// watching all job events, even during a deployment.
 	if err := s.streamHostEvents(); err != nil {
+		return err
+	}
+
+	if err := s.streamFormationEvents(); err != nil {
 		return err
 	}
 
@@ -291,15 +302,9 @@ func (s *Scheduler) Run() error {
 	s.HandleLeaderChange(isLeader)
 	leaderCh := s.discoverd.LeaderCh()
 
-	if err := s.streamFormationEvents(); err != nil {
-		return err
-	}
-
 	s.tickSyncJobs(30 * time.Second)
 	s.tickSyncFormations(time.Minute)
 	s.tickSyncHosts(10 * time.Second)
-
-	go s.RunPutJobs()
 
 	for {
 		select {
@@ -360,6 +365,8 @@ func (s *Scheduler) Run() error {
 			s.HandleLeaderChange(isLeader)
 		case req := <-s.placementRequests:
 			s.HandlePlacementRequest(req)
+		case req := <-s.internalStateRequests:
+			s.HandleInternalStateRequest(req)
 		case e := <-s.hostEvents:
 			s.HandleHostEvent(e)
 		case <-s.hostChecks:
@@ -374,10 +381,10 @@ func (s *Scheduler) Run() error {
 			s.SyncJobs()
 		case <-s.syncHosts:
 			s.SyncHosts()
-		case s.getJobs <- s.jobs:
+		case <-s.pause:
+			<-s.resume
 		}
 	}
-	return nil
 }
 
 func (s *Scheduler) IsLeader() bool {
@@ -385,9 +392,7 @@ func (s *Scheduler) IsLeader() bool {
 }
 
 func (s *Scheduler) SyncJobs() (err error) {
-	defer s.sendEvent(EventTypeClusterSync, nil, nil)
-
-	log := logger.New("fn", "SyncJobs")
+	log := s.logger.New("fn", "SyncJobs")
 	log.Info("syncing jobs")
 
 	defer func() {
@@ -410,8 +415,8 @@ func (s *Scheduler) SyncJobs() (err error) {
 		}
 	}
 
-	// ensure that all starting or up jobs in the controller are still in
-	// those states
+	// ensure that all pending / starting / up jobs in the controller are
+	// still in those states
 	jobs, err := s.JobListActive()
 	if err != nil {
 		if err == controller.ErrNotFound {
@@ -434,8 +439,18 @@ func (s *Scheduler) SyncJobs() (err error) {
 			continue
 		}
 
+		// ignore jobs in the JobStateStopping state since, although a
+		// request has been made to stop the job, we don't yet know if
+		// it has actually stopped, so just leave it in whatever state
+		// it's currently in until we get the stopped event
+		if j.State == JobStateStopping {
+			continue
+		}
+
 		// persist the job if it has a different in-memory state
-		if job.State == ct.JobStateStarting && j.state != JobStateStarting || job.State == ct.JobStateUp && j.state != JobStateRunning {
+		if job.State == ct.JobStatePending && j.State != JobStatePending ||
+			job.State == ct.JobStateStarting && j.State != JobStateStarting ||
+			job.State == ct.JobStateUp && j.State != JobStateRunning {
 			s.persistJob(j)
 		}
 	}
@@ -444,10 +459,9 @@ func (s *Scheduler) SyncJobs() (err error) {
 }
 
 func (s *Scheduler) SyncFormations() {
-	defer s.sendEvent(EventTypeFormationSync, nil, nil)
-
-	log := logger.New("fn", "SyncFormations")
+	log := s.logger.New("fn", "SyncFormations")
 	log.Info("syncing formations")
+	defer log.Debug("formations synced")
 
 	formations, err := s.FormationListActive()
 	if err != nil {
@@ -472,7 +486,7 @@ func (s *Scheduler) SyncFormations() {
 }
 
 func (s *Scheduler) SyncHosts() (err error) {
-	log := logger.New("fn", "SyncHosts")
+	log := s.logger.New("fn", "SyncHosts")
 	log.Info("syncing hosts")
 
 	defer func() {
@@ -505,8 +519,9 @@ func (s *Scheduler) SyncHosts() (err error) {
 	}
 
 	// mark any hosts as unhealthy which are not returned from s.Hosts()
+	// and are not explicitly shutdown
 	for id, host := range s.hosts {
-		if _, ok := known[id]; !ok {
+		if _, ok := known[id]; !ok && !host.Shutdown {
 			s.markHostAsUnhealthy(host)
 		}
 	}
@@ -536,12 +551,16 @@ func (s *Scheduler) RectifyFormation(key utils.FormationKey) {
 	if !s.IsLeader() {
 		return
 	}
-	defer s.sendEvent(EventTypeRectify, nil, key)
+	defer s.logger.New("fn", "RectifyFormation").Debug("rectified formation", "key", key)
 
 	formation, ok := s.formations[key]
 	if !ok {
 		return
 	}
+
+	// stop surplus omni jobs first in case we need to reschedule them
+	// on other hosts
+	s.stopSurplusOmniJobs(formation)
 
 	// stop jobs with mismatched tags first in case we need to reschedule
 	// them on hosts with matching tags
@@ -554,11 +573,57 @@ func (s *Scheduler) RectifyFormation(key utils.FormationKey) {
 	s.handleFormationDiff(formation, diff)
 }
 
+// stopSurplusOmniJobs stops surplus jobs which are running on a host which has
+// more than the expected number of omni jobs for a given type (this happens
+// for example when both the bootstrapper and scheduler are starting jobs and
+// distribute omni jobs unevenly)
+func (s *Scheduler) stopSurplusOmniJobs(formation *Formation) {
+	log := s.logger.New("fn", "stopSurplusOmniJobs")
+
+	for typ, proc := range formation.Release.Processes {
+		if !proc.Omni {
+			continue
+		}
+
+		// get a list of jobs per host so we can count them and
+		// potentially stop any surplus ones
+		hostJobs := make(map[string][]*Job)
+		for _, job := range s.jobs.WithFormationAndType(formation, typ) {
+			if job.IsRunning() {
+				hostJobs[job.HostID] = append(hostJobs[job.HostID], job)
+			}
+		}
+
+		// detect surplus jobs per host by comparing the expected count
+		// from the formation with the number of jobs currently running
+		// on that host
+		expected := formation.OriginalProcesses[typ]
+		var surplusJobs []*Job
+		for _, jobs := range hostJobs {
+			if diff := len(jobs) - expected; diff > 0 {
+				// add the most recent jobs which are at the start
+				// of the slice (WithFormationAndType returns them
+				// in reverse chronological order above)
+				surplusJobs = append(surplusJobs, jobs[0:diff]...)
+			}
+		}
+
+		if len(surplusJobs) == 0 {
+			continue
+		}
+
+		log.Info(fmt.Sprintf("detected %d surplus omni jobs", len(surplusJobs)), "type", typ)
+		for _, job := range surplusJobs {
+			s.stopJob(job)
+		}
+	}
+}
+
 // stopJobsWithMismatchedTags stops any running jobs whose tags do not match
 // those of the host they are running on (possible after either the host's tags
 // or the formation's tags are updated)
 func (s *Scheduler) stopJobsWithMismatchedTags(formation *Formation) {
-	log := logger.New("fn", "stopJobsWithMismatchedTags")
+	log := s.logger.New("fn", "stopJobsWithMismatchedTags")
 	for _, job := range s.jobs {
 		if !job.IsInFormation(formation.key()) || !job.IsRunning() {
 			continue
@@ -592,26 +657,19 @@ func (s *Scheduler) formationDiff(formation *Formation) Processes {
 		return nil
 	}
 	key := formation.key()
-	expected := formation.GetProcesses()
 	actual := s.jobs.GetProcesses(key)
-	if expected.Equals(actual) {
-		return nil
+	diff := formation.Diff(actual)
+	if !diff.IsEmpty() {
+		log := s.logger.New("fn", "formationDiff", "app.id", key.AppID, "release.id", key.ReleaseID)
+		log.Info("expected different from actual", "expected", formation.Processes, "actual", actual, "diff", diff)
 	}
-	formation.Processes = actual
-	diff := formation.Update(expected)
-	log := logger.New("fn", "formationDiff", "app.id", key.AppID, "release.id", key.ReleaseID)
-	log.Info("expected different from actual", "expected", expected, "actual", actual, "diff", diff)
 	return diff
 }
 
 func (s *Scheduler) HandleFormationChange(ef *ct.ExpandedFormation) {
-	var err error
-	defer func() {
-		s.sendEvent(EventTypeFormationChange, err, nil)
-	}()
-
-	log := logger.New("fn", "HandleFormationChange", "app.id", ef.App.ID, "release.id", ef.Release.ID, "processes", ef.Processes)
+	log := s.logger.New("fn", "HandleFormationChange", "app.id", ef.App.ID, "release.id", ef.Release.ID, "processes", ef.Processes)
 	log.Info("handling formation change")
+	defer log.Debug("formation change handled")
 	s.handleFormation(ef)
 }
 
@@ -621,13 +679,15 @@ func (s *Scheduler) HandlePlacementRequest(req *PlacementRequest) {
 		return
 	}
 
-	// don't attempt to place a job which has been marked as stopped
-	if req.Job.state == JobStateStopped {
-		req.Error(ErrJobStopped)
+	// don't attempt to place a job which is no longer pending, which could
+	// be the case either if the job has been marked as stopped, or AddJob
+	// failed in some way (e.g. a timeout) but the job did actually start
+	if req.Job.State != JobStatePending {
+		req.Error(ErrJobNotPending)
 		return
 	}
 
-	log := logger.New("fn", "HandlePlacementRequest", "app.id", req.Job.AppID, "release.id", req.Job.ReleaseID, "job.type", req.Job.Type, "job.tags", req.Job.Tags())
+	log := s.logger.New("fn", "HandlePlacementRequest", "app.id", req.Job.AppID, "release.id", req.Job.ReleaseID, "job.type", req.Job.Type, "job.tags", req.Job.Tags())
 	log.Info("handling placement request")
 
 	if len(s.hosts) == 0 {
@@ -635,10 +695,17 @@ func (s *Scheduler) HandlePlacementRequest(req *PlacementRequest) {
 		return
 	}
 
+	// reset the job's HostID in case we already placed it but it failed to
+	// start
+	req.Job.HostID = ""
+
 	formation := req.Job.Formation
 	counts := s.jobs.GetHostJobCounts(formation.key(), req.Job.Type)
 	var minCount int = math.MaxInt32
-	for _, h := range s.SortedHosts() {
+	for _, h := range s.ShuffledHosts() {
+		if h.Shutdown {
+			continue
+		}
 		if !req.Job.TagsMatchHost(h) {
 			continue
 		}
@@ -674,32 +741,181 @@ func (s *Scheduler) HandlePlacementRequest(req *PlacementRequest) {
 	req.Error(nil)
 }
 
-func (s *Scheduler) SortedHosts() sortHosts {
-	hosts := make(sortHosts, 0, len(s.hosts))
+type InternalState struct {
+	Hosts      map[string]*Host      `json:"hosts"`
+	Jobs       Jobs                  `json:"jobs"`
+	Formations map[string]*Formation `json:"formations"`
+	IsLeader   *bool                 `json:"is_leader,omitempty"`
+}
+
+func NewInternalStateRequest() *InternalStateRequest {
+	return &InternalStateRequest{Done: make(chan struct{})}
+}
+
+type InternalStateRequest struct {
+	State *InternalState
+	Done  chan struct{}
+}
+
+func (s *Scheduler) HandleInternalStateRequest(req *InternalStateRequest) {
+	log := s.logger.New("fn", "HandleInternalStateRequest")
+	log.Info("handling internal state request")
+
+	// create an InternalState as a snapshot of the current state by
+	// copying objects and their exported fields
+	req.State = &InternalState{
+		Hosts:      make(map[string]*Host, len(s.hosts)),
+		Jobs:       make(map[string]*Job, len(s.jobs)),
+		Formations: make(map[string]*Formation, len(s.formations)),
+		IsLeader:   s.isLeader,
+	}
+
+	for id, host := range s.hosts {
+		h := *host
+		h.Tags = make(map[string]string, len(host.Tags))
+		for key, val := range host.Tags {
+			h.Tags[key] = val
+		}
+		req.State.Hosts[id] = &h
+	}
+
+	for id, job := range s.jobs {
+		req.State.Jobs[id] = &(*job)
+	}
+
+	for key, formation := range s.formations {
+		f := Formation{
+			ExpandedFormation: &ct.ExpandedFormation{
+				App: &ct.App{
+					ID:   formation.App.ID,
+					Name: formation.App.Name,
+					Meta: formation.App.Meta,
+				},
+				Release: &ct.Release{
+					ID:        formation.Release.ID,
+					Processes: make(map[string]ct.ProcessType, len(formation.Release.Processes)),
+				},
+				Processes: make(map[string]int, len(formation.Processes)),
+				Tags:      make(map[string]map[string]string, len(formation.Tags)),
+				UpdatedAt: formation.UpdatedAt,
+			},
+			OriginalProcesses: formation.OriginalProcesses,
+		}
+		for typ, n := range formation.Processes {
+			f.Processes[typ] = n
+		}
+		for typ, n := range formation.OriginalProcesses {
+			f.OriginalProcesses[typ] = n
+		}
+		for typ, tags := range formation.Tags {
+			f.Tags[typ] = make(map[string]string, len(tags))
+			for key, val := range tags {
+				f.Tags[typ][key] = val
+			}
+		}
+		for name, proc := range formation.Release.Processes {
+			f.Release.Processes[name] = ct.ProcessType{
+				Args: proc.Args,
+				Data: proc.Data,
+				Omni: proc.Omni,
+			}
+		}
+		req.State.Formations[key.String()] = &f
+	}
+
+	close(req.Done)
+}
+
+func (s *Scheduler) InternalState() *InternalState {
+	req := NewInternalStateRequest()
+	s.internalStateRequests <- req
+	<-req.Done
+	return req.State
+}
+
+func (s *Scheduler) ShuffledHosts() []*Host {
+	hosts := make([]*Host, 0, len(s.hosts))
 	for _, host := range s.hosts {
 		hosts = append(hosts, host)
 	}
-	hosts.Sort()
+	for i := len(hosts) - 1; i > 0; i-- {
+		j := random.Math.Intn(i + 1)
+		hosts[i], hosts[j] = hosts[j], hosts[i]
+	}
 	return hosts
 }
 
+var putJobAttempts = attempt.Strategy{
+	Delay: 100 * time.Millisecond,
+	Total: time.Minute,
+}
+
+// RunPutJobs starts a loop which receives jobs from the s.putJobs channel and
+// persists them to the controller using the putJobAttempts retry strategy.
+//
+// A goroutine is started per job to persist, but care is taken to persist jobs
+// with the same UUID sequentially and in order to avoid for example a job
+// transitioning from "down" to "up" in the controller.
 func (s *Scheduler) RunPutJobs() {
-	log := logger.New("fn", "RunPutJobs")
+	log := s.logger.New("fn", "RunPutJobs")
 	log.Info("starting job persistence loop")
-	strategy := attempt.Strategy{Delay: 100 * time.Millisecond, Total: time.Minute}
-	for job := range s.putJobs {
-		err := strategy.RunWithValidator(func() error {
+
+	// queue is a map of job UUID to a slice of jobs to persist for that
+	// given UUID, and the loop below persists the jobs in the slice
+	// in FIFO order
+	queue := make(map[string][]*ct.Job)
+
+	// done is a channel which receives a UUID once a job has been
+	// persisted for that UUID, thus potentially triggering the
+	// persistence of the next job in the queue for that UUID
+	done := make(chan string)
+
+	// persist makes multiple attempts to persist the given job, sending to
+	// the done channel once the attempts have finished
+	persist := func(job *ct.Job) {
+		err := putJobAttempts.RunWithValidator(func() error {
 			return s.PutJob(job)
 		}, httphelper.IsRetryableError)
 		if err != nil {
 			log.Error("error persisting job", "job.id", job.ID, "job.state", job.State, "err", err)
 		}
+		done <- job.UUID
 	}
-	log.Info("stopping job persistence loop")
+
+	// start the persistence loop which receives from both the s.putJobs
+	// and the done channel, modifies the queue accordingly and then calls
+	// the persist function in a goroutine if necessary
+	for {
+		select {
+		case job, ok := <-s.putJobs:
+			if !ok {
+				log.Info("stopping job persistence loop")
+				return
+			}
+
+			// push the job to the back of the queue
+			queue[job.UUID] = append(queue[job.UUID], job)
+
+			// if there is only one job in the queue, persist it
+			if len(queue[job.UUID]) == 1 {
+				go persist(job)
+			}
+		case uuid := <-done:
+			// remove the persisted job from the queue
+			queue[uuid] = queue[uuid][1:]
+
+			// if the queue has more jobs, persist the first one
+			if len(queue[uuid]) > 0 {
+				go persist(queue[uuid][0])
+			} else {
+				delete(queue, uuid)
+			}
+		}
+	}
 }
 
 func (s *Scheduler) HandleLeaderChange(isLeader bool) {
-	log := logger.New("fn", "HandleLeaderChange")
+	log := s.logger.New("fn", "HandleLeaderChange")
 	s.isLeader = &isLeader
 	if isLeader {
 		log.Info("handling leader promotion")
@@ -711,24 +927,23 @@ func (s *Scheduler) HandleLeaderChange(isLeader bool) {
 	} else {
 		log.Info("handling leader demotion")
 	}
-	s.sendEvent(EventTypeLeaderChange, nil, isLeader)
 }
 
 func (s *Scheduler) handleFormationDiff(f *Formation, diff Processes) {
-	log := logger.New("fn", "handleFormationDiff", "app.id", f.App.ID, "release.id", f.Release.ID)
+	log := s.logger.New("fn", "handleFormationDiff", "app.id", f.App.ID, "release.id", f.Release.ID)
 	log.Info("formation in incorrect state", "diff", diff)
 	for typ, n := range diff {
 		if n > 0 {
 			log.Info(fmt.Sprintf("starting %d new %s jobs", n, typ))
 			for i := 0; i < n; i++ {
 				job := &Job{
-					ID:        generateJobUUID(),
+					ID:        s.generateJobUUID(),
 					Type:      typ,
 					AppID:     f.App.ID,
 					ReleaseID: f.Release.ID,
 					Formation: f,
-					startedAt: time.Now(),
-					state:     JobStatePending,
+					StartedAt: time.Now(),
+					State:     JobStatePending,
 				}
 				s.jobs.Add(job)
 
@@ -746,14 +961,34 @@ func (s *Scheduler) handleFormationDiff(f *Formation, diff Processes) {
 	}
 }
 
+// activeFormationCount returns the number of formations which have running
+// jobs for the given app
+func (s *Scheduler) activeFormationCount(appID string) int {
+	activeReleases := make(map[string]struct{})
+	for _, job := range s.jobs {
+		if job.IsRunning() && job.IsInApp(appID) {
+			activeReleases[job.Formation.Release.ID] = struct{}{}
+		}
+	}
+	return len(activeReleases)
+}
+
 func (s *Scheduler) StartJob(job *Job) {
-	log := logger.New("fn", "StartJob", "app.id", job.AppID, "release.id", job.ReleaseID, "job.type", job.Type)
+	log := s.logger.New("fn", "StartJob", "app.id", job.AppID, "release.id", job.ReleaseID, "job.type", job.Type)
 	log.Info("starting job")
 
-	for attempt := 0; attempt < maxJobAttempts; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			time.Sleep(jobAttemptInterval)
+			// when making multiple attempts, backoff in increments
+			// of 500ms (capped at 30s)
+			delay := 500 * time.Millisecond * time.Duration(attempt)
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+			log.Info(fmt.Sprintf("failed to start job after %d attempts, waiting %s before trying again", attempt, delay))
+			time.Sleep(delay)
 		}
+
 		log.Info("placing job in the cluster")
 		config, host, err := s.PlaceJob(job)
 		if err == ErrNotLeader {
@@ -761,6 +996,9 @@ func (s *Scheduler) StartJob(job *Job) {
 			return
 		} else if err == ErrNoHostsMatchTags {
 			log.Warn("unable to place job as tags don't match any hosts")
+			return
+		} else if err == ErrJobNotPending {
+			log.Warn("unable to place job as it is no longer pending")
 			return
 		} else if err != nil {
 			log.Error("error placing job in the cluster", "err", err)
@@ -782,7 +1020,6 @@ func (s *Scheduler) StartJob(job *Job) {
 		}
 		return
 	}
-	log.Error(fmt.Sprintf("error starting job after %d attempts", maxJobAttempts))
 }
 
 // PlacementRequest is sent from a StartJob goroutine to the main scheduler
@@ -813,7 +1050,7 @@ func (s *Scheduler) followHost(h utils.HostClient) (*Host, error) {
 		return host, nil
 	}
 
-	host := NewHost(h)
+	host := NewHost(h, s.logger)
 	jobs, err := host.StreamEventsTo(s.jobEvents)
 	if err != nil {
 		return nil, err
@@ -830,7 +1067,7 @@ func (s *Scheduler) followHost(h utils.HostClient) (*Host, error) {
 }
 
 func (s *Scheduler) unfollowHost(host *Host) {
-	log := logger.New("fn", "unfollowHost", "host.id", host.ID)
+	log := s.logger.New("fn", "unfollowHost", "host.id", host.ID)
 	log.Info("unfollowing host")
 	host.Close()
 	delete(s.hosts, host.ID)
@@ -838,11 +1075,11 @@ func (s *Scheduler) unfollowHost(host *Host) {
 	// rectify the omni job counts so that when omni jobs are marked as
 	// stopped, they are not restarted
 	for _, formation := range s.formations {
-		formation.RectifyOmni(len(s.hosts))
+		formation.RectifyOmni(s.activeHostCount())
 	}
 
 	for _, job := range s.jobs {
-		if job.HostID == host.ID && job.state != JobStateStopped {
+		if job.HostID == host.ID && job.State != JobStateStopped {
 			log.Info("removing job", "job.id", job.JobID)
 			s.markAsStopped(job)
 		}
@@ -852,30 +1089,48 @@ func (s *Scheduler) unfollowHost(host *Host) {
 }
 
 func (s *Scheduler) markHostAsUnhealthy(host *Host) {
-	logger.Warn("host service is down, marking as unhealthy and triggering host checks", "host.id", host.ID)
-	host.healthy = false
+	s.logger.Warn("host service is down, marking as unhealthy and triggering host checks", "host.id", host.ID)
+	host.Healthy = false
 	s.triggerHostChecks()
 }
 
 func (s *Scheduler) HandleHostEvent(e *discoverd.Event) {
-	log := logger.New("fn", "HandleHostEvent", "event.type", e.Kind)
+	log := s.logger.New("fn", "HandleHostEvent", "event.type", e.Kind)
 	log.Info("handling host event")
-
-	var err error
-	defer func() {
-		s.sendEvent(EventTypeHostEvent, err, nil)
-	}()
 
 	switch e.Kind {
 	case discoverd.EventKindUp:
 		s.handleNewHost(e.Instance.Meta["id"])
 	case discoverd.EventKindUpdate:
 		id := e.Instance.Meta["id"]
+		_, isShutdown := e.Instance.Meta["shutdown"]
 
 		// if we haven't seen this host before, handle it as new
+		// (provided it is not shutdown)
 		host, ok := s.hosts[id]
 		if !ok {
-			s.handleNewHost(id)
+			if !isShutdown {
+				s.handleNewHost(id)
+			}
+			return
+		}
+
+		// if the host is shutdown, just mark it as shutdown and return
+		// rather than explicitly unfollowing to avoid a race where
+		// SyncHosts could run before we get the down event, thus
+		// re-following a host we know is shutdown (the host will be
+		// unfollowed when we get the eventual down event)
+		if isShutdown {
+			log.Info("marking host as shutdown", "host.id", host.ID)
+			host.Shutdown = true
+
+			// rectify the omni job counts now the host is shutdown
+			// so that when down events are received for omni jobs,
+			// they are not restarted
+			for _, formation := range s.formations {
+				formation.RectifyOmni(s.activeHostCount())
+			}
+
 			return
 		}
 
@@ -897,12 +1152,16 @@ func (s *Scheduler) HandleHostEvent(e *discoverd.Event) {
 			log.Warn("ignoring host down event, unknown host")
 			return
 		}
-		s.markHostAsUnhealthy(host)
+		if host.Shutdown {
+			s.unfollowHost(host)
+		} else {
+			s.markHostAsUnhealthy(host)
+		}
 	}
 }
 
 func (s *Scheduler) handleNewHost(id string) {
-	log := logger.New("fn", "handleNewHost", "host.id", id)
+	log := s.logger.New("fn", "handleNewHost", "host.id", id)
 	log.Info("host is up, starting job event stream")
 	h, err := s.Host(id)
 	if err != nil {
@@ -922,14 +1181,27 @@ func (s *Scheduler) handleNewHost(id string) {
 	s.maybeStartPendingTagJobs(host)
 }
 
+// activeHostCount returns the number of active hosts (i.e. all hosts which
+// are not shutting down) and is used to determine how many omni jobs should
+// be running when calling formation.RectifyOmni
+func (s *Scheduler) activeHostCount() int {
+	count := 0
+	for _, host := range s.hosts {
+		if !host.Shutdown {
+			count++
+		}
+	}
+	return count
+}
+
 func (s *Scheduler) PerformHostChecks() {
-	log := logger.New("fn", "PerformHostChecks")
+	log := s.logger.New("fn", "PerformHostChecks")
 	log.Info("performing host checks")
 
 	allHealthy := true
 
 	for id, host := range s.hosts {
-		if host.healthy {
+		if host.Healthy {
 			continue
 		}
 
@@ -938,13 +1210,13 @@ func (s *Scheduler) PerformHostChecks() {
 		if _, err := host.client.GetStatus(); err == nil {
 			// assume the host is healthy if we can get its status
 			log.Info("host is now healthy")
-			host.healthy = true
-			host.checks = 0
+			host.Healthy = true
+			host.Checks = 0
 			continue
 		}
 
-		host.checks++
-		if host.checks >= s.maxHostChecks {
+		host.Checks++
+		if host.Checks >= s.maxHostChecks {
 			log.Warn(fmt.Sprintf("host unhealthy for %d consecutive checks, unfollowing", s.maxHostChecks))
 			s.unfollowHost(host)
 			continue
@@ -959,15 +1231,15 @@ func (s *Scheduler) PerformHostChecks() {
 }
 
 func (s *Scheduler) HandleJobEvent(e *host.Event) {
-	log := logger.New("fn", "HandleJobEvent", "job.id", e.JobID, "event.type", e.Event)
+	log := s.logger.New("fn", "HandleJobEvent", "job.id", e.JobID, "event.type", e.Event)
 
 	log.Info("handling job event")
 	job := s.handleActiveJob(e.Job)
 	switch e.Event {
 	case host.JobEventStart:
-		s.sendEvent(EventTypeJobStart, nil, job)
+		log.Debug("handled job start event", "job", job)
 	case host.JobEventStop:
-		s.sendEvent(EventTypeJobStop, nil, job)
+		log.Debug("handled job stop event", "job", job)
 	}
 }
 
@@ -1005,7 +1277,7 @@ func (s *Scheduler) handleActiveJob(activeJob *host.ActiveJob) *Job {
 		s.jobs.Add(job)
 	}
 
-	job.startedAt = activeJob.StartedAt
+	job.StartedAt = activeJob.StartedAt
 	job.metadata = hostJob.Metadata
 	job.exitStatus = activeJob.ExitStatus
 	job.hostError = activeJob.Error
@@ -1020,27 +1292,27 @@ func (s *Scheduler) markAsStopped(job *Job) {
 }
 
 func (s *Scheduler) handleJobStatus(job *Job, status host.JobStatus) {
-	log := logger.New("fn", "handleJobStatus", "job.id", job.JobID, "app.id", job.AppID, "release.id", job.ReleaseID, "job.type", job.Type)
+	log := s.logger.New("fn", "handleJobStatus", "job.id", job.JobID, "app.id", job.AppID, "release.id", job.ReleaseID, "job.type", job.Type)
 
 	// update the job's state, keeping a reference to the previous state
-	previousState := job.state
+	previousState := job.State
 	switch status {
 	case host.StatusStarting:
-		job.state = JobStateStarting
+		job.State = JobStateStarting
 	case host.StatusRunning:
-		job.state = JobStateRunning
+		job.State = JobStateRunning
 	case host.StatusDone, host.StatusCrashed, host.StatusFailed:
-		job.state = JobStateStopped
+		job.State = JobStateStopped
 	}
 
 	// if the job's state has changed, persist it to the controller
-	if job.state != previousState {
-		log.Info("handling job status change", "from", previousState, "to", job.state)
+	if job.State != previousState {
+		log.Info("handling job status change", "from", previousState, "to", job.State)
 		s.persistJob(job)
 	}
 
-	// ensure the job has a known formation
-	if job.Formation == nil {
+	// ensure jobs started as part of a formation change have a known formation
+	if job.metadata["flynn-controller.formation"] == "true" && job.Formation == nil {
 		formation := s.formations.Get(job.AppID, job.ReleaseID)
 		if formation == nil {
 			ef, err := s.GetExpandedFormation(job.AppID, job.ReleaseID)
@@ -1058,7 +1330,7 @@ func (s *Scheduler) handleJobStatus(job *Job, status host.JobStatus) {
 
 				// only log an error if the state changed (so we don't
 				// keep logging it in periodic SyncJobs calls)
-				if job.state != previousState {
+				if job.State != previousState {
 					log.Error("error looking up formation for job", "err", err)
 				}
 				return
@@ -1068,9 +1340,8 @@ func (s *Scheduler) handleJobStatus(job *Job, status host.JobStatus) {
 		job.Formation = formation
 	}
 
-	// if the job has no type, or has a type which is not part of the
-	// release (e.g. a slugbuilder job), then we are done
-	if job.Type == "" || !job.HasTypeFromRelease() {
+	// if the job was not started as part of a formation, then we are done
+	if job.Formation == nil {
 		return
 	}
 
@@ -1081,7 +1352,7 @@ func (s *Scheduler) handleJobStatus(job *Job, status host.JobStatus) {
 
 	// if the job has just transitioned to the stopped state, check if we
 	// expect it to be running, and if we do, restart it
-	if previousState != JobStateStopped && job.state == JobStateStopped {
+	if previousState != JobStateStopped && job.State == JobStateStopped {
 		if diff := s.formationDiff(job.Formation); diff[job.Type] > 0 {
 			s.restartJob(job)
 		}
@@ -1107,11 +1378,11 @@ func (s *Scheduler) persistControllerJob(job *ct.Job) {
 }
 
 func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Formation) {
-	log := logger.New("fn", "handleFormation", "app.id", ef.App.ID, "release.id", ef.Release.ID)
+	log := s.logger.New("fn", "handleFormation", "app.id", ef.App.ID, "release.id", ef.Release.ID)
 
 	defer func() {
 		// ensure the formation has the correct omni job counts
-		if formation.RectifyOmni(len(s.hosts)) {
+		if formation.RectifyOmni(s.activeHostCount()) {
 			s.triggerRectify(formation.key())
 		}
 
@@ -1130,13 +1401,21 @@ func (s *Scheduler) handleFormation(ef *ct.ExpandedFormation) (formation *Format
 		log.Info("adding new formation", "processes", ef.Processes)
 		formation = s.formations.Add(NewFormation(ef))
 	} else {
-		if formation.OriginalProcesses.Equals(ef.Processes) && utils.FormationTagsEqual(formation.Tags, ef.Tags) {
+		diff := Processes(ef.Processes).Diff(formation.OriginalProcesses)
+		if diff.IsEmpty() && utils.FormationTagsEqual(formation.Tags, ef.Tags) {
 			return
-		} else {
-			log.Info("updating processes and tags of existing formation", "processes", ef.Processes, "tags", ef.Tags)
-			formation.Tags = ef.Tags
-			formation.SetProcesses(ef.Processes)
 		}
+
+		// do not completely scale down critical apps for which this is the only active formation
+		// (this prevents for example scaling down discoverd which breaks the cluster)
+		if diff.IsScaleDownOf(formation.OriginalProcesses) && formation.App.Critical() && s.activeFormationCount(formation.App.ID) < 2 {
+			log.Info("refusing to scale down critical app")
+			return
+		}
+
+		log.Info("updating processes and tags of existing formation", "processes", ef.Processes, "tags", ef.Tags)
+		formation.Tags = ef.Tags
+		formation.SetProcesses(ef.Processes)
 	}
 	s.triggerRectify(formation.key())
 	return
@@ -1151,7 +1430,7 @@ func (s *Scheduler) triggerRectify(key utils.FormationKey) {
 }
 
 func (s *Scheduler) stopJobOfType(f *Formation, typ string) (err error) {
-	log := logger.New("fn", "stopJobOfType", "app.id", f.App.ID, "release.id", f.Release.ID, "job.type", typ)
+	log := s.logger.New("fn", "stopJobOfType", "app.id", f.App.ID, "release.id", f.Release.ID, "job.type", typ)
 	log.Info(fmt.Sprintf("stopping %s job", typ))
 
 	defer func() {
@@ -1168,14 +1447,21 @@ func (s *Scheduler) stopJobOfType(f *Formation, typ string) (err error) {
 }
 
 func (s *Scheduler) stopJob(job *Job) error {
-	log := logger.New("fn", "stopJob", "job.id", job.ID, "job.type", job.Type, "job.state", job.state)
+	log := s.logger.New("fn", "stopJob", "job.id", job.ID, "job.type", job.Type, "job.state", job.State)
 	log.Info("stopping job")
 
-	switch job.state {
+	switch job.State {
 	case JobStatePending:
-		// If it's a pending job, we are either in the process
-		// of starting it, or it is scheduled to start in the
-		// future.
+		// If it's a pending job with a HostID, then it has been
+		// placed in the cluster but we are yet to receive a
+		// "starting" event, so we need to explicitly stop it.
+		if job.HostID != "" {
+			break
+		}
+
+		// If it's a pending job which hasn't been placed, we
+		// are either in the process of starting it, or it is
+		// scheduled to start in the future.
 		//
 		// Jobs being actively started can just be marked as
 		// stopped, causing the StartJob goroutine to fail the
@@ -1185,7 +1471,7 @@ func (s *Scheduler) stopJob(job *Job) error {
 		// also marked as stopped so that if the timer has already
 		// fired, it won't actually be placed in the cluster.
 		log.Info("stopping pending job", "job.id", job.ID)
-		job.state = JobStateStopped
+		job.State = JobStateStopped
 		s.persistJob(job)
 		if job.restartTimer != nil {
 			job.restartTimer.Stop()
@@ -1201,11 +1487,20 @@ func (s *Scheduler) stopJob(job *Job) error {
 		return fmt.Errorf("unknown host: %q", job.HostID)
 	}
 
+	// set the state to JobStateStopping in case a StartJob goroutine is
+	// still trying to start the job, in which case it will get an
+	// ErrJobNotPending error on the next call to PlaceJob
+	job.State = JobStateStopping
+
 	log.Info("requesting host to stop job", "host.id", job.HostID)
-	job.state = JobStateStopping
+	// call host.StopJob in a goroutine so it doesn't block the main
+	// scheduler loop
 	go func() {
-		// host.StopJob can block, so run it in a goroutine
 		if err := host.client.StopJob(job.JobID); err != nil {
+			// when an error happens, we don't know if the job actually
+			// stopped or not, but just log the error instead of retrying
+			// and let the next SyncJobs routine determine if another
+			// attempt at stopping the job is necessary
 			log.Error("error requesting host to stop job", "err", err)
 		}
 	}()
@@ -1213,15 +1508,25 @@ func (s *Scheduler) stopJob(job *Job) error {
 }
 
 // findJobToStop finds a job from the given formation and type which should be
-// stopped, choosing pending jobs if present, and the most recently started job
-// otherwise
+// stopped, choosing pending or stopping jobs if present, and the most recently
+// started job otherwise
 func (s *Scheduler) findJobToStop(f *Formation, typ string) (*Job, error) {
 	var runningJob *Job
 	for _, job := range s.jobs.WithFormationAndType(f, typ) {
-		switch job.state {
-		case JobStatePending:
+		switch job.State {
+		case JobStatePending, JobStateStopping:
 			return job, nil
 		case JobStateStarting, JobStateRunning:
+			// if the job is on a host which is shutting down,
+			// return it (it is about to stop anyway, and this
+			// avoids a race where modifying the omni counts to
+			// remove a shut down host could cause a subsequent
+			// rectify to stop a job on an active host before the
+			// shutting down host's job has stopped)
+			if host, ok := s.hosts[job.HostID]; ok && host.Shutdown {
+				return job, nil
+			}
+
 			// return the most recent job (which is the first in
 			// the slice we are iterating over) if none of the
 			// above cases match
@@ -1240,8 +1545,20 @@ func jobConfig(job *Job, hostID string) *host.Job {
 	return utils.JobConfig(job.Formation.ExpandedFormation, job.Type, hostID, job.ID)
 }
 
+func (s *Scheduler) Pause() {
+	s.logger.Info("pausing scheduler")
+	s.pause <- struct{}{}
+	s.logger.Info("scheduler paused")
+}
+
+func (s *Scheduler) Resume() {
+	s.logger.Info("resuming scheduler")
+	s.resume <- struct{}{}
+	s.logger.Info("scheduler resumed")
+}
+
 func (s *Scheduler) Stop() error {
-	log := logger.New("fn", "Stop")
+	log := s.logger.New("fn", "Stop")
 	log.Info("stopping scheduler loop")
 	s.stopOnce.Do(func() {
 		close(s.stop)
@@ -1249,29 +1566,8 @@ func (s *Scheduler) Stop() error {
 	return nil
 }
 
-func (s *Scheduler) Subscribe(events chan Event) stream.Stream {
-	log := logger.New("fn", "Subscribe")
-	log.Info("adding event subscriber")
-	s.listenMtx.Lock()
-	defer s.listenMtx.Unlock()
-	s.listeners[events] = struct{}{}
-	return &Stream{s, events}
-}
-
-func (s *Scheduler) Unsubscribe(events chan Event) {
-	log := logger.New("fn", "Unsubscribe")
-	log.Info("removing event subscriber")
-	s.listenMtx.Lock()
-	defer s.listenMtx.Unlock()
-	delete(s.listeners, events)
-}
-
-func (s *Scheduler) Jobs() map[string]*Job {
-	return <-s.getJobs
-}
-
 func (s *Scheduler) RunningJobs() map[string]*Job {
-	jobs := s.Jobs()
+	jobs := s.InternalState().Jobs
 	runningJobs := make(map[string]*Job, len(jobs))
 	for id, j := range jobs {
 		if j.IsRunning() {
@@ -1282,10 +1578,9 @@ func (s *Scheduler) RunningJobs() map[string]*Job {
 }
 
 func (s *Scheduler) restartJob(job *Job) {
-	restarts := job.restarts
-	// reset the restart count if it has been running for longer than the
-	// back off period
-	if !job.startedAt.IsZero() && job.startedAt.Before(time.Now().Add(-s.backoffPeriod)) {
+	restarts := job.Restarts
+	// reset the restart count if it has been running for more than 5 minutes
+	if !job.StartedAt.IsZero() && job.StartedAt.Before(time.Now().Add(-5*time.Minute)) {
 		restarts = 0
 	}
 	backoff := s.getBackoffDuration(restarts)
@@ -1293,36 +1588,43 @@ func (s *Scheduler) restartJob(job *Job) {
 	// create a new job so its state is tracked separately from the job
 	// it is replacing
 	newJob := &Job{
-		ID:        generateJobUUID(),
+		ID:        s.generateJobUUID(),
 		Type:      job.Type,
 		AppID:     job.AppID,
 		ReleaseID: job.ReleaseID,
 		Formation: job.Formation,
-		runAt:     typeconv.TimePtr(time.Now().Add(backoff)),
-		startedAt: time.Now(),
-		state:     JobStatePending,
-		restarts:  restarts + 1,
+		RunAt:     typeconv.TimePtr(time.Now().Add(backoff)),
+		StartedAt: time.Now(),
+		State:     JobStatePending,
+		Restarts:  restarts + 1,
 	}
 	s.jobs.Add(newJob)
 
 	// persist the job so that it appears as pending in the database
 	s.persistJob(newJob)
 
-	logger.Info("scheduling job restart", "fn", "restartJob", "job.id", newJob.ID, "attempts", newJob.restarts, "delay", backoff)
+	s.logger.Info("scheduling job restart", "fn", "restartJob", "old_job.id", job.ID, "new_job.id", newJob.ID, "attempts", newJob.Restarts, "delay", backoff)
 	newJob.restartTimer = time.AfterFunc(backoff, func() { s.StartJob(newJob) })
 }
 
 func (s *Scheduler) getBackoffDuration(restarts uint) time.Duration {
-	multiplier := 32 // max multiplier
-	if restarts < 6 {
-		// 2^(restarts - 1), or 0 if restarts == 0
-		multiplier = (1 << restarts) >> 1
+	switch {
+	case restarts < 5:
+		return 0
+	case restarts < 15:
+		return 10 * time.Second
+	default:
+		return 30 * time.Second
 	}
-	return s.backoffPeriod * time.Duration(multiplier)
 }
 
 func (s *Scheduler) startHTTPServer(port string) {
-	log := logger.New("fn", "startHTTPServer")
+	log := s.logger.New("fn", "startHTTPServer")
+
+	http.HandleFunc("/debug/state", func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(s.InternalState())
+	})
+
 	status.AddHandler(status.HealthyHandler)
 	addr := ":" + port
 	log.Info("serving HTTP requests", "addr", addr)
@@ -1334,7 +1636,7 @@ func (s *Scheduler) startHTTPServer(port string) {
 }
 
 func (s *Scheduler) tickSyncJobs(d time.Duration) {
-	logger.Info("starting sync jobs ticker", "duration", d)
+	s.logger.Info("starting sync jobs ticker", "duration", d)
 	go func() {
 		for range time.Tick(d) {
 			s.triggerSyncJobs()
@@ -1343,7 +1645,7 @@ func (s *Scheduler) tickSyncJobs(d time.Duration) {
 }
 
 func (s *Scheduler) tickSyncFormations(d time.Duration) {
-	logger.Info("starting sync formations ticker", "duration", d)
+	s.logger.Info("starting sync formations ticker", "duration", d)
 	go func() {
 		for range time.Tick(d) {
 			s.triggerSyncFormations()
@@ -1352,7 +1654,7 @@ func (s *Scheduler) tickSyncFormations(d time.Duration) {
 }
 
 func (s *Scheduler) tickSyncHosts(d time.Duration) {
-	logger.Info("starting sync hosts ticker", "duration", d)
+	s.logger.Info("starting sync hosts ticker", "duration", d)
 	go func() {
 		for range time.Tick(d) {
 			s.triggerSyncHosts()
@@ -1392,129 +1694,4 @@ func (s *Scheduler) triggerHostChecks() {
 	case s.hostChecks <- struct{}{}:
 	default:
 	}
-}
-
-type Stream struct {
-	s      *Scheduler
-	events chan Event
-}
-
-func (s *Stream) Close() error {
-	s.s.Unsubscribe(s.events)
-	return nil
-}
-
-func (s *Stream) Err() error {
-	return nil
-}
-
-func (s *Scheduler) sendEvent(typ EventType, err error, data interface{}) {
-	event := NewEvent(typ, err, data)
-	s.listenMtx.RLock()
-	defer s.listenMtx.RUnlock()
-	if len(s.listeners) > 0 {
-		logger.Info(fmt.Sprintf("sending %s event to %d listener(s)", event.Type(), len(s.listeners)), "event", event.Type(), "err", event.Err())
-	}
-	for ch := range s.listeners {
-		// drop the event if the listener is too slow to avoid blocking the main loop
-		select {
-		case ch <- event:
-		default:
-		}
-	}
-}
-
-type Event interface {
-	Type() EventType
-	Err() error
-	Data() interface{}
-}
-
-type EventType string
-
-const (
-	EventTypeDefault         EventType = "default"
-	EventTypeLeaderChange    EventType = "leader-change"
-	EventTypeClusterSync     EventType = "cluster-sync"
-	EventTypeFormationSync   EventType = "formation-sync"
-	EventTypeFormationChange EventType = "formation-change"
-	EventTypeRectify         EventType = "rectify"
-	EventTypeJobStart        EventType = "start-job"
-	EventTypeJobStop         EventType = "stop-job"
-	EventTypeHostEvent       EventType = "host-event"
-)
-
-type DefaultEvent struct {
-	err error
-	typ EventType
-}
-
-func (de *DefaultEvent) Err() error {
-	return de.err
-}
-
-func (de *DefaultEvent) Type() EventType {
-	return de.typ
-}
-
-func (de *DefaultEvent) Data() interface{} {
-	return nil
-}
-
-type JobEvent struct {
-	Event
-	Job *Job
-}
-
-func (je *JobEvent) Data() interface{} {
-	return je.Job
-}
-
-type LeaderChangeEvent struct {
-	Event
-	IsLeader bool
-}
-
-func (lce *LeaderChangeEvent) Data() interface{} {
-	return lce.IsLeader
-}
-
-type RectifyEvent struct {
-	Event
-	FormationKey utils.FormationKey
-}
-
-func (re *RectifyEvent) Data() interface{} {
-	return re.FormationKey
-}
-
-func NewEvent(typ EventType, err error, data interface{}) Event {
-	switch typ {
-	case EventTypeJobStop:
-		fallthrough
-	case EventTypeJobStart:
-		job, _ := data.(*Job)
-		return &JobEvent{Event: &DefaultEvent{err: err, typ: typ}, Job: job}
-	case EventTypeLeaderChange:
-		isLeader, _ := data.(bool)
-		return &LeaderChangeEvent{Event: &DefaultEvent{err: err, typ: typ}, IsLeader: isLeader}
-	case EventTypeRectify:
-		key, _ := data.(utils.FormationKey)
-		return &RectifyEvent{Event: &DefaultEvent{err: err, typ: typ}, FormationKey: key}
-	default:
-		return &DefaultEvent{err: err, typ: typ}
-	}
-}
-
-func getBackoffPeriod() time.Duration {
-	backoffPeriod := 10 * time.Minute
-
-	if period := os.Getenv("BACKOFF_PERIOD"); period != "" {
-		p, err := time.ParseDuration(period)
-		if err == nil {
-			backoffPeriod = p
-		}
-	}
-
-	return backoffPeriod
 }

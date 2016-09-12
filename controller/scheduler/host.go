@@ -2,34 +2,39 @@ package main
 
 import (
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
+	"github.com/flynn/flynn/controller/testutils"
 	"github.com/flynn/flynn/controller/utils"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/stream"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type Host struct {
-	ID       string
-	Tags     map[string]string
+	ID       string            `json:"id"`
+	Tags     map[string]string `json:"tags"`
+	Healthy  bool              `json:"healthy"`
+	Checks   int               `json:"checks"`
+	Shutdown bool              `json:"shutdown"`
+
 	client   utils.HostClient
-	healthy  bool
-	checks   int
 	stop     chan struct{}
 	stopOnce sync.Once
 	done     chan struct{}
+	logger   log15.Logger
 }
 
-func NewHost(h utils.HostClient) *Host {
+func NewHost(h utils.HostClient, l log15.Logger) *Host {
 	return &Host{
 		ID:      h.ID(),
 		Tags:    h.Tags(),
+		Healthy: true,
 		client:  h,
-		healthy: true,
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
+		logger:  l,
 	}
 }
 
@@ -48,7 +53,7 @@ func (h *Host) TagsEqual(tags map[string]string) bool {
 // StreamEventsTo streams all job events from the host to the given channel in
 // a goroutine, returning the current list of active jobs.
 func (h *Host) StreamEventsTo(ch chan *host.Event) (map[string]host.ActiveJob, error) {
-	log := logger.New("fn", "StreamEventsTo", "host.id", h.ID)
+	log := h.logger.New("fn", "StreamEventsTo", "host.id", h.ID)
 	var events chan *host.Event
 	var stream stream.Stream
 	connect := func() (err error) {
@@ -84,6 +89,12 @@ func (h *Host) StreamEventsTo(ch chan *host.Event) (map[string]host.ActiveJob, e
 						break eventLoop
 					}
 					ch <- event
+
+					// if the host is a FakeHostClient with TestEventHook
+					// set, send on the channel to synchronize with tests
+					if h, ok := h.client.(*testutils.FakeHostClient); ok && h.TestEventHook != nil {
+						h.TestEventHook <- struct{}{}
+					}
 				case <-h.stop:
 					return
 				}
@@ -115,11 +126,3 @@ func (h *Host) Close() {
 		<-h.done
 	})
 }
-
-// sortHosts sorts Hosts lexicographically based on their ID
-type sortHosts []*Host
-
-func (s sortHosts) Len() int           { return len(s) }
-func (s sortHosts) Less(i, j int) bool { return s[i].ID < s[j].ID }
-func (s sortHosts) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s sortHosts) Sort()              { sort.Sort(s) }

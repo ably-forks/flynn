@@ -3,14 +3,15 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/host/resource"
 	"github.com/flynn/flynn/pkg/typeconv"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -31,26 +32,26 @@ Commands:
 Examples:
 
 	$ flynn limit
-	web:     max_fd=10000  memory=1GB
-	worker:  max_fd=10000  memory=1GB
+	web:     cpu=1000  max_fd=10000  memory=1GB
+	worker:  cpu=1000  max_fd=10000  memory=1GB
 
-	$ flynn limit set web memory=512MB max_fd=12000
+	$ flynn limit set web memory=512MB max_fd=12000 cpu=500
 	Created release 5058ae7964f74c399a240bdd6e7d1bcb
 
 	$ flynn limit
-	web:     max_fd=12000  memory=512MB
-	worker:  max_fd=10000  memory=1GB
+	web:     cpu=500   max_fd=12000  memory=512MB
+	worker:  cpu=1000  max_fd=10000  memory=1GB
 
 	$ flynn limit set web memory=256MB
 	Created release b39fe25d0ea344b6b2af5cf4d6542a80
 
 	$ flynn limit
-	web:     max_fd=12000  memory=256MB
-	worker:  max_fd=10000  memory=1GB
+	web:     cpu=500   max_fd=12000  memory=256MB
+	worker:  cpu=1000  max_fd=10000  memory=1GB
 `)
 }
 
-func runLimit(args *docopt.Args, client *controller.Client) error {
+func runLimit(args *docopt.Args, client controller.Client) error {
 	if args.Bool["set"] {
 		return runLimitSet(args, client)
 	}
@@ -91,22 +92,21 @@ func formatLimits(w io.Writer, s string, r resource.Resources) {
 	fmt.Fprintf(w, "%s:\t%s\n", s, strings.Join(limits, "\t"))
 }
 
-func runLimitSet(args *docopt.Args, client *controller.Client) error {
+func runLimitSet(args *docopt.Args, client controller.Client) error {
 	proc := args.String["<proc>"]
 	release, err := client.GetAppRelease(mustApp())
 	if err == controller.ErrNotFound {
 		release = &ct.Release{}
-		if proc != "" {
-			release.Processes = make(map[string]ct.ProcessType)
-			release.Processes[proc] = ct.ProcessType{}
-		}
 	} else if err != nil {
 		return err
 	}
 
+	if release.Processes == nil {
+		release.Processes = make(map[string]ct.ProcessType)
+	}
 	t, ok := release.Processes[proc]
-	if !ok {
-		return fmt.Errorf("unknown process type %q", proc)
+	if !ok && proc != "slugbuilder" {
+		fmt.Fprintf(os.Stderr, "Warning: %q is not an existing process type, setting anyway\n", proc)
 	}
 	if t.Resources == nil {
 		t.Resources = resource.Defaults()
@@ -134,7 +134,7 @@ func runLimitSet(args *docopt.Args, client *controller.Client) error {
 	if err := client.CreateRelease(release); err != nil {
 		return err
 	}
-	if err := client.DeployAppRelease(mustApp(), release.ID); err != nil {
+	if err := client.DeployAppRelease(mustApp(), release.ID, nil); err != nil {
 		return err
 	}
 	fmt.Printf("Created release %s\n", release.ID)

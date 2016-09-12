@@ -6,13 +6,23 @@ import (
 	"os"
 	"strings"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/resource"
 	"github.com/flynn/flynn/pkg/shutdown"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
+)
+
+const (
+	disallowConns   = `UPDATE pg_database SET datallowconn = FALSE WHERE datname = $1`
+	disconnectConns = `
+SELECT pg_terminate_backend(pg_stat_activity.pid)
+FROM pg_stat_activity
+WHERE pg_stat_activity.datname = $1
+  AND pid <> pg_backend_pid();`
 )
 
 var serviceName = os.Getenv("FLYNN_POSTGRES")
@@ -37,9 +47,9 @@ func main() {
 	api := &pgAPI{db}
 
 	router := httprouter.New()
-	router.POST("/databases", api.createDatabase)
-	router.DELETE("/databases", api.dropDatabase)
-	router.GET("/ping", api.ping)
+	router.POST("/databases", httphelper.WrapHandler(api.createDatabase))
+	router.DELETE("/databases", httphelper.WrapHandler(api.dropDatabase))
+	router.GET("/ping", httphelper.WrapHandler(api.ping))
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -61,7 +71,7 @@ type pgAPI struct {
 	db *postgres.DB
 }
 
-func (p *pgAPI) createDatabase(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+func (p *pgAPI) createDatabase(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	username, password, database := random.Hex(16), random.Hex(16), random.Hex(16)
 
 	if err := p.db.Exec(fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '%s'`, username, password)); err != nil {
@@ -88,10 +98,22 @@ func (p *pgAPI) createDatabase(w http.ResponseWriter, req *http.Request, _ httpr
 	})
 }
 
-func (p *pgAPI) dropDatabase(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+func (p *pgAPI) dropDatabase(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	id := strings.SplitN(strings.TrimPrefix(req.FormValue("id"), "/databases/"), ":", 2)
 	if len(id) != 2 || id[1] == "" {
 		httphelper.ValidationError(w, "id", "is invalid")
+		return
+	}
+
+	// disable new connections to the target database
+	if err := p.db.Exec(disallowConns, id[1]); err != nil {
+		httphelper.Error(w, err)
+		return
+	}
+
+	// terminate current connections
+	if err := p.db.Exec(disconnectConns, id[1]); err != nil {
+		httphelper.Error(w, err)
 		return
 	}
 
@@ -108,7 +130,7 @@ func (p *pgAPI) dropDatabase(w http.ResponseWriter, req *http.Request, _ httprou
 	w.WriteHeader(200)
 }
 
-func (p *pgAPI) ping(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+func (p *pgAPI) ping(ctx context.Context, w http.ResponseWriter, req *http.Request) {
 	if err := p.db.Exec("SELECT 1"); err != nil {
 		httphelper.Error(w, err)
 		return

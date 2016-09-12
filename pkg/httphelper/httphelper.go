@@ -10,12 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/pkg/cors"
 	"github.com/flynn/flynn/pkg/ctxhelper"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/jackc/pgx"
+	"github.com/julienschmidt/httprouter"
+	"golang.org/x/net/context"
 )
 
 type ErrorCode string
@@ -30,6 +30,8 @@ const (
 	PreconditionFailedErrorCode ErrorCode = "precondition_failed"
 	UnauthorizedErrorCode       ErrorCode = "unauthorized"
 	UnknownErrorCode            ErrorCode = "unknown_error"
+	RatelimitedErrorCode        ErrorCode = "ratelimited"
+	ServiceUnavailableErrorCode ErrorCode = "service_unavailable"
 )
 
 var errorResponseCodes = map[ErrorCode]int{
@@ -42,6 +44,8 @@ var errorResponseCodes = map[ErrorCode]int{
 	ValidationErrorCode:         400,
 	UnauthorizedErrorCode:       401,
 	UnknownErrorCode:            500,
+	RatelimitedErrorCode:        429,
+	ServiceUnavailableErrorCode: 503,
 }
 
 type JSONError struct {
@@ -212,8 +216,16 @@ func ObjectExistsError(w http.ResponseWriter, message string) {
 	Error(w, ObjectExistsErr(message))
 }
 
+func ConflictError(w http.ResponseWriter, message string) {
+	Error(w, JSONError{Code: ConflictErrorCode, Message: message})
+}
+
 func PreconditionFailedErr(message string) error {
 	return JSONError{Code: PreconditionFailedErrorCode, Message: message}
+}
+
+func ServiceUnavailableError(w http.ResponseWriter, message string) {
+	Error(w, JSONError{Code: ServiceUnavailableErrorCode, Message: message, Retry: true})
 }
 
 func ValidationError(w http.ResponseWriter, field, message string) {
@@ -246,5 +258,6 @@ func JSON(w http.ResponseWriter, status int, v interface{}) {
 
 func DecodeJSON(req *http.Request, i interface{}) error {
 	dec := json.NewDecoder(req.Body)
+	dec.UseNumber()
 	return dec.Decode(i)
 }

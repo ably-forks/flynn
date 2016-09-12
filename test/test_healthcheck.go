@@ -5,11 +5,11 @@ import (
 	"net/http"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/status"
+	c "github.com/flynn/go-check"
 )
 
 type HealthcheckSuite struct {
@@ -130,8 +130,11 @@ func (s *HealthcheckSuite) TestStatus(t *c.C) {
 	t.Assert(err, c.IsNil)
 
 	t.Assert(data.Data.Status, c.Equals, status.CodeHealthy)
-	t.Assert(data.Data.Detail, c.HasLen, 11)
+	t.Assert(data.Data.Detail, c.HasLen, 13)
+	optional := map[string]bool{"mariadb": true}
 	for name, s := range data.Data.Detail {
-		t.Assert(s.Status, c.Equals, status.CodeHealthy, c.Commentf("name = %s", name))
+		if !optional[name] {
+			t.Assert(s.Status, c.Equals, status.CodeHealthy, c.Commentf("name = %s", name))
+		}
 	}
 }

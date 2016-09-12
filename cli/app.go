@@ -5,9 +5,9 @@ import (
 	"log"
 	"os/exec"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -84,7 +84,7 @@ Examples:
 `)
 }
 
-func runCreate(args *docopt.Args, client *controller.Client) error {
+func runCreate(args *docopt.Args, client controller.Client) error {
 	app := &ct.App{}
 	app.Name = args.String["<name>"]
 	remote := args.String["--remote"]
@@ -114,7 +114,7 @@ func runCreate(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runDelete(args *docopt.Args, client *controller.Client) error {
+func runDelete(args *docopt.Args, client controller.Client) error {
 	appName := mustApp()
 	remote := args.String["--remote"]
 
@@ -122,6 +122,11 @@ func runDelete(args *docopt.Args, client *controller.Client) error {
 		if !promptYesNo(fmt.Sprintf("Are you sure you want to delete the app %q?", appName)) {
 			return nil
 		}
+	}
+
+	// scale formation down to 0
+	if err := scaleToZero(appName, client); err != nil {
+		return err
 	}
 
 	res, err := client.DeleteApp(appName)
@@ -137,12 +142,12 @@ func runDelete(args *docopt.Args, client *controller.Client) error {
 		}
 	}
 
-	log.Printf("Deleted %s (removed %d routes, deprovisioned %d resources)",
-		appName, len(res.DeletedRoutes), len(res.DeletedResources))
+	log.Printf("Deleted %s (removed %d routes, deleted %d releases, deprovisioned %d resources)",
+		appName, len(res.DeletedRoutes), len(res.DeletedReleases), len(res.DeletedResources))
 	return nil
 }
 
-func runApps(args *docopt.Args, client *controller.Client) error {
+func runApps(args *docopt.Args, client controller.Client) error {
 	apps, err := client.AppList()
 	if err != nil {
 		return err
@@ -158,7 +163,7 @@ func runApps(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runInfo(_ *docopt.Args, client *controller.Client) error {
+func runInfo(_ *docopt.Args, client controller.Client) error {
 	appName := mustApp()
 
 	fmt.Println("===", appName)
@@ -167,7 +172,7 @@ func runInfo(_ *docopt.Args, client *controller.Client) error {
 	defer w.Flush()
 
 	if release, err := client.GetAppRelease(appName); err == nil || err == controller.ErrNotFound {
-		if err == controller.ErrNotFound || release.Env["SLUG_URL"] != "" {
+		if err == controller.ErrNotFound || release.IsGitDeploy() {
 			listRec(w, "Git URL:", gitURL(clusterConf, appName))
 		}
 	} else {
@@ -179,7 +184,7 @@ func runInfo(_ *docopt.Args, client *controller.Client) error {
 			if k.Type == "http" {
 				route := k.HTTPRoute()
 				protocol := "https"
-				if route.TLSCert == "" {
+				if route.Certificate == nil && route.LegacyTLSCert == "" {
 					protocol = "http"
 				}
 				listRec(w, "Web URL:", protocol+"://"+route.Domain)
@@ -188,5 +193,54 @@ func runInfo(_ *docopt.Args, client *controller.Client) error {
 		}
 	}
 
+	return nil
+}
+
+func scaleToZero(appName string, client controller.Client) error {
+	release, err := client.GetAppRelease(appName)
+	if err == controller.ErrNotFound {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	formation, err := client.GetFormation(appName, release.ID)
+	if err == controller.ErrNotFound {
+		formation = &ct.Formation{
+			AppID:     appName,
+			ReleaseID: release.ID,
+			Processes: make(map[string]int),
+		}
+	} else if err != nil {
+		return err
+	}
+
+	if len(formation.Processes) == 0 {
+		return nil
+	}
+	processes := make(map[string]int)
+	expected := client.ExpectedScalingEvents(formation.Processes, processes, release.Processes, 1)
+
+	if expected.Count() == 0 {
+		return nil
+	}
+
+	watcher, err := client.WatchJobEvents(appName, release.ID)
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	// override with empty processes map
+	formation.Processes = processes
+	err = client.PutFormation(formation)
+	if err != nil {
+		return err
+	}
+	err = watcher.WaitFor(expected, scaleTimeout, func(job *ct.Job) error {
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 	return nil
 }

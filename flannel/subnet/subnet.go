@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/flynn/flynn/Godeps/_workspace/src/github.com/golang/glog"
+	log "github.com/golang/glog"
 
 	"github.com/flynn/flynn/flannel/pkg/ip"
 	"github.com/flynn/flynn/flannel/pkg/task"
@@ -241,43 +241,6 @@ func (sm *SubnetManager) getLeases() ([]SubnetLease, error) {
 func deleteLease(l []SubnetLease, i int) []SubnetLease {
 	l[i], l = l[len(l)-1], l[:len(l)-1]
 	return l
-}
-
-func (sm *SubnetManager) applyLeases(newLeases []SubnetLease) EventBatch {
-	sm.mtx.Lock()
-	defer sm.mtx.Unlock()
-
-	var batch EventBatch
-
-	for _, l := range newLeases {
-		// skip self
-		if l.Network.Equal(sm.myLease.Network) {
-			continue
-		}
-
-		found := false
-		for i, c := range sm.leases {
-			if c.Network.Equal(l.Network) {
-				sm.leases = deleteLease(sm.leases, i)
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			// new subnet
-			batch = append(batch, Event{SubnetAdded, l})
-		}
-	}
-
-	// everything left in sm.leases has been deleted
-	for _, c := range sm.leases {
-		batch = append(batch, Event{SubnetRemoved, c})
-	}
-
-	sm.leases = newLeases
-
-	return batch
 }
 
 func (sm *SubnetManager) applySubnetChange(action string, ipn ip.IP4Net, data []byte) (Event, error) {

@@ -2,15 +2,13 @@ package main
 
 import (
 	"io"
-	"io/ioutil"
-	"strings"
 
-	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	tu "github.com/flynn/flynn/controller/testutils"
 	ct "github.com/flynn/flynn/controller/types"
 	host "github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/random"
+	. "github.com/flynn/go-check"
 )
 
 func (s *S) createTestJob(c *C, in *ct.Job) *ct.Job {
@@ -58,17 +56,18 @@ func (s *S) TestJobListActive(c *C) {
 		createJob(ct.JobStateStarting),
 		createJob(ct.JobStateUp),
 		createJob(ct.JobStateDown),
+		createJob(ct.JobStatePending),
 		createJob(ct.JobStateStarting),
 		createJob(ct.JobStateUp),
 	}
 
 	list, err := s.c.JobListActive()
 	c.Assert(err, IsNil)
-	c.Assert(list, HasLen, 4)
+	c.Assert(list, HasLen, 6)
 
-	// check that we only get jobs with a starting or running state,
+	// check that we only get jobs with a pending, starting or up state,
 	// most recently updated first
-	expected := []*ct.Job{jobs[5], jobs[4], jobs[2], jobs[1]}
+	expected := []*ct.Job{jobs[6], jobs[5], jobs[4], jobs[2], jobs[1], jobs[0]}
 	for i, job := range expected {
 		actual := list[i]
 		c.Assert(actual.UUID, Equals, job.UUID)
@@ -107,21 +106,8 @@ func (s *S) TestJobGet(c *C) {
 	}
 }
 
-func newFakeLog(r io.Reader) *fakeLog {
-	return &fakeLog{r}
-}
-
-type fakeLog struct {
-	io.Reader
-}
-
 func fakeHostID() string {
 	return random.Hex(16)
-}
-
-func (l *fakeLog) Close() error { return nil }
-func (l *fakeLog) Write([]byte) (int, error) {
-	return 0, io.ErrUnexpectedEOF
 }
 
 func (s *S) TestKillJob(c *C) {
@@ -140,7 +126,7 @@ func (s *S) TestKillJob(c *C) {
 		State:     ct.JobStateStarting,
 		Meta:      map[string]string{"some": "info"},
 	})
-	hc := tu.NewFakeHostClient(hostID)
+	hc := tu.NewFakeHostClient(hostID, false)
 	hc.AddJob(&host.Job{ID: jobID})
 	s.cc.AddHost(hc)
 
@@ -151,21 +137,21 @@ func (s *S) TestKillJob(c *C) {
 
 func (s *S) TestRunJobDetached(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "run-detached"})
+	artifact := s.createTestArtifact(c, &ct.Artifact{Type: host.ArtifactTypeDocker, URI: "docker://foo/bar"})
 	hostID := fakeHostID()
-	host := tu.NewFakeHostClient(hostID)
+	host := tu.NewFakeHostClient(hostID, false)
 	s.cc.AddHost(host)
 
-	artifact := s.createTestArtifact(c, &ct.Artifact{Type: "docker", URI: "docker://foo/bar"})
 	release := s.createTestRelease(c, &ct.Release{
-		ArtifactID: artifact.ID,
-		Env:        map[string]string{"RELEASE": "true", "FOO": "bar"},
+		ArtifactIDs: []string{artifact.ID},
+		Env:         map[string]string{"RELEASE": "true", "FOO": "bar"},
 	})
 
-	cmd := []string{"foo", "bar"}
+	args := []string{"foo", "bar"}
 	req := &ct.NewJob{
 		ReleaseID:  release.ID,
 		ReleaseEnv: true,
-		Cmd:        cmd,
+		Args:       args,
 		Env:        map[string]string{"JOB": "true", "FOO": "baz"},
 		Meta:       map[string]string{"foo": "baz"},
 	}
@@ -174,7 +160,7 @@ func (s *S) TestRunJobDetached(c *C) {
 	c.Assert(res.ID, Not(Equals), "")
 	c.Assert(res.ReleaseID, Equals, release.ID)
 	c.Assert(res.Type, Equals, "")
-	c.Assert(res.Cmd, DeepEquals, cmd)
+	c.Assert(res.Args, DeepEquals, args)
 
 	jobs, err := host.ListJobs()
 	c.Assert(err, IsNil)
@@ -187,7 +173,7 @@ func (s *S) TestRunJobDetached(c *C) {
 			"flynn-controller.release":  release.ID,
 			"foo": "baz",
 		})
-		c.Assert(job.Config.Cmd, DeepEquals, []string{"foo", "bar"})
+		c.Assert(job.Config.Args, DeepEquals, []string{"foo", "bar"})
 		c.Assert(job.Config.Env, DeepEquals, map[string]string{
 			"FLYNN_APP_ID":       app.ID,
 			"FLYNN_RELEASE_ID":   release.ID,
@@ -204,10 +190,10 @@ func (s *S) TestRunJobDetached(c *C) {
 func (s *S) TestRunJobAttached(c *C) {
 	app := s.createTestApp(c, &ct.App{Name: "run-attached"})
 	hostID := fakeHostID()
-	hc := tu.NewFakeHostClient(hostID)
+	hc := tu.NewFakeHostClient(hostID, false)
 	s.cc.AddHost(hc)
 
-	done := make(chan struct{})
+	input := make(chan string, 1)
 	var jobID string
 	hc.SetAttachFunc("*", func(req *host.AttachReq, wait bool) (cluster.AttachClient, error) {
 		c.Assert(wait, Equals, true)
@@ -219,29 +205,30 @@ func (s *S) TestRunJobAttached(c *C) {
 			Width:  10,
 		})
 		jobID = req.JobID
-		pipeR, pipeW := io.Pipe()
+		inPipeR, inPipeW := io.Pipe()
 		go func() {
-			stdin, err := ioutil.ReadAll(pipeR)
-			c.Assert(err, IsNil)
-			c.Assert(string(stdin), Equals, "test in")
-			close(done)
+			buf := make([]byte, 10)
+			n, _ := inPipeR.Read(buf)
+			input <- string(buf[:n])
 		}()
+		outPipeR, outPipeW := io.Pipe()
+		go outPipeW.Write([]byte("test out"))
 		return cluster.NewAttachClient(struct {
 			io.Reader
 			io.WriteCloser
-		}{strings.NewReader("test out"), pipeW}), nil
+		}{outPipeR, inPipeW}), nil
 	})
 
-	artifact := s.createTestArtifact(c, &ct.Artifact{Type: "docker", URI: "docker://foo/bar"})
+	artifact := s.createTestArtifact(c, &ct.Artifact{Type: host.ArtifactTypeDocker, URI: "docker://foo/bar"})
 	release := s.createTestRelease(c, &ct.Release{
-		ArtifactID: artifact.ID,
-		Env:        map[string]string{"RELEASE": "true", "FOO": "bar"},
+		ArtifactIDs: []string{artifact.ID},
+		Env:         map[string]string{"RELEASE": "true", "FOO": "bar"},
 	})
 
 	data := &ct.NewJob{
 		ReleaseID:  release.ID,
 		ReleaseEnv: true,
-		Cmd:        []string{"foo", "bar"},
+		Args:       []string{"foo", "bar"},
 		Env:        map[string]string{"JOB": "true", "FOO": "baz"},
 		Meta:       map[string]string{"foo": "baz"},
 		TTY:        true,
@@ -253,10 +240,11 @@ func (s *S) TestRunJobAttached(c *C) {
 
 	_, err = rwc.Write([]byte("test in"))
 	c.Assert(err, IsNil)
-	rwc.CloseWrite()
-	stdout, err := ioutil.ReadAll(rwc)
+	c.Assert(<-input, Equals, "test in")
+	buf := make([]byte, 10)
+	n, _ := rwc.Read(buf)
 	c.Assert(err, IsNil)
-	c.Assert(string(stdout), Equals, "test out")
+	c.Assert(string(buf[:n]), Equals, "test out")
 	rwc.Close()
 
 	jobs, err := hc.ListJobs()
@@ -270,7 +258,7 @@ func (s *S) TestRunJobAttached(c *C) {
 			"flynn-controller.release":  release.ID,
 			"foo": "baz",
 		})
-		c.Assert(job.Config.Cmd, DeepEquals, []string{"foo", "bar"})
+		c.Assert(job.Config.Args, DeepEquals, []string{"foo", "bar"})
 		c.Assert(job.Config.Env, DeepEquals, map[string]string{
 			"FLYNN_APP_ID":       app.ID,
 			"FLYNN_RELEASE_ID":   release.ID,

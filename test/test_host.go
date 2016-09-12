@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
@@ -21,6 +20,7 @@ import (
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/schedutil"
+	c "github.com/flynn/go-check"
 )
 
 type HostSuite struct {
@@ -51,15 +51,19 @@ func (s *HostSuite) TestAddFailingJob(t *c.C) {
 	t.Assert(err, c.IsNil)
 	defer stream.Close()
 
-	// add a job with a non existent artifact
+	// add a job with a non existent partition
 	job := &host.Job{
-		ID:       jobID,
-		Artifact: host.Artifact{Type: "docker", URI: "http://example.com?name=foo&id=bar"},
+		ID: jobID,
+		ImageArtifact: &host.Artifact{
+			Type: host.ArtifactTypeDocker,
+			URI:  "http://example.com?name=foo&id=bar",
+		},
+		Partition: "nonexistent",
 	}
 	t.Assert(h.AddJob(job), c.IsNil)
 
 	// check we get a create then error event
-	actual := make([]*host.Event, 0, 2)
+	actual := make(map[string]*host.Event, 2)
 loop:
 	for {
 		select {
@@ -67,7 +71,10 @@ loop:
 			if !ok {
 				t.Fatalf("job event stream closed unexpectedly: %s", stream.Err())
 			}
-			actual = append(actual, e)
+			if _, ok := actual[e.Event]; ok {
+				t.Fatalf("unexpected event: %v", e)
+			}
+			actual[e.Event] = e
 			if len(actual) >= 2 {
 				break loop
 			}
@@ -75,12 +82,12 @@ loop:
 			t.Fatal("timed out waiting for job event")
 		}
 	}
-	t.Assert(actual, c.HasLen, 2)
-	t.Assert(actual[0].Event, c.Equals, host.JobEventCreate)
-	t.Assert(actual[1].Event, c.Equals, host.JobEventError)
-	jobErr := actual[1].Job.Error
-	t.Assert(jobErr, c.NotNil)
-	t.Assert(*jobErr, c.Equals, "registry: repo not found")
+	t.Assert(actual[host.JobEventCreate], c.NotNil)
+	e := actual[host.JobEventError]
+	t.Assert(e, c.NotNil)
+	t.Assert(e.Job, c.NotNil)
+	t.Assert(e.Job.Error, c.NotNil)
+	t.Assert(*e.Job.Error, c.Equals, `host: invalid job partition "nonexistent"`)
 }
 
 func (s *HostSuite) TestAttachNonExistentJob(t *c.C) {
@@ -155,7 +162,7 @@ func makeIshApp(cluster *cluster.Client, h *cluster.Host, dc *discoverd.Client, 
 	// run a job that accepts tcp connections and performs tasks we ask of it in its container
 	cmd := exec.JobUsingCluster(cluster, exec.DockerImage(imageURIs["test-apps"]), &host.Job{
 		Config: host.ContainerConfig{
-			Cmd:   []string{"/bin/ish"},
+			Args:  []string{"/bin/ish"},
 			Ports: []host.Port{{Proto: "tcp"}},
 			Env: map[string]string{
 				"NAME": serviceName,
@@ -286,7 +293,7 @@ func (s *HostSuite) TestSignalJob(t *c.C) {
 	// start a signal-service job
 	cmd := exec.JobUsingCluster(cluster, exec.DockerImage(imageURIs["test-apps"]), &host.Job{
 		Config: host.ContainerConfig{
-			Cmd:        []string{"/bin/signal"},
+			Args:       []string{"/bin/signal"},
 			DisableLog: true,
 		},
 	})
@@ -321,7 +328,7 @@ func (s *HostSuite) TestResourceLimits(t *c.C) {
 		s.clusterClient(t),
 		exec.DockerImage(imageURIs["test-apps"]),
 		&host.Job{
-			Config:    host.ContainerConfig{Cmd: []string{"sh", "-c", resourceCmd}},
+			Config:    host.ContainerConfig{Args: []string{"sh", "-c", resourceCmd}},
 			Resources: testResources(),
 		},
 	)
@@ -342,6 +349,55 @@ func (s *HostSuite) TestResourceLimits(t *c.C) {
 	assertResourceLimits(t, out.String())
 }
 
+func (s *HostSuite) TestDevStdout(t *c.C) {
+	cmd := exec.CommandUsingCluster(
+		s.clusterClient(t),
+		exec.DockerImage(imageURIs["test-apps"]),
+		"sh", "-c", "echo foo > /dev/stdout; echo bar > /dev/stderr",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := make(chan error)
+	go func() {
+		runErr <- cmd.Run()
+	}()
+	select {
+	case err := <-runErr:
+		t.Assert(err, c.IsNil)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for /dev/stdout job")
+	}
+
+	t.Assert(stdout.String(), c.Equals, "foo\n")
+	t.Assert(stderr.String(), c.Equals, "bar\n")
+}
+
+func (s *HostSuite) TestDevSHM(t *c.C) {
+	cmd := exec.CommandUsingCluster(
+		s.clusterClient(t),
+		exec.DockerImage(imageURIs["test-apps"]),
+		"sh", "-c", "df -h /dev/shm && echo foo > /dev/shm/asdf",
+	)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	runErr := make(chan error)
+	go func() {
+		runErr <- cmd.Run()
+	}()
+	select {
+	case err := <-runErr:
+		t.Assert(err, c.IsNil)
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for /dev/shm job")
+	}
+
+	t.Assert(out.String(), c.Equals, "Filesystem                Size      Used Available Use% Mounted on\nshm                      64.0M         0     64.0M   0% /dev/shm\n")
+}
+
 func (s *HostSuite) TestUpdate(t *c.C) {
 	dir := t.MkDir()
 	flynnHost := filepath.Join(dir, "flynn-host")
@@ -359,6 +415,7 @@ func (s *HostSuite) TestUpdate(t *c.C) {
 		"--backend", "mock",
 		"--vol-provider", "mock",
 		"--volpath", filepath.Join(dir, "volumes"),
+		"--log-dir", filepath.Join(dir, "logs"),
 	)
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -399,6 +456,7 @@ func (s *HostSuite) TestUpdate(t *c.C) {
 		"--backend", "mock",
 		"--vol-provider", "mock",
 		"--volpath", filepath.Join(dir, "volumes"),
+		"--log-dir", filepath.Join(dir, "logs"),
 	)
 	t.Assert(err, c.IsNil)
 	defer syscall.Kill(pid, syscall.SIGKILL)

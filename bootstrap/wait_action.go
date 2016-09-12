@@ -21,7 +21,7 @@ func init() {
 }
 
 func (a *WaitAction) Run(s *State) error {
-	const waitMax = time.Minute
+	const waitMax = 5 * time.Minute
 	const waitInterval = 500 * time.Millisecond
 
 	if a.Status == 0 {
@@ -32,9 +32,11 @@ func (a *WaitAction) Run(s *State) error {
 	if err != nil {
 		return err
 	}
-	lookupDiscoverdURLHost(s, u, waitMax)
+	if err := lookupDiscoverdURLHost(s, u, waitMax); err != nil {
+		return err
+	}
 
-	start := time.Now()
+	timeout := time.After(waitMax)
 	for {
 		var result string
 
@@ -69,10 +71,11 @@ func (a *WaitAction) Run(s *State) error {
 			return fmt.Errorf("bootstrap: unknown protocol")
 		}
 	fail:
-		if time.Now().Sub(start) >= waitMax {
+		select {
+		case <-timeout:
 			return fmt.Errorf("bootstrap: timed out waiting for %s, last response %s", a.URL, result)
+		case <-time.After(waitInterval):
 		}
-		time.Sleep(waitInterval)
 	}
 }
 

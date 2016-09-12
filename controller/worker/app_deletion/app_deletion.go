@@ -6,20 +6,20 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/pkg/postgres"
+	"github.com/flynn/que-go"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type context struct {
 	db     *postgres.DB
-	client *controller.Client
+	client controller.Client
 	logger log15.Logger
 }
 
-func JobHandler(db *postgres.DB, client *controller.Client, logger log15.Logger) func(*que.Job) error {
+func JobHandler(db *postgres.DB, client controller.Client, logger log15.Logger) func(*que.Job) error {
 	return (&context{db, client, logger}).HandleAppDeletion
 }
 
@@ -52,6 +52,30 @@ func (c *context) HandleAppDeletion(job *que.Job) (err error) {
 		a.DeletedRoutes = append(a.DeletedRoutes, route)
 	}
 	log.Info(fmt.Sprintf("deleted %d routes", len(a.DeletedRoutes)))
+
+	log.Info("getting app releases")
+	releases, err := c.client.AppReleaseList(app.ID)
+	if err != nil {
+		log.Error("error getting app releases", "err", err)
+		return err
+	}
+
+	// unset the app release so it doesn't prevent deleting it
+	log.Info("unsetting app release")
+	if err := c.db.Exec("app_update_release", app.ID, nil); err != nil {
+		log.Error("error unsetting app release", "err", err)
+		return err
+	}
+
+	for _, release := range releases {
+		log.Info("deleting release", "release_id", release.ID)
+		if _, err := c.client.DeleteRelease(app.ID, release.ID); err != nil {
+			log.Error("error deleting release", "release_id", release.ID, "err", err)
+			return err
+		}
+		a.DeletedReleases = append(a.DeletedReleases, release)
+	}
+	log.Info(fmt.Sprintf("deleted %d releases", len(a.DeletedReleases)))
 
 	log.Info("getting app resources")
 	resources, err := c.client.AppResourceList(app.ID)

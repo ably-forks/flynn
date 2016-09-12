@@ -3,11 +3,10 @@ package vxlan
 import (
 	"fmt"
 	"net"
-	"os"
 	"syscall"
 
-	log "github.com/flynn/flynn/Godeps/_workspace/src/github.com/golang/glog"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/vishvananda/netlink"
+	log "github.com/golang/glog"
+	"github.com/vishvananda/netlink"
 
 	"github.com/flynn/flynn/flannel/pkg/ip"
 )
@@ -22,17 +21,6 @@ type vxlanDeviceAttrs struct {
 
 type vxlanDevice struct {
 	link *netlink.Vxlan
-}
-
-func sysctlSet(path, value string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write([]byte(value))
-	return err
 }
 
 func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
@@ -131,10 +119,6 @@ func (dev *vxlanDevice) MACAddr() net.HardwareAddr {
 
 func (dev *vxlanDevice) MTU() int {
 	return dev.link.MTU
-}
-
-func isNeighResolving(state int) bool {
-	return (state & (netlink.NUD_INCOMPLETE | netlink.NUD_STALE | netlink.NUD_DELAY | netlink.NUD_PROBE)) != 0
 }
 
 type neigh struct {

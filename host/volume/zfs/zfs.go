@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	zfs "github.com/flynn/flynn/Godeps/_workspace/src/github.com/mistifyio/go-zfs"
 	"github.com/flynn/flynn/host/volume"
 	"github.com/flynn/flynn/pkg/random"
+	zfs "github.com/mistifyio/go-zfs"
 )
 
 type zfsVolume struct {
@@ -129,16 +129,16 @@ func NewProvider(config *ProviderConfig) (volume.Provider, error) {
 	}, nil
 }
 
-func (b Provider) Kind() string {
+func (p *Provider) Kind() string {
 	return "zfs"
 }
 
-func (b *Provider) NewVolume() (volume.Volume, error) {
+func (p *Provider) NewVolume() (volume.Volume, error) {
 	id := random.UUID()
 	v := &zfsVolume{
 		info:      &volume.Info{ID: id},
-		provider:  b,
-		basemount: b.mountPath(id),
+		provider:  p,
+		basemount: p.mountPath(id),
 	}
 	var err error
 	v.dataset, err = zfs.CreateFilesystem(path.Join(v.provider.dataset.Name, id), map[string]string{
@@ -147,12 +147,12 @@ func (b *Provider) NewVolume() (volume.Volume, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.volumes[id] = v
+	p.volumes[id] = v
 	return v, nil
 }
 
-func (b *Provider) owns(vol volume.Volume) (*zfsVolume, error) {
-	zvol := b.volumes[vol.Info().ID]
+func (p *Provider) owns(vol volume.Volume) (*zfsVolume, error) {
+	zvol := p.volumes[vol.Info().ID]
 	if zvol == nil {
 		return nil, fmt.Errorf("volume does not belong to this provider")
 	}
@@ -162,12 +162,12 @@ func (b *Provider) owns(vol volume.Volume) (*zfsVolume, error) {
 	return zvol, nil
 }
 
-func (b Provider) mountPath(id string) string {
-	return filepath.Join(b.config.WorkingDir, "/mnt/", id)
+func (p *Provider) mountPath(id string) string {
+	return filepath.Join(p.config.WorkingDir, "/mnt/", id)
 }
 
-func (b *Provider) DestroyVolume(vol volume.Volume) error {
-	zvol, err := b.owns(vol)
+func (p *Provider) DestroyVolume(vol volume.Volume) error {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return err
 	}
@@ -189,12 +189,12 @@ func (b *Provider) DestroyVolume(vol volume.Volume) error {
 		}
 	}
 	os.Remove(zvol.basemount)
-	delete(b.volumes, vol.Info().ID)
+	delete(p.volumes, vol.Info().ID)
 	return nil
 }
 
-func (b *Provider) CreateSnapshot(vol volume.Volume) (volume.Volume, error) {
-	zvol, err := b.owns(vol)
+func (p *Provider) CreateSnapshot(vol volume.Volume) (volume.Volume, error) {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return nil, err
 	}
@@ -202,16 +202,16 @@ func (b *Provider) CreateSnapshot(vol volume.Volume) (volume.Volume, error) {
 	snap := &zfsVolume{
 		info:      &volume.Info{ID: id},
 		provider:  zvol.provider,
-		basemount: b.mountPath(id),
+		basemount: p.mountPath(id),
 	}
 	snap.dataset, err = zvol.dataset.Snapshot(id, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := b.mountSnapshot(snap); err != nil {
+	if err := p.mountDataset(snap); err != nil {
 		return nil, err
 	}
-	b.volumes[id] = snap
+	p.volumes[id] = snap
 	return snap, nil
 }
 
@@ -232,30 +232,35 @@ func isMount(path string) (bool, error) {
 	return pathDev != parentDev, nil
 }
 
-func (b *Provider) mountSnapshot(vol *zfsVolume) error {
-	// mount the snapshot (readonly)
+func (p *Provider) mountDataset(vol *zfsVolume) error {
+	// mount the dataset, snapshots will be readonly
 	// 'zfs mount' currently can't perform on snapshots; seealso https://github.com/zfsonlinux/zfs/issues/173
 	alreadyMounted, err := isMount(vol.basemount)
 	if err != nil {
-		return fmt.Errorf("could not mount snapshot: %s", err)
+		return fmt.Errorf("could not mount: %s", err)
 	}
 	if alreadyMounted {
 		return nil
 	}
 	if err = os.MkdirAll(vol.basemount, 0644); err != nil {
-		return fmt.Errorf("could not mount snapshot: %s", err)
+		return fmt.Errorf("could not mount: %s", err)
 	}
 	var buf bytes.Buffer
-	cmd := exec.Command("mount", "-tzfs", vol.dataset.Name, vol.basemount)
+	var cmd *exec.Cmd
+	if vol.IsSnapshot() {
+		cmd = exec.Command("mount", "-tzfs", vol.dataset.Name, vol.basemount)
+	} else {
+		cmd = exec.Command("zfs", "mount", vol.dataset.Name)
+	}
 	cmd.Stderr = &buf
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("could not mount snapshot: %s (%s)", err, strings.TrimSpace(buf.String()))
+		return fmt.Errorf("could not mount: %s (%s)", err, strings.TrimSpace(buf.String()))
 	}
 	return nil
 }
 
-func (b *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
-	zvol, err := b.owns(vol)
+func (p *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +271,7 @@ func (b *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
 	v2 := &zfsVolume{
 		info:      &volume.Info{ID: id},
 		provider:  zvol.provider,
-		basemount: b.mountPath(id),
+		basemount: p.mountPath(id),
 	}
 	cloneID := fmt.Sprintf("%s/%s", zvol.provider.dataset.Name, id)
 	v2.dataset, err = zvol.dataset.Clone(cloneID, map[string]string{
@@ -275,7 +280,7 @@ func (b *Provider) ForkVolume(vol volume.Volume) (volume.Volume, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not fork volume: %s", err)
 	}
-	b.volumes[id] = v2
+	p.volumes[id] = v2
 	return v2, nil
 }
 
@@ -286,8 +291,8 @@ type zfsHaves struct {
 /*
 	Returns the set of snapshot UIDs available in this volume's backing dataset.
 */
-func (b *Provider) ListHaves(vol volume.Volume) ([]json.RawMessage, error) {
-	zvol, err := b.owns(vol)
+func (p *Provider) ListHaves(vol volume.Volume) ([]json.RawMessage, error) {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return nil, err
 	}
@@ -307,8 +312,8 @@ func (b *Provider) ListHaves(vol volume.Volume) ([]json.RawMessage, error) {
 	return res, nil
 }
 
-func (b *Provider) SendSnapshot(vol volume.Volume, haves []json.RawMessage, output io.Writer) error {
-	zvol, err := b.owns(vol)
+func (p *Provider) SendSnapshot(vol volume.Volume, haves []json.RawMessage, output io.Writer) error {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return err
 	}
@@ -372,8 +377,8 @@ func (b *Provider) SendSnapshot(vol volume.Volume, haves []json.RawMessage, outp
 	In the former case, you can renegociate; in the latter, you will have to
 	either *destroy snapshots* or make a new volume.
 */
-func (b *Provider) ReceiveSnapshot(vol volume.Volume, input io.Reader) (volume.Volume, error) {
-	zvol, err := b.owns(vol)
+func (p *Provider) ReceiveSnapshot(vol volume.Volume, input io.Reader) (volume.Volume, error) {
+	zvol, err := p.owns(vol)
 	if err != nil {
 		return nil, err
 	}
@@ -403,12 +408,12 @@ func (b *Provider) ReceiveSnapshot(vol volume.Volume, input io.Reader) (volume.V
 		info:      &volume.Info{ID: id},
 		provider:  zvol.provider,
 		dataset:   snapds,
-		basemount: b.mountPath(id),
+		basemount: p.mountPath(id),
 	}
-	if err := b.mountSnapshot(snap); err != nil {
+	if err := p.mountDataset(snap); err != nil {
 		return nil, err
 	}
-	b.volumes[id] = snap
+	p.volumes[id] = snap
 	return snap, nil
 }
 
@@ -420,8 +425,8 @@ func (v *zfsVolume) Location() string {
 	return v.basemount
 }
 
-func (b *Provider) MarshalGlobalState() (json.RawMessage, error) {
-	return json.Marshal(b.config)
+func (p *Provider) MarshalGlobalState() (json.RawMessage, error) {
+	return json.Marshal(p.config)
 }
 
 type zfsVolumeRecord struct {
@@ -429,15 +434,15 @@ type zfsVolumeRecord struct {
 	Basemount string `json:"basemount"`
 }
 
-func (b *Provider) MarshalVolumeState(volumeID string) (json.RawMessage, error) {
-	vol := b.volumes[volumeID]
+func (p *Provider) MarshalVolumeState(volumeID string) (json.RawMessage, error) {
+	vol := p.volumes[volumeID]
 	record := zfsVolumeRecord{}
 	record.Dataset = vol.dataset.Name
 	record.Basemount = vol.basemount
 	return json.Marshal(record)
 }
 
-func (b *Provider) RestoreVolumeState(volInfo *volume.Info, data json.RawMessage) (volume.Volume, error) {
+func (p *Provider) RestoreVolumeState(volInfo *volume.Info, data json.RawMessage) (volume.Volume, error) {
 	record := &zfsVolumeRecord{}
 	if err := json.Unmarshal(data, record); err != nil {
 		return nil, fmt.Errorf("cannot restore volume %q: %s", volInfo.ID, err)
@@ -448,17 +453,14 @@ func (b *Provider) RestoreVolumeState(volInfo *volume.Info, data json.RawMessage
 	}
 	v := &zfsVolume{
 		info:      volInfo,
-		provider:  b,
+		provider:  p,
 		dataset:   dataset,
 		basemount: record.Basemount,
 	}
-	// zfs should have already remounted filesystems; special remount case for snapshots
-	if v.IsSnapshot() {
-		if err := b.mountSnapshot(v); err != nil {
-			return nil, err
-		}
+	if err := p.mountDataset(v); err != nil {
+		return nil, err
 	}
-	b.volumes[volInfo.ID] = v
+	p.volumes[volInfo.ID] = v
 	return v, nil
 }
 

@@ -6,30 +6,46 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
 	"github.com/flynn/flynn/discoverd/client"
 	dt "github.com/flynn/flynn/discoverd/types"
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/sse"
 	"github.com/flynn/flynn/pkg/status"
 	"github.com/flynn/flynn/pkg/stream"
+	"github.com/julienschmidt/httprouter"
+	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 // StreamBufferSize is the size of the channel buffer used for event subscription.
 const StreamBufferSize = 64 // TODO: Figure out how big this buffer should be.
 
+func loggerFn(handler http.Handler, logger log.Logger, clientIP string, rw *hh.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	handler.ServeHTTP(rw, req)
+	switch rw.Status() {
+	case 200, 307, 0: // 0 == 200 OK
+	default:
+		logger.Info("request completed", "method", req.Method, "path", req.URL.Path, "client_ip", clientIP, "status", rw.Status(), "duration", time.Since(start))
+	}
+}
+
 // NewHandler returns a new instance of Handler.
-func NewHandler() *Handler {
+func NewHandler(proxy bool, peers []string) *Handler {
 	r := httprouter.New()
 
 	h := &Handler{Handler: r}
 	h.Shutdown.Store(false)
 
+	h.Peers = peers
+	h.Proxy.Store(proxy)
+
 	if os.Getenv("DEBUG") != "" {
-		h.Handler = hh.ContextInjector("discoverd", hh.NewRequestLogger(h.Handler))
+		h.Handler = hh.ContextInjector("discoverd", hh.NewRequestLoggerCustom(h.Handler, loggerFn))
 	}
 
 	r.HandlerFunc("GET", status.Path, status.HealthyHandler.ServeHTTP)
@@ -49,13 +65,15 @@ func NewHandler() *Handler {
 	r.GET("/services/:service/leader", h.serveGetLeader)
 
 	r.GET("/raft/leader", h.serveGetRaftLeader)
-	r.POST("/raft/nodes", h.servePostRaftNodes)
-	r.DELETE("/raft/nodes", h.serveDeleteRaftNodes)
+	r.GET("/raft/peers", h.serveGetRaftPeers)
+	r.PUT("/raft/peers/:peer", h.servePutRaftPeer)
+	r.DELETE("/raft/peers/:peer", h.serveDeleteRaftPeer)
+	r.POST("/raft/promote", h.servePromote)
+	r.POST("/raft/demote", h.serveDemote)
 
 	r.GET("/ping", h.servePing)
 
 	r.POST("/shutdown", h.serveShutdown)
-
 	return h
 }
 
@@ -63,8 +81,11 @@ func NewHandler() *Handler {
 type Handler struct {
 	http.Handler
 	Shutdown atomic.Value // bool
+	Proxy    atomic.Value // bool
 	Main     interface {
-		Close() (dt.ShutdownInfo, error)
+		Close() (dt.TargetLogIndex, error)
+		Promote() error
+		Demote() error
 	}
 	Store interface {
 		Leader() string
@@ -82,13 +103,43 @@ type Handler struct {
 
 		AddPeer(peer string) error
 		RemovePeer(peer string) error
+		GetPeers() ([]string, error)
+		LastIndex() uint64
 	}
+	Peers []string
+}
+
+// Whitelisted endpoints won't be proxied.
+func proxyWhitelisted(r *http.Request) bool {
+	for _, url := range []string{"/raft/promote", "/raft/demote", "/shutdown"} {
+		if strings.HasPrefix(r.URL.Path, url) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Shutdown.Load().(bool) {
-		hh.Error(w, ErrShutdown)
+		hh.ServiceUnavailableError(w, "discoverd: shutting down")
 		return
+	}
+	// If running in proxy mode then redirect requests to a random peer
+	if h.Proxy.Load().(bool) {
+		if !proxyWhitelisted(r) {
+			// TODO(jpg): Should configuring the peer in proxy mode with no peers be impossible?
+			host := h.Peers[rand.Intn(len(h.Peers))]
+			redirectToHost(w, r, host)
+			return
+		}
+	} else {
+		// Send current peer list and index to the client so it can keep the list of
+		// peers in sync with the cluster.
+		peers, err := h.Store.GetPeers()
+		if err == nil {
+			w.Header().Set("Discoverd-Peers", strings.Join(peers, ","))
+		}
+		w.Header().Set("Discoverd-Index", strconv.FormatUint(h.Store.LastIndex(), 10))
 	}
 	h.Handler.ServeHTTP(w, r)
 	return
@@ -326,12 +377,28 @@ func (h *Handler) servePing(w http.ResponseWriter, r *http.Request, params httpr
 
 func (h *Handler) serveShutdown(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	h.Shutdown.Store(true)
-	lastIdx, err := h.Main.Close()
+	targetLogIndex, err := h.Main.Close()
 	if err != nil {
 		hh.Error(w, err)
 		return
 	}
-	hh.JSON(w, 200, lastIdx)
+	hh.JSON(w, 200, targetLogIndex)
+}
+
+// servePromote attempts to promote this discoverd peer to a raft peer
+func (h *Handler) servePromote(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	if err := h.Main.Promote(); err != nil {
+		hh.Error(w, err)
+		return
+	}
+}
+
+// serveDemote attempts to demote this peer from a raft peer to a proxy
+func (h *Handler) serveDemote(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	if err := h.Main.Demote(); err != nil {
+		hh.Error(w, err)
+		return
+	}
 }
 
 // serveStream creates a subscription and streams out events in SSE format.
@@ -363,29 +430,42 @@ func (h *Handler) serveGetRaftLeader(w http.ResponseWriter, r *http.Request, par
 		return
 	}
 
-	hh.JSON(w, 200, map[string]interface{}{"host": h.Store.Leader()})
+	hh.JSON(w, 200, dt.RaftLeader{Host: h.Store.Leader()})
 }
 
-// servePostRaftNodes joins a node to the store cluster.
-func (h *Handler) servePostRaftNodes(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
-	addr := r.FormValue("addr")
-	if err := h.Store.AddPeer(addr); err == ErrNotLeader {
+// serveGetRaftPeers returns the current raft peers.
+func (h *Handler) serveGetRaftPeers(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	peers, err := h.Store.GetPeers()
+	if err != nil {
+		hh.Error(w, err)
+	}
+
+	hh.JSON(w, 200, peers)
+}
+
+// servePutRaftNodes joins a peer to the store cluster.
+func (h *Handler) servePutRaftPeer(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	peer := params.ByName("peer")
+	if err := h.Store.AddPeer(peer); err == ErrNotLeader {
 		h.redirectToLeader(w, r)
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		hh.Error(w, err)
 		return
 	}
+	var targetLogIndex dt.TargetLogIndex
+	targetLogIndex.LastIndex = h.Store.LastIndex()
+	hh.JSON(w, 200, targetLogIndex)
 }
 
-// serveDeleteRaftNodes removes a node to the store cluster.
-func (h *Handler) serveDeleteRaftNodes(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
-	addr := r.FormValue("addr")
-	if err := h.Store.RemovePeer(addr); err == ErrNotLeader {
+// serveDeleteRaftNodes removes a peer to the store cluster.
+func (h *Handler) serveDeleteRaftPeer(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	peer := params.ByName("peer")
+	if err := h.Store.RemovePeer(peer); err == ErrNotLeader {
 		h.redirectToLeader(w, r)
 		return
 	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		hh.Error(w, err)
 		return
 	}
 }
@@ -400,17 +480,6 @@ func (h *Handler) redirectToLeader(w http.ResponseWriter, r *http.Request) {
 	}
 
 	redirectToHost(w, r, leader)
-}
-
-// ProxyHandler proxies all requests to a random peer.
-type ProxyHandler struct {
-	Peers []string
-}
-
-// ServeHTTP redirects all requests to a random peer.
-func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	host := h.Peers[rand.Intn(len(h.Peers))]
-	redirectToHost(w, r, host)
 }
 
 func redirectToHost(w http.ResponseWriter, r *http.Request, hostport string) {

@@ -7,14 +7,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/flynn/controller/worker/types"
 	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/tlscert"
 	routerc "github.com/flynn/flynn/router/client"
 	"github.com/flynn/flynn/router/types"
+	"github.com/flynn/que-go"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 // limits the number of concurrent requests to the router
@@ -22,21 +23,28 @@ const maxActiveRouteUpdates = 5
 
 type context struct {
 	db     *postgres.DB
-	client *controller.Client
+	client controller.Client
 	logger log15.Logger
 }
 
 type migration struct {
 	db                 *postgres.DB
-	client             *controller.Client
+	client             controller.Client
 	rc                 routerc.Client
 	logger             log15.Logger
 	dm                 *ct.DomainMigration
 	activeRouteUpdates chan struct{}
+	stop               chan struct{}
 }
 
-func JobHandler(db *postgres.DB, client *controller.Client, logger log15.Logger) func(*que.Job) error {
+func JobHandler(db *postgres.DB, client controller.Client, logger log15.Logger) func(*que.Job) error {
 	return (&context{db, client, logger}).HandleDomainMigration
+}
+
+func deployTimeout() <-chan struct{} {
+	ch := make(chan struct{})
+	time.AfterFunc(5*time.Minute, func() { close(ch) })
+	return ch
 }
 
 func (c *context) HandleDomainMigration(job *que.Job) (err error) {
@@ -58,6 +66,7 @@ func (c *context) HandleDomainMigration(job *que.Job) (err error) {
 		logger:             log,
 		dm:                 dm,
 		activeRouteUpdates: make(chan struct{}, maxActiveRouteUpdates),
+		stop:               job.Stop,
 	}
 
 	if err := m.db.QueryRow("SELECT old_domain, domain, old_tls_cert, tls_cert, created_at, finished_at FROM domain_migrations WHERE migration_id = $1", dm.ID).Scan(&dm.OldDomain, &dm.Domain, &dm.OldTLSCert, &dm.TLSCert, &dm.CreatedAt, &dm.FinishedAt); err != nil {
@@ -145,10 +154,10 @@ func (m *migration) generateTLSCert() (*tlscert.Cert, error) {
 
 func dupRelease(release *ct.Release) *ct.Release {
 	return &ct.Release{
-		ArtifactID: release.ArtifactID,
-		Env:        release.Env,
-		Meta:       release.Meta,
-		Processes:  release.Processes,
+		ArtifactIDs: release.ArtifactIDs,
+		Env:         release.Env,
+		Meta:        release.Meta,
+		Processes:   release.Processes,
 	}
 }
 
@@ -163,7 +172,7 @@ func (m *migration) waitForDeployment(app string) error {
 	}
 
 	events := make(chan *ct.Event)
-	stream, err := m.client.StreamEvents(controller.StreamEventsOptions{
+	stream, err := m.client.StreamEvents(ct.StreamEventsOptions{
 		AppID:       d.AppID,
 		ObjectID:    d.ID,
 		ObjectTypes: []ct.EventType{ct.EventTypeDeployment},
@@ -196,6 +205,8 @@ func (m *migration) waitForDeployment(app string) error {
 			err := errors.New("timed out waiting for deployment")
 			log.Error(err.Error())
 			return err
+		case <-m.stop:
+			return worker.ErrStopped
 		}
 	}
 }
@@ -222,7 +233,7 @@ func (m *migration) maybeDeployController() error {
 		log.Error("error creating release", "error", err)
 		return err
 	}
-	if err := m.client.DeployAppRelease(appName, release.ID); err != nil {
+	if err := m.client.DeployAppRelease(appName, release.ID, deployTimeout()); err != nil {
 		log.Error("error deploying release", "error", err)
 		return err
 	}
@@ -251,7 +262,7 @@ func (m *migration) maybeDeployRouter() error {
 		log.Error("error creating release", "error", err)
 		return err
 	}
-	if err := m.client.DeployAppRelease(appName, release.ID); err != nil {
+	if err := m.client.DeployAppRelease(appName, release.ID, deployTimeout()); err != nil {
 		log.Error("error deploying release", "error", err)
 		return err
 	}
@@ -282,7 +293,7 @@ func (m *migration) maybeDeployDashboard() error {
 		log.Error("error creating release", "error", err)
 		return err
 	}
-	if err := m.client.DeployAppRelease(appName, release.ID); err != nil {
+	if err := m.client.DeployAppRelease(appName, release.ID, deployTimeout()); err != nil {
 		log.Error("error deploying release", "error", err)
 		return err
 	}
@@ -340,7 +351,7 @@ func (m *migration) appCreateMissingRoutes(appID string, routes []*router.Route)
 		if route.Type != "http" {
 			continue
 		}
-		if strings.HasSuffix(route.Domain, m.dm.OldDomain) && route.TLSCert == m.dm.OldTLSCert.Cert {
+		if strings.HasSuffix(route.Domain, m.dm.OldDomain) {
 			if err := m.appMaybeCreateRoute(appID, route, routes); err != nil {
 				return err
 			}
@@ -364,12 +375,13 @@ func (m *migration) appMaybeCreateRoute(appID string, oldRoute *router.Route, ro
 		Sticky:  oldRoute.Sticky,
 		Service: oldRoute.Service,
 	}
-	if oldRoute.TLSCert == m.dm.OldTLSCert.Cert {
-		route.TLSCert = m.dm.TLSCert.Cert
-		route.TLSKey = m.dm.TLSCert.PrivateKey
+	if oldRoute.Certificate != nil && oldRoute.Certificate.Cert == strings.TrimSpace(m.dm.OldTLSCert.Cert) {
+		route.Certificate = &router.Certificate{
+			Cert: m.dm.TLSCert.Cert,
+			Key:  m.dm.TLSCert.PrivateKey,
+		}
 	} else {
-		route.TLSCert = oldRoute.TLSCert
-		route.TLSKey = oldRoute.TLSKey
+		route.Certificate = oldRoute.Certificate
 	}
 	err := m.client.CreateRoute(appID, route)
 	if err != nil && err.Error() == "conflict: Duplicate route" {

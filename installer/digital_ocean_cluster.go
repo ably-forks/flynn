@@ -9,17 +9,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/code.google.com/p/goauth2/oauth"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/digitalocean/godo"
-	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/crypto/ssh"
+	"github.com/digitalocean/godo"
 	"github.com/flynn/flynn/pkg/sshkeygen"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/oauth2"
 )
 
+type doTokenSource struct {
+	AccessToken string
+}
+
+func (t *doTokenSource) Token() (*oauth2.Token, error) {
+	return &oauth2.Token{
+		AccessToken: t.AccessToken,
+	}, nil
+}
+
 func digitalOceanClient(creds *Credential) *godo.Client {
-	t := &oauth.Transport{
-		Token: &oauth.Token{AccessToken: creds.Secret},
-	}
-	return godo.NewClient(t.Client())
+	return godo.NewClient(oauth2.NewClient(oauth2.NoContext, &doTokenSource{creds.Secret}))
 }
 
 func (c *DigitalOceanCluster) Type() string {
@@ -86,6 +93,7 @@ func (c *DigitalOceanCluster) Run() {
 			c.createDroplets,
 			c.fetchInstanceIPs,
 			c.configureDomain,
+			c.base.uploadBackup,
 			c.installFlynn,
 			c.bootstrap,
 			c.base.waitForDNS,
@@ -93,7 +101,7 @@ func (c *DigitalOceanCluster) Run() {
 
 		for _, step := range steps {
 			if err := step(); err != nil {
-				if c.base.State != "deleting" {
+				if c.base.getState() != "deleting" {
 					c.base.setState("error")
 					c.base.SendError(err)
 				}
@@ -224,7 +232,7 @@ func (c *DigitalOceanCluster) createDroplets() error {
 
 func (c *DigitalOceanCluster) createDroplet(name string) (*int, error) {
 	c.base.SendLog(fmt.Sprintf("Creating droplet %s", name))
-	dr, _, err := c.client.Droplets.Create(&godo.DropletCreateRequest{
+	droplet, res, err := c.client.Droplets.Create(&godo.DropletCreateRequest{
 		Name:   name,
 		Region: c.Region,
 		Size:   c.Size,
@@ -238,9 +246,8 @@ func (c *DigitalOceanCluster) createDroplet(name string) (*int, error) {
 	if err != nil {
 		return nil, err
 	}
-	droplet := dr.Droplet
 	c.DropletIDs = append(c.DropletIDs, int64(droplet.ID))
-	for _, a := range dr.Links.Actions {
+	for _, a := range res.Links.Actions {
 		if a.Rel == "create" {
 			return &a.ID, nil
 		}
@@ -300,7 +307,7 @@ func (c *DigitalOceanCluster) fetchDroplets() ([]*godo.Droplet, error) {
 		if err != nil {
 			return nil, err
 		}
-		droplets = append(droplets, dr.Droplet)
+		droplets = append(droplets, dr)
 	}
 	return droplets, nil
 }
@@ -315,7 +322,7 @@ func (c *DigitalOceanCluster) configureDomain() error {
 	if err != nil {
 		return err
 	}
-	domainName := dr.Domain.Name
+	domainName := dr.Name
 	for i, ip := range c.base.InstanceIPs {
 		if i == 0 {
 			// An A record already exists via the create domain request
@@ -458,7 +465,7 @@ func (c *DigitalOceanCluster) wrapRequest(runRequest func() (*godo.Response, err
 }
 
 func (c *DigitalOceanCluster) Delete() {
-	prevState := c.base.State
+	prevState := c.base.getState()
 	c.base.setState("deleting")
 
 	if c.base.Domain != nil {

@@ -15,8 +15,10 @@ type Job struct {
 
 	Metadata map[string]string `json:"metadata,omitempty"`
 
-	Artifact  Artifact           `json:"artifact,omitempty"`
-	Resources resource.Resources `json:"resources,omitempty"`
+	ImageArtifact *Artifact          `json:"artifact,omitempty"`
+	FileArtifacts []*Artifact        `json:"file_artifacts,omitempty"`
+	Resources     resource.Resources `json:"resources,omitempty"`
+	Partition     string             `json:"partition,omitempty"`
 
 	Config ContainerConfig `json:"config,omitempty"`
 
@@ -47,8 +49,7 @@ func (j *Job) Dup() *Job {
 		return res
 	}
 	job.Metadata = dupMap(j.Metadata)
-	job.Config.Entrypoint = dupSlice(j.Config.Entrypoint)
-	job.Config.Cmd = dupSlice(j.Config.Cmd)
+	job.Config.Args = dupSlice(j.Config.Args)
 	job.Config.Env = dupMap(j.Config.Env)
 	if j.Config.Ports != nil {
 		job.Config.Ports = make([]Port, len(j.Config.Ports))
@@ -71,11 +72,10 @@ type JobResources struct {
 }
 
 type ContainerConfig struct {
+	Args        []string          `json:"args,omitempty"`
 	TTY         bool              `json:"tty,omitempty"`
 	Stdin       bool              `json:"stdin,omitempty"`
 	Data        bool              `json:"data,omitempty"`
-	Entrypoint  []string          `json:"entry_point,omitempty"`
-	Cmd         []string          `json:"cmd,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Mounts      []Mount           `json:"mounts,omitempty"`
 	Volumes     []VolumeBinding   `json:"volumes,omitempty"`
@@ -91,11 +91,8 @@ func (x ContainerConfig) Merge(y ContainerConfig) ContainerConfig {
 	x.TTY = x.TTY || y.TTY
 	x.Stdin = x.Stdin || y.Stdin
 	x.Data = x.Data || y.Data
-	if y.Entrypoint != nil {
-		x.Entrypoint = y.Entrypoint
-	}
-	if y.Cmd != nil {
-		x.Cmd = y.Cmd
+	if y.Args != nil {
+		x.Args = y.Args
 	}
 	env := make(map[string]string, len(x.Env)+len(y.Env))
 	for k, v := range x.Env {
@@ -161,7 +158,7 @@ type HealthCheck struct {
 	Path   string `json:"path,omitempty"`
 	Host   string `json:"host,omitempty"`
 	Match  string `json:"match,omitempty"`
-	Status int    `json:"status.omitempty"`
+	Status int    `json:"status,omitempty"`
 }
 
 type Mount struct {
@@ -179,9 +176,16 @@ type VolumeBinding struct {
 }
 
 type Artifact struct {
-	URI  string `json:"url,omitempty"`
-	Type string `json:"type,omitempty"`
+	URI  string       `json:"url,omitempty"`
+	Type ArtifactType `json:"type,omitempty"`
 }
+
+type ArtifactType string
+
+const (
+	ArtifactTypeDocker ArtifactType = "docker"
+	ArtifactTypeFile   ArtifactType = "file"
+)
 
 type Host struct {
 	ID string `json:"id,omitempty"`
@@ -196,11 +200,6 @@ type Event struct {
 	Job   *ActiveJob `json:"job,omitempty"`
 }
 
-type HostEvent struct {
-	Event  string `json:"event,omitempty"`
-	HostID string `json:"host_id,omitempty"`
-}
-
 type ActiveJob struct {
 	Job         *Job      `json:"job,omitempty"`
 	HostID      string    `json:"host_id,omitempty"`
@@ -208,13 +207,29 @@ type ActiveJob struct {
 	InternalIP  string    `json:"internal_ip,omitempty"`
 	ForceStop   bool      `json:"force_stop,omitempty"`
 	Status      JobStatus `json:"status,omitempty"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	EndedAt     time.Time `json:"ended_at,omitempty"`
 	ExitStatus  *int      `json:"exit_status,omitempty"`
 	Error       *string   `json:"error,omitempty"`
 }
 
-var ErrJobNotRunning = errors.New("host: job not running")
+func (j *ActiveJob) Dup() *ActiveJob {
+	job := *j
+	job.Job = j.Job.Dup()
+	if j.ExitStatus != nil {
+		*job.ExitStatus = *j.ExitStatus
+	}
+	if j.Error != nil {
+		*job.Error = *j.Error
+	}
+	return &job
+}
+
+var (
+	ErrJobNotRunning = errors.New("host: job not running")
+	ErrAttached      = errors.New("host: job is attached")
+)
 
 type AttachReq struct {
 	JobID  string     `json:"job_id,omitempty"`
@@ -265,6 +280,7 @@ const (
 )
 
 type NetworkConfig struct {
+	JobID     string   `json:"job_id"`
 	Subnet    string   `json:"subnet"`
 	MTU       int      `json:"mtu"`
 	Resolvers []string `json:"resolvers"`
@@ -294,7 +310,7 @@ const (
 )
 
 type ResourceCheck struct {
-	Ports []Port `json"ports,omitempty"`
+	Ports []Port `json:"ports,omitempty"`
 }
 
 type Command struct {

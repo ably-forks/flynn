@@ -12,12 +12,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/boltdb/bolt"
+	"github.com/boltdb/bolt"
 	"github.com/flynn/flynn/host/types"
 	"github.com/flynn/flynn/pkg/cluster"
 )
 
 // TODO: prune old jobs?
+
+// ErrJobExists is returned when attempting to add a job to the state with an
+// ID which already exists
+var ErrJobExists = errors.New("job already exists")
 
 type State struct {
 	id string
@@ -62,18 +66,21 @@ func (s *State) Restore(backend Backend, buffers host.LogBuffers) (func(), error
 
 	s.backend = backend
 
-	var resurrect []*host.ActiveJob
+	var resurrect []*host.Job
 	if err := s.stateDB.View(func(tx *bolt.Tx) error {
 		jobsBucket := tx.Bucket([]byte("jobs"))
 		backendJobsBucket := tx.Bucket([]byte("backend-jobs"))
 		backendGlobalBucket := tx.Bucket([]byte("backend-global"))
-		resurrectionBucket := tx.Bucket([]byte("resurrection-jobs"))
+		persistentBucket := tx.Bucket([]byte("persistent-jobs"))
 
 		// restore jobs
 		if err := jobsBucket.ForEach(func(k, v []byte) error {
 			job := &host.ActiveJob{}
 			if err := json.Unmarshal(v, job); err != nil {
 				return err
+			}
+			if job.CreatedAt.IsZero() {
+				job.CreatedAt = time.Now()
 			}
 			if job.ContainerID != "" {
 				s.containers[job.ContainerID] = job
@@ -98,91 +105,45 @@ func (s *State) Restore(backend Backend, buffers host.LogBuffers) (func(), error
 			return err
 		}
 
-		if resurrectionBucket == nil {
-			s.mtx.Lock()
+		// resurrect any persistent jobs which are not running
+		if err := persistentBucket.ForEach(func(k, v []byte) error {
 			for _, job := range s.jobs {
-				// if there was an unclean shutdown, we resurrect all jobs marked
-				// that were running at shutdown and are no longer running.
-				if job.Job.Resurrect && job.Status != host.StatusRunning {
-					resurrect = append(resurrect, job)
+				if job.Job.ID == string(v) && !backend.JobExists(job.Job.ID) {
+					resurrect = append(resurrect, job.Job)
 				}
 			}
-			s.mtx.Unlock()
-		} else {
-			defer tx.DeleteBucket([]byte("resurrection-jobs"))
-			if err := resurrectionBucket.ForEach(func(k, v []byte) error {
-				job := &host.ActiveJob{}
-				if err := json.Unmarshal(v, job); err != nil {
-					return err
-				}
-				resurrect = append(resurrect, job)
-				return nil
-			}); err != nil {
-				return err
-			}
+			return nil
+		}); err != nil {
+			return err
 		}
+
 		return nil
 	}); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("could not restore from host persistence db: %s", err)
 	}
 
 	return func() {
+		if len(resurrect) == 0 {
+			return
+		}
 		var wg sync.WaitGroup
 		wg.Add(len(resurrect))
 		for _, job := range resurrect {
-			go func(job *host.ActiveJob) {
+			go func(job *host.Job) {
 				// generate a new job id, this is a new job
-				newID := cluster.GenerateJobID(s.id, "")
-				log.Printf("resurrecting %s as %s", job.Job.ID, newID)
-				job.Job.ID = newID
-				s.AddJob(job.Job)
-				config := &RunConfig{
-					// TODO(titanous): Use Job instead of ActiveJob in
-					// resurrection bucket once InternalIP is not used.
-					// TODO(titanous): Passing the IP is a hack, remove it once the
-					// postgres appliance doesn't use it to calculate its ID in the
-					// state machine.
-					IP: net.ParseIP(job.InternalIP),
+				newJob := job.Dup()
+				newJob.ID = cluster.GenerateJobID(s.id, "")
+				if _, ok := newJob.Config.Env["FLYNN_JOB_ID"]; ok {
+					newJob.Config.Env["FLYNN_JOB_ID"] = newJob.ID
 				}
-				backend.Run(job.Job, config)
+				log.Printf("resurrecting %s as %s", job.ID, newJob.ID)
+				s.AddJob(newJob)
+				backend.Run(newJob, nil, nil)
 				wg.Done()
 			}(job)
 		}
 		wg.Wait()
 	}, nil
-}
-
-// MarkForResurrection is run during a clean shutdown and persists all running
-// jobs with the resurrection flag before they are terminated by
-// backend cleanup.
-func (s *State) MarkForResurrection() error {
-	if err := s.Acquire(); err != nil {
-		return err
-	}
-	defer s.Release()
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	return s.stateDB.Update(func(tx *bolt.Tx) error {
-		tx.DeleteBucket([]byte("resurrection-jobs"))
-		bucket, err := tx.CreateBucket([]byte("resurrection-jobs"))
-		if err != nil {
-			return err
-		}
-
-		for _, job := range s.jobs {
-			if !job.Job.Resurrect || job.Status != host.StatusRunning {
-				continue
-			}
-			data, err := json.Marshal(job)
-			if err != nil {
-				continue
-			}
-			if err := bucket.Put([]byte(job.Job.ID), data); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 }
 
 // OpenDB opens and initialises the persistence DB, if not already open.
@@ -208,6 +169,7 @@ func (s *State) OpenDB() error {
 		tx.CreateBucketIfNotExists([]byte("jobs"))
 		tx.CreateBucketIfNotExists([]byte("backend-jobs"))
 		tx.CreateBucketIfNotExists([]byte("backend-global"))
+		tx.CreateBucketIfNotExists([]byte("persistent-jobs"))
 		return nil
 	}); err != nil {
 		return fmt.Errorf("could not initialize host persistence db: %s", err)
@@ -266,6 +228,12 @@ func (s *State) Release() {
 	}
 }
 
+func (s *State) PersistBackendGlobalState(data []byte) error {
+	return s.stateDB.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("backend-global")).Put([]byte("backend"), data)
+	})
+}
+
 func (s *State) persist(jobID string) {
 	// s.mtx.RLock() should already be covered by caller
 
@@ -288,9 +256,9 @@ func (s *State) persist(jobID string) {
 			jobsBucket.Delete([]byte(jobID))
 		}
 
-		// save the opaque blob the backend provides regarding this job
+		// save the opaque blob the backend provides regarding this job if it is starting/running
 		if backend, ok := s.backend.(JobStateSaver); ok {
-			if _, exists := s.jobs[jobID]; exists {
+			if job, exists := s.jobs[jobID]; exists && (job.Status == host.StatusStarting || job.Status == host.StatusRunning) {
 				backendState, err := backend.MarshalJobState(jobID)
 				if err != nil {
 					return fmt.Errorf("backend failed to serialize job state: %s", err)
@@ -326,13 +294,21 @@ func (s *State) persist(jobID string) {
 	}
 }
 
-func (s *State) AddJob(j *host.Job) {
+func (s *State) AddJob(j *host.Job) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	job := &host.ActiveJob{Job: j, HostID: s.id}
+	if _, ok := s.jobs[j.ID]; ok {
+		return ErrJobExists
+	}
+	job := &host.ActiveJob{
+		Job:       j,
+		HostID:    s.id,
+		CreatedAt: time.Now(),
+	}
 	s.jobs[j.ID] = job
 	s.sendEvent(job, host.JobEventCreate)
 	s.persist(j.ID)
+	return nil
 }
 
 func (s *State) GetJob(id string) *host.ActiveJob {
@@ -342,8 +318,7 @@ func (s *State) GetJob(id string) *host.ActiveJob {
 	if job == nil {
 		return nil
 	}
-	jobCopy := *job
-	return &jobCopy
+	return job.Dup()
 }
 
 func (s *State) RemoveJob(jobID string) {
@@ -353,12 +328,12 @@ func (s *State) RemoveJob(jobID string) {
 	s.persist(jobID)
 }
 
-func (s *State) Get() map[string]host.ActiveJob {
+func (s *State) Get() map[string]*host.ActiveJob {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	res := make(map[string]host.ActiveJob, len(s.jobs))
+	res := make(map[string]*host.ActiveJob, len(s.jobs))
 	for k, v := range s.jobs {
-		res[k] = *v
+		res[k] = v.Dup()
 	}
 	return res
 }
@@ -544,11 +519,11 @@ func (s *State) RemoveListener(jobID string, ch chan host.Event) {
 }
 
 func (s *State) sendEvent(job *host.ActiveJob, event string) {
-	j := *job
+	j := job.Dup()
 	go func() {
 		s.listenMtx.RLock()
 		defer s.listenMtx.RUnlock()
-		e := host.Event{JobID: job.Job.ID, Job: &j, Event: event}
+		e := host.Event{JobID: job.Job.ID, Job: j, Event: event}
 		for ch := range s.listeners["all"] {
 			ch <- e
 		}
@@ -556,4 +531,15 @@ func (s *State) sendEvent(job *host.ActiveJob, event string) {
 			ch <- e
 		}
 	}()
+}
+
+func (s *State) SetPersistentSlot(slot string, jobID string) error {
+	if err := s.Acquire(); err != nil {
+		return err
+	}
+	defer s.Release()
+	return s.stateDB.Update(func(tx *bolt.Tx) error {
+		persistentBucket := tx.Bucket([]byte("persistent-jobs"))
+		return persistentBucket.Put([]byte(slot), []byte(jobID))
+	})
 }

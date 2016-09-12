@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/flynn/flynn/Godeps/_workspace/src/gopkg.in/inconshreveable/log15.v2"
 	hh "github.com/flynn/flynn/pkg/httphelper"
+	log "gopkg.in/inconshreveable/log15.v2"
 )
 
 type identifier interface {
@@ -56,8 +56,9 @@ func (s *Stream) Serve() {
 	s.fw = hh.FlushWriter{Writer: newWriter(s.rw), Enabled: true}
 
 	if cw, ok := s.rw.(http.CloseNotifier); ok {
+		ch := cw.CloseNotify()
 		go func() {
-			<-cw.CloseNotify()
+			<-ch
 			s.Close()
 		}()
 	}

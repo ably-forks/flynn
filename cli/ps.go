@@ -4,10 +4,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/docker/docker/pkg/units"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
+	"github.com/docker/go-units"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -41,7 +41,7 @@ Example:
 `)
 }
 
-func runPs(args *docopt.Args, client *controller.Client) error {
+func runPs(args *docopt.Args, client controller.Client) error {
 	jobs, err := client.JobList(mustApp())
 	if err != nil {
 		return err

@@ -1,16 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
-	"os"
 	"strings"
 	"time"
 
-	c "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/discoverd/client"
 	"github.com/flynn/flynn/host/types"
+	logaggc "github.com/flynn/flynn/logaggregator/client"
 	"github.com/flynn/flynn/pkg/cluster"
+	"github.com/flynn/flynn/pkg/typeconv"
+	c "github.com/flynn/go-check"
 )
 
 type SchedulerSuite struct {
@@ -25,21 +27,6 @@ func (s *SchedulerSuite) checkJobState(t *c.C, appID, jobID string, state ct.Job
 	job, err := s.controllerClient(t).GetJob(appID, jobID)
 	t.Assert(err, c.IsNil)
 	t.Assert(job.State, c.Equals, state)
-}
-
-func jobEventsEqual(expected, actual ct.JobEvents) bool {
-	for typ, events := range expected {
-		diff, ok := actual[typ]
-		if !ok {
-			return false
-		}
-		for state, count := range events {
-			if diff[state] != count {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func (s *SchedulerSuite) TestScale(t *c.C) {
@@ -83,6 +70,40 @@ func (s *SchedulerSuite) TestScaleTags(t *c.C) {
 		t.Skip("not enough hosts to test tagged based scheduling")
 	}
 
+	// stream the scheduler leader log so we can synchronize tag changes
+	leader, err := s.discoverdClient(t).Service("controller-scheduler").Leader()
+	t.Assert(err, c.IsNil)
+	client := s.controllerClient(t)
+	res, err := client.GetAppLog("controller", &ct.LogOpts{
+		Follow:      true,
+		JobID:       leader.Meta["FLYNN_JOB_ID"],
+		ProcessType: typeconv.StringPtr("scheduler"),
+		Lines:       typeconv.IntPtr(0),
+	})
+	t.Assert(err, c.IsNil)
+	defer res.Close()
+	tagChange := make(chan struct{})
+	go func() {
+		dec := json.NewDecoder(res)
+		for {
+			var msg logaggc.Message
+			if err := dec.Decode(&msg); err != nil {
+				return
+			}
+			if strings.Contains(msg.Msg, "host tags changed") {
+				tagChange <- struct{}{}
+			}
+		}
+	}()
+	waitSchedulerTagChange := func() {
+		select {
+		case <-tagChange:
+			return
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for scheduler leader to see tag change")
+		}
+	}
+
 	// watch service events so we can wait for tag changes
 	events := make(chan *discoverd.Event)
 	stream, err := s.discoverdClient(t).Service("flynn-host").Watch(events)
@@ -115,6 +136,7 @@ func (s *SchedulerSuite) TestScaleTags(t *c.C) {
 		for key, val := range tags {
 			t.Assert(event.Instance.Meta["tag:"+key], c.Equals, val)
 		}
+		waitSchedulerTagChange()
 	}
 
 	// create an app with a tagged process and watch job events
@@ -124,7 +146,6 @@ func (s *SchedulerSuite) TestScaleTags(t *c.C) {
 		ReleaseID: release.ID,
 		Tags:      map[string]map[string]string{"printer": {"active": "true"}},
 	}
-	client := s.controllerClient(t)
 	watcher, err := client.WatchJobEvents(app.ID, release.ID)
 	t.Assert(err, c.IsNil)
 	defer watcher.Close()
@@ -248,15 +269,37 @@ func (s *SchedulerSuite) TestControllerRestart(t *c.C) {
 	t.Assert(hostID, c.Not(c.Equals), "")
 	debugf(t, "current controller app[%s] host[%s] job[%s]", app.ID, hostID, jobID)
 
-	// start another controller and wait for it to come up
-	watcher, err := s.controllerClient(t).WatchJobEvents("controller", release.ID)
+	// subscribe to service events, wait for current event
+	events := make(chan *discoverd.Event)
+	stream, err := s.discoverdClient(t).Service("controller").Watch(events)
 	t.Assert(err, c.IsNil)
-	defer watcher.Close()
+	defer stream.Close()
+	type serviceEvents map[discoverd.EventKind]int
+	wait := func(expected serviceEvents) {
+		actual := make(serviceEvents)
+	outer:
+		for {
+			select {
+			case event := <-events:
+				actual[event.Kind]++
+				for kind, count := range expected {
+					if actual[kind] != count {
+						continue outer
+					}
+				}
+				return
+			case <-time.After(scaleTimeout):
+				t.Fatal("timed out waiting for controller service event")
+			}
+		}
+	}
+	wait(serviceEvents{discoverd.EventKindCurrent: 1})
+
+	// start another controller and wait for it to come up
 	debug(t, "scaling the controller up")
 	formation.Processes["web"]++
 	t.Assert(s.controllerClient(t).PutFormation(formation), c.IsNil)
-	err = watcher.WaitFor(ct.JobEvents{"web": {ct.JobStateUp: 1}}, scaleTimeout, nil)
-	t.Assert(err, c.IsNil)
+	wait(serviceEvents{discoverd.EventKindUp: 1})
 
 	// kill the first controller and check the scheduler brings it back online
 	cc := cluster.NewClientWithServices(s.discoverdClient(t).Service)
@@ -264,15 +307,13 @@ func (s *SchedulerSuite) TestControllerRestart(t *c.C) {
 	t.Assert(err, c.IsNil)
 	debug(t, "stopping job ", jobID)
 	t.Assert(hc.StopJob(jobID), c.IsNil)
-	err = watcher.WaitFor(ct.JobEvents{"web": {ct.JobStateDown: 1, ct.JobStateUp: 1}}, scaleTimeout, nil)
-	t.Assert(err, c.IsNil)
+	wait(serviceEvents{discoverd.EventKindUp: 1, discoverd.EventKindDown: 1})
 
 	// scale back down
 	debug(t, "scaling the controller down")
 	formation.Processes["web"]--
 	t.Assert(s.controllerClient(t).PutFormation(formation), c.IsNil)
-	err = watcher.WaitFor(ct.JobEvents{"web": {ct.JobStateDown: 1}}, scaleTimeout, nil)
-	t.Assert(err, c.IsNil)
+	wait(serviceEvents{discoverd.EventKindDown: 1})
 
 	// unset the suite's client so other tests use a new client
 	s.controller = nil
@@ -288,7 +329,7 @@ func (s *SchedulerSuite) TestJobMeta(t *c.C) {
 	// start 1 one-off job
 	_, err = s.controllerClient(t).RunJobDetached(app.ID, &ct.NewJob{
 		ReleaseID: release.ID,
-		Cmd:       []string{"sh", "-c", "while true; do echo one-off-job; sleep 1; done"},
+		Args:      []string{"sh", "-c", "while true; do echo one-off-job; sleep 1; done"},
 		Meta: map[string]string{
 			"foo": "baz",
 		},
@@ -320,7 +361,7 @@ func (s *SchedulerSuite) TestJobStatus(t *c.C) {
 	}), c.IsNil)
 	_, err = s.controllerClient(t).RunJobDetached(app.ID, &ct.NewJob{
 		ReleaseID: release.ID,
-		Cmd:       []string{"sh", "-c", "while true; do echo one-off-job; sleep 1; done"},
+		Args:      []string{"sh", "-c", "while true; do echo one-off-job; sleep 1; done"},
 	})
 	t.Assert(err, c.IsNil)
 	err = watcher.WaitFor(ct.JobEvents{"printer": {ct.JobStateUp: 1}, "crasher": {ct.JobStateUp: 1}, "": {ct.JobStateUp: 1}}, scaleTimeout, nil)
@@ -408,26 +449,14 @@ func (s *SchedulerSuite) TestOmniJobs(t *c.C) {
 	}
 
 	// Check that new hosts get omni jobs
-	newHosts := s.addHosts(t, 2, false)
-	defer s.removeHosts(t, newHosts)
+	newHosts := s.addHosts(t, 2, false, "router-api")
+	defer s.removeHosts(t, newHosts, "router-api")
 	err = watcher.WaitFor(ct.JobEvents{"omni": {ct.JobStateUp: 2}}, scaleTimeout, nil)
 	t.Assert(err, c.IsNil)
 }
 
 func (s *SchedulerSuite) TestJobRestartBackoffPolicy(t *c.C) {
-	// To run this test on local, set BACKOFF_PERIOD on the flynn host machine
-	var backoffPeriod time.Duration
-	var err error
-	if testCluster == nil {
-		backoffPeriod, err = time.ParseDuration(os.Getenv("BACKOFF_PERIOD"))
-		if err != nil {
-			t.Skip("cannot determine backoff period")
-		}
-	} else {
-		backoffPeriod = testCluster.BackoffPeriod()
-	}
 	startTimeout := 20 * time.Second
-	debugf(t, "job restart backoff period: %s", backoffPeriod)
 
 	app, release := s.createApp(t)
 
@@ -462,10 +491,8 @@ func (s *SchedulerSuite) TestJobRestartBackoffPolicy(t *c.C) {
 	}
 
 	waitForRestart(0)
-	waitForRestart(backoffPeriod)
-	waitForRestart(2 * backoffPeriod)
-	debug(t, "waiting for backoff period to expire")
-	time.Sleep(backoffPeriod)
+	waitForRestart(0)
+	waitForRestart(0)
 	waitForRestart(0)
 }
 
@@ -526,7 +553,7 @@ func (s *SchedulerSuite) TestRollbackController(t *c.C) {
 	// create a controller deployment that will fail
 	release.ID = ""
 	worker := release.Processes["worker"]
-	worker.Entrypoint = []string{"/i/dont/exist"}
+	worker.Args = []string{"/i/dont/exist"}
 	release.Processes["worker"] = worker
 	t.Assert(client.CreateRelease(release), c.IsNil)
 	deployment, err := client.CreateDeployment(app.ID, release.ID)

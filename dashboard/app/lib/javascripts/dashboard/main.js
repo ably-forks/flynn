@@ -2,6 +2,7 @@ import { extend } from 'marbles/utils';
 import History from 'marbles/history';
 import QueryParams from 'marbles/query_params';
 import MainRouter from './routers/main';
+import ProvidersRouter from './routers/providers';
 import AppsRouter from './routers/apps';
 import GithubRouter from './routers/github';
 import Dispatcher from './dispatcher';
@@ -20,6 +21,7 @@ var Dashboard = function () {
 	this.dispatcherIndex = Dispatcher.register(this.__handleEvent.bind(this));
 
 	history.register(new MainRouter({ context: this }));
+	history.register(new ProvidersRouter({ context: this }));
 	history.register(new AppsRouter({ context: this }));
 	history.register(new GithubRouter({ context: this }));
 };
@@ -38,9 +40,12 @@ extend(Dashboard.prototype, {
 
 	ready: function () {
 		var resolveWaitForNav;
+		this.waitingForNav = true;
 		this.waitForNav = new Promise(function(resolve) {
 			resolveWaitForNav = resolve;
-		});
+		}).then(function () {
+			this.waitingForNav = false;
+		}.bind(this));
 
 		var loadURL = function() {
 			resolveWaitForNav();
@@ -55,7 +60,8 @@ extend(Dashboard.prototype, {
 		Config.setClient(new Client(Config.endpoints));
 		if (Config.user && Config.user.auths.github) {
 			Config.setGithubClient(new GithubClient(
-				Config.user.auths.github.access_token
+				Config.user.auths.github.access_token,
+				Config.github_api_url
 			));
 		}
 
@@ -253,6 +259,7 @@ extend(Dashboard.prototype, {
 				force: true,
 				params: [params]
 			});
+			Config.freezeNav();
 			break;
 
 		case "SERVICE_UNAVAILABLE":
@@ -294,7 +301,8 @@ extend(Dashboard.prototype, {
 			if ( !Config.githubClient ) {
 				var githubAuth = Config.user.auths.github;
 				Config.setGithubClient(new GithubClient(
-					githubAuth.access_token
+					githubAuth.access_token,
+					Config.github_api_url
 				));
 			}
 		} else {
@@ -352,9 +360,9 @@ extend(Dashboard.prototype, {
 		if ( !event.handler.opts.secondary ) {
 			window.scrollTo(0,0);
 
-			// don't reset view when navigating in/out app modals
-			var appsPathRegexp = /^apps\/[^\/]+/;
-			if ((path.match(appsPathRegexp) || [1])[0] !== (prevPath.match(appsPathRegexp) || [2])[0]) {
+			// don't reset view when navigating in/out app modals or between provider views
+			var pathRegexp = /^(?:apps\/[^\/]+)|providers/;
+			if ((path.match(pathRegexp) || [1])[0] !== (prevPath.match(pathRegexp) || [2])[0]) {
 				this.primaryView = null;
 				React.unmountComponentAtNode(this.el);
 			}

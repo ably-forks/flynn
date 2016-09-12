@@ -1,8 +1,8 @@
 package schema
 
 import (
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/que-go"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/jackc/pgx"
+	"github.com/flynn/que-go"
+	"github.com/jackc/pgx"
 )
 
 var preparedStatements = map[string]string{
@@ -16,6 +16,7 @@ var preparedStatements = map[string]string{
 	"app_update_strategy":                   appUpdateStrategyQuery,
 	"app_update_meta":                       appUpdateMetaQuery,
 	"app_update_release":                    appUpdateReleaseQuery,
+	"app_update_deploy_timeout":             appUpdateDeployTimeoutQuery,
 	"app_delete":                            appDeleteQuery,
 	"app_next_name_id":                      appNextNameIDQuery,
 	"app_get_release":                       appGetReleaseQuery,
@@ -23,10 +24,16 @@ var preparedStatements = map[string]string{
 	"release_select":                        releaseSelectQuery,
 	"release_insert":                        releaseInsertQuery,
 	"release_app_list":                      releaseAppListQuery,
+	"release_artifacts_insert":              releaseArtifactsInsertQuery,
+	"release_artifacts_delete":              releaseArtifactsDeleteQuery,
+	"release_delete":                        releaseDeleteQuery,
 	"artifact_list":                         artifactListQuery,
+	"artifact_list_ids":                     artifactListIDsQuery,
 	"artifact_select":                       artifactSelectQuery,
 	"artifact_select_by_type_and_uri":       artifactSelectByTypeAndURIQuery,
 	"artifact_insert":                       artifactInsertQuery,
+	"artifact_delete":                       artifactDeleteQuery,
+	"artifact_release_count":                artifactReleaseCountQuery,
 	"deployment_list":                       deploymentListQuery,
 	"deployment_select":                     deploymentSelectQuery,
 	"deployment_insert":                     deploymentInsertQuery,
@@ -37,23 +44,23 @@ var preparedStatements = map[string]string{
 	"event_insert":                          eventInsertQuery,
 	"event_insert_unique":                   eventInsertUniqueQuery,
 	"formation_list_by_app":                 formationListByAppQuery,
+	"formation_list_by_release":             formationListByReleaseQuery,
 	"formation_list_active":                 formationListActiveQuery,
 	"formation_list_since":                  formationListSinceQuery,
 	"formation_select":                      formationSelectQuery,
 	"formation_select_expanded":             formationSelectExpandedQuery,
 	"formation_insert":                      formationInsertQuery,
-	"formation_update":                      formationUpdateQuery,
 	"formation_delete":                      formationDeleteQuery,
 	"formation_delete_by_app":               formationDeleteByAppQuery,
 	"job_list":                              jobListQuery,
 	"job_list_active":                       jobListActiveQuery,
 	"job_select":                            jobSelectQuery,
 	"job_insert":                            jobInsertQuery,
-	"job_update":                            jobUpdateQuery,
 	"provider_list":                         providerListQuery,
 	"provider_select_by_name":               providerSelectByNameQuery,
 	"provider_select_by_name_or_id":         providerSelectByNameOrIDQuery,
 	"provider_insert":                       providerInsertQuery,
+	"resource_list":                         resourceListQuery,
 	"resource_list_by_provider":             resourceListByProviderQuery,
 	"resource_list_by_app":                  resourceListByAppQuery,
 	"resource_select":                       resourceSelectQuery,
@@ -64,6 +71,9 @@ var preparedStatements = map[string]string{
 	"app_resource_delete_by_app":            appResourceDeleteByAppQuery,
 	"app_resource_delete_by_resource":       appResourceDeleteByResourceQuery,
 	"domain_migration_insert":               domainMigrationInsert,
+	"backup_insert":                         backupInsert,
+	"backup_update":                         backupUpdate,
+	"backup_select_latest":                  backupSelectLatest,
 }
 
 func PrepareStatements(conn *pgx.Conn) error {
@@ -105,37 +115,76 @@ UPDATE apps SET strategy = $2, updated_at = now() WHERE app_id = $1`
 UPDATE apps SET meta = $2, updated_at = now() WHERE app_id = $1`
 	appUpdateReleaseQuery = `
 UPDATE apps SET release_id = $2, updated_at = now() WHERE app_id = $1`
+	appUpdateDeployTimeoutQuery = `
+UPDATE apps SET deploy_timeout = $2, updated_at = now() WHERE app_id = $1`
 	appDeleteQuery = `
 UPDATE apps SET deleted_at = now() WHERE app_id = $1 AND deleted_at IS NULL`
 	appNextNameIDQuery = `
 SELECT nextval('name_ids')`
 	appGetReleaseQuery = `
-SELECT r.release_id, r.artifact_id, r.env, r.processes, r.meta, r.created_at
-FROM apps a JOIN releases r USING (release_id) WHERE a.app_id = $1`
+SELECT r.release_id,
+  ARRAY(
+	SELECT a.artifact_id
+	FROM release_artifacts a
+	WHERE a.release_id = r.release_id AND a.deleted_at IS NULL
+	ORDER BY a.index
+  ), r.env, r.processes, r.meta, r.created_at
+FROM apps a JOIN releases r USING (release_id) WHERE a.app_id = $1 AND r.deleted_at IS NULL`
 
 	releaseListQuery = `
-SELECT release_id, artifact_id, env, processes, meta, created_at
-FROM releases WHERE deleted_at IS NULL ORDER BY created_at DESC`
+SELECT r.release_id,
+  ARRAY(
+	SELECT a.artifact_id
+	FROM release_artifacts a
+	WHERE a.release_id = r.release_id AND a.deleted_at IS NULL
+	ORDER BY a.index
+  ), r.env, r.processes, r.meta, r.created_at
+FROM releases r WHERE r.deleted_at IS NULL ORDER BY r.created_at DESC`
 	releaseSelectQuery = `
-SELECT release_id, artifact_id, env, processes, meta, created_at
-FROM releases WHERE release_id = $1 AND deleted_at IS NULL`
+SELECT r.release_id,
+  ARRAY(
+	SELECT a.artifact_id
+	FROM release_artifacts a
+	WHERE a.release_id = r.release_id AND a.deleted_at IS NULL
+	ORDER BY a.index
+  ), r.env, r.processes, r.meta, r.created_at
+FROM releases r WHERE r.release_id = $1 AND r.deleted_at IS NULL`
 	releaseInsertQuery = `
-INSERT INTO releases (release_id, artifact_id, env, processes, meta)
-VALUES ($1, $2, $3, $4, $5) RETURNING created_at`
+INSERT INTO releases (release_id, env, processes, meta)
+VALUES ($1, $2, $3, $4) RETURNING created_at`
 	releaseAppListQuery = `
-SELECT DISTINCT(r.release_id), r.artifact_id, r.env, r.processes, r.meta, r.created_at
+SELECT DISTINCT(r.release_id),
+  ARRAY(
+	SELECT a.artifact_id
+	FROM release_artifacts a
+	WHERE a.release_id = r.release_id AND a.deleted_at IS NULL
+	ORDER BY a.index
+  ), r.env, r.processes, r.meta, r.created_at
 FROM releases r JOIN formations f USING (release_id)
 WHERE f.app_id = $1 AND r.deleted_at IS NULL ORDER BY r.created_at DESC`
+	releaseArtifactsInsertQuery = `
+INSERT INTO release_artifacts (release_id, artifact_id, index) VALUES ($1, $2, $3)`
+	releaseArtifactsDeleteQuery = `
+UPDATE release_artifacts SET deleted_at = now() WHERE release_id = $1 AND artifact_id = $2 AND deleted_at IS NULL`
+	releaseDeleteQuery = `
+UPDATE releases SET deleted_at = now() WHERE release_id = $1 AND deleted_at IS NULL`
 	artifactListQuery = `
-SELECT artifact_id, type, uri, created_at FROM artifacts
+SELECT artifact_id, type, uri, meta, created_at FROM artifacts
 WHERE deleted_at IS NULL ORDER BY created_at DESC`
+	artifactListIDsQuery = `
+SELECT artifact_id, type, uri, meta, created_at FROM artifacts
+WHERE deleted_at IS NULL AND artifact_id = ANY($1)`
 	artifactSelectQuery = `
-SELECT artifact_id, type, uri, created_at FROM artifacts
+SELECT artifact_id, type, uri, meta, created_at FROM artifacts
 WHERE artifact_id = $1 AND deleted_at IS NULL`
 	artifactSelectByTypeAndURIQuery = `
-SELECT artifact_id, created_at FROM artifacts WHERE type = $1 AND uri = $2`
+SELECT artifact_id, meta, created_at FROM artifacts WHERE type = $1 AND uri = $2 AND deleted_at IS NULL`
 	artifactInsertQuery = `
-INSERT INTO artifacts (artifact_id, type, uri) VALUES ($1, $2, $3) RETURNING created_at`
+INSERT INTO artifacts (artifact_id, type, uri, meta) VALUES ($1, $2, $3, $4) RETURNING created_at`
+	artifactDeleteQuery = `
+UPDATE artifacts SET deleted_at = now() WHERE artifact_id = $1 AND deleted_at IS NULL`
+	artifactReleaseCountQuery = `
+SELECT COUNT(*) FROM release_artifacts WHERE artifact_id = $1 AND deleted_at IS NULL`
 	deploymentInsertQuery = `
 INSERT INTO deployments (deployment_id, app_id, old_release_id, new_release_id, strategy, processes, deploy_timeout)
 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING created_at`
@@ -175,21 +224,28 @@ INSERT INTO events (app_id, object_id, object_type, data)
 VALUES ($1, $2, $3, $4)`
 	eventInsertUniqueQuery = `
 INSERT INTO events (app_id, object_id, unique_id, object_type, data)
-VALUES ($1, $2, $3, $4, $5)`
+VALUES ($1, $2, $3, $4, $5) ON CONFLICT (unique_id) DO NOTHING`
 	formationListByAppQuery = `
 SELECT app_id, release_id, processes, tags, created_at, updated_at
-FROM formations WHERE app_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC
-	`
+FROM formations WHERE app_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`
+	formationListByReleaseQuery = `
+SELECT app_id, release_id, processes, tags, created_at, updated_at
+FROM formations WHERE release_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC`
 	formationListActiveQuery = `
 SELECT
-  apps.app_id, apps.name,
-  releases.release_id, releases.artifact_id, releases.meta, releases.env, releases.processes,
-  artifacts.artifact_id, artifacts.type, artifacts.uri,
+  apps.app_id, apps.name, apps.meta,
+  releases.release_id,
+  ARRAY(
+	SELECT r.artifact_id
+	FROM release_artifacts r
+	WHERE r.release_id = releases.release_id AND r.deleted_at IS NULL
+	ORDER BY r.index
+  ),
+  releases.meta, releases.env, releases.processes,
   formations.processes, formations.tags, formations.updated_at
 FROM formations
 JOIN apps USING (app_id)
 JOIN releases ON releases.release_id = formations.release_id
-JOIN artifacts USING (artifact_id)
 WHERE (formations.app_id, formations.release_id) IN (
   SELECT app_id, release_id
   FROM formations, json_each_text(formations.processes::json)
@@ -201,30 +257,35 @@ AND formations.deleted_at IS NULL
 ORDER BY updated_at DESC`
 	formationListSinceQuery = `
 SELECT app_id, release_id, processes, tags, created_at, updated_at
-FROM formations WHERE updated_at >= $1 ORDER BY updated_at DESC`
+FROM formations WHERE updated_at >= $1 AND deleted_at IS NULL ORDER BY updated_at DESC`
 	formationSelectQuery = `
 SELECT app_id, release_id, processes, tags, created_at, updated_at
 FROM formations WHERE app_id = $1 AND release_id = $2 AND deleted_at IS NULL`
 	formationSelectExpandedQuery = `
 SELECT
-  apps.app_id, apps.name,
-  releases.release_id, releases.artifact_id, releases.meta, releases.env, releases.processes,
-  artifacts.artifact_id, artifacts.type, artifacts.uri,
+  apps.app_id, apps.name, apps.meta,
+  releases.release_id,
+  ARRAY(
+	SELECT a.artifact_id
+	FROM release_artifacts a
+	WHERE a.release_id = releases.release_id AND a.deleted_at IS NULL
+	ORDER BY a.index
+  ),
+  releases.meta, releases.env, releases.processes,
   formations.processes, formations.tags, formations.updated_at
 FROM formations
 JOIN apps USING (app_id)
 JOIN releases ON releases.release_id = formations.release_id
-JOIN artifacts USING (artifact_id)
 WHERE formations.app_id = $1 AND formations.release_id = $2 AND formations.deleted_at IS NULL`
 	formationInsertQuery = `
 INSERT INTO formations (app_id, release_id, processes, tags)
-VALUES ($1, $2, $3, $4) RETURNING created_at, updated_at`
-	formationUpdateQuery = `
-UPDATE formations SET processes = $3, tags = $4, updated_at = now(), deleted_at = NULL
-WHERE app_id = $1 AND release_id = $2 RETURNING created_at, updated_at`
+VALUES ($1, $2, $3, $4)
+ON CONFLICT ON CONSTRAINT formations_pkey DO UPDATE
+SET processes = $3, tags = $4, updated_at = now(), deleted_at = NULL
+RETURNING created_at, updated_at`
 	formationDeleteQuery = `
 UPDATE formations SET deleted_at = now(), processes = NULL, updated_at = now()
-WHERE app_id = $1 AND release_id = $2`
+WHERE app_id = $1 AND release_id = $2 AND deleted_at IS NULL`
 	formationDeleteByAppQuery = `
 UPDATE formations SET deleted_at = now(), processes = NULL, updated_at = now()
 WHERE app_id = $1 AND deleted_at IS NULL`
@@ -233,16 +294,15 @@ SELECT cluster_id, job_id, host_id, app_id, release_id, process_type, state, met
 FROM job_cache WHERE app_id = $1 ORDER BY created_at DESC`
 	jobListActiveQuery = `
 SELECT cluster_id, job_id, host_id, app_id, release_id, process_type, state, meta, exit_status, host_error, run_at, restarts, created_at, updated_at
-FROM job_cache WHERE state = 'starting' OR state = 'up' ORDER BY updated_at DESC`
+FROM job_cache WHERE state = 'pending' OR state = 'starting' OR state = 'up' ORDER BY updated_at DESC`
 	jobSelectQuery = `
 SELECT cluster_id, job_id, host_id, app_id, release_id, process_type, state, meta, exit_status, host_error, run_at, restarts, created_at, updated_at
 FROM job_cache WHERE job_id = $1`
 	jobInsertQuery = `
 INSERT INTO job_cache (cluster_id, job_id, host_id, app_id, release_id, process_type, state, meta, exit_status, host_error, run_at, restarts)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING created_at, updated_at`
-	jobUpdateQuery = `
-UPDATE job_cache SET cluster_id = $2, host_id = $3, state = $4, exit_status = $5, host_error = $6, run_at = $7, restarts = $8, updated_at = now()
-WHERE job_id = $1 RETURNING created_at, updated_at`
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (job_id) DO UPDATE
+SET cluster_id = $1, host_id = $3, state = $7, exit_status = $9, host_error = $10, run_at = $11, restarts = $12, updated_at = now()
+RETURNING created_at, updated_at`
 	providerListQuery = `
 SELECT provider_id, name, url, created_at, updated_at
 FROM providers WHERE deleted_at IS NULL ORDER BY created_at DESC`
@@ -255,6 +315,17 @@ FROM providers WHERE deleted_at IS NULL AND (provider_id = $1 OR name = $2) LIMI
 	providerInsertQuery = `
 INSERT INTO providers (name, url) VALUES ($1, $2)
 RETURNING provider_id, created_at, updated_at`
+	resourceListQuery = `
+SELECT resource_id, provider_id, external_id, env,
+  ARRAY(
+	SELECT a.app_id
+    FROM app_resources a
+	WHERE a.resource_id = r.resource_id AND a.deleted_at IS NULL
+	ORDER BY a.created_at DESC
+  ), created_at
+FROM resources r
+WHERE deleted_at IS NULL
+ORDER BY created_at DESC`
 	resourceListByProviderQuery = `
 SELECT resource_id, provider_id, external_id, env,
   ARRAY(
@@ -276,7 +347,7 @@ SELECT DISTINCT(r.resource_id), r.provider_id, r.external_id, r.env,
   ), r.created_at
 FROM resources r
 JOIN app_resources a USING (resource_id)
-WHERE a.app_id = $1 AND r.deleted_at IS NULL
+WHERE a.app_id = $1 AND r.deleted_at IS NULL AND a.deleted_at IS NULL
 ORDER BY r.created_at DESC`
 	resourceSelectQuery = `
 SELECT resource_id, provider_id, external_id, env,
@@ -302,9 +373,15 @@ INSERT INTO app_resources (app_id, resource_id)
 VALUES ((SELECT app_id FROM apps WHERE (app_id = $1 OR name = $2) AND deleted_at IS NULL), $3)
 RETURNING app_id`
 	appResourceDeleteByAppQuery = `
-UPDATE app_resources SET deleted_at = now() WHERE app_id = $1 AND deleted_at IS NULL`
+DELETE FROM app_resources WHERE app_id = $1`
 	appResourceDeleteByResourceQuery = `
-UPDATE app_resources SET deleted_at = now() WHERE resource_id = $1 AND deleted_at IS NULL`
+DELETE FROM app_resources WHERE resource_id = $1`
 	domainMigrationInsert = `
 INSERT INTO domain_migrations (old_domain, domain, old_tls_cert, tls_cert) VALUES ($1, $2, $3, $4) RETURNING migration_id, created_at`
+	backupInsert = `
+INSERT INTO backups (status, sha512, size, error, completed_at) VALUES ($1, $2, $3, $4, $5) RETURNING backup_id, created_at, updated_at`
+	backupUpdate = `
+UPDATE backups SET status = $2, sha512 = $3, size = $4, error = $5, completed_at = $6, updated_at = now() WHERE backup_id = $1 RETURNING updated_at`
+	backupSelectLatest = `
+SELECT backup_id, status, sha512, size, error, created_at, updated_at, completed_at FROM backups WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1`
 )

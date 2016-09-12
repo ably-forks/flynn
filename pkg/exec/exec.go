@@ -20,11 +20,10 @@ type Cmd struct {
 	TTY    bool
 	Meta   map[string]string
 
-	Entrypoint []string
+	Args []string
 
-	Artifact host.Artifact
+	ImageArtifact host.Artifact
 
-	Cmd []string
 	Env map[string]string
 
 	Stdin io.Reader
@@ -82,15 +81,15 @@ type Cmd struct {
 }
 
 func DockerImage(uri string) host.Artifact {
-	return host.Artifact{Type: "docker", URI: uri}
+	return host.Artifact{Type: host.ArtifactTypeDocker, URI: uri}
 }
 
-func Command(artifact host.Artifact, cmd ...string) *Cmd {
-	return &Cmd{Artifact: artifact, Cmd: cmd}
+func Command(artifact host.Artifact, args ...string) *Cmd {
+	return &Cmd{ImageArtifact: artifact, Args: args}
 }
 
 func Job(artifact host.Artifact, job *host.Job) *Cmd {
-	return &Cmd{Artifact: artifact, Job: job}
+	return &Cmd{ImageArtifact: artifact, Job: job}
 }
 
 type ClusterClient interface {
@@ -98,8 +97,8 @@ type ClusterClient interface {
 	Host(string) (*cluster.Host, error)
 }
 
-func CommandUsingCluster(c ClusterClient, artifact host.Artifact, cmd ...string) *Cmd {
-	command := Command(artifact, cmd...)
+func CommandUsingCluster(c ClusterClient, artifact host.Artifact, args ...string) *Cmd {
+	command := Command(artifact, args...)
 	command.cluster = c
 	return command
 }
@@ -186,13 +185,12 @@ func (c *Cmd) Start() error {
 	// otherwise generate one from the fields on exec.Cmd that mirror stdlib's os.exec.
 	if c.Job == nil {
 		c.Job = &host.Job{
-			Artifact: c.Artifact,
+			ImageArtifact: &c.ImageArtifact,
 			Config: host.ContainerConfig{
-				Entrypoint: c.Entrypoint,
-				Cmd:        c.Cmd,
-				TTY:        c.TTY,
-				Env:        c.Env,
-				Stdin:      c.Stdin != nil || c.stdinPipe != nil,
+				Args:  c.Args,
+				TTY:   c.TTY,
+				Env:   c.Env,
+				Stdin: c.Stdin != nil || c.stdinPipe != nil,
 			},
 			Metadata: c.Meta,
 		}
@@ -202,7 +200,7 @@ func (c *Cmd) Start() error {
 			c.Job.Config.DisableLog = true
 		}
 	} else {
-		c.Job.Artifact = c.Artifact
+		c.Job.ImageArtifact = &c.ImageArtifact
 	}
 	if c.Job.ID == "" {
 		c.Job.ID = cluster.GenerateJobID(c.HostID, "")

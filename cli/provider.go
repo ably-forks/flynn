@@ -3,9 +3,9 @@ package main
 import (
 	"log"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-docopt"
 	"github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
+	"github.com/flynn/go-docopt"
 )
 
 func init() {
@@ -22,7 +22,7 @@ Commands:
 `)
 }
 
-func runProvider(args *docopt.Args, client *controller.Client) error {
+func runProvider(args *docopt.Args, client controller.Client) error {
 	if args.Bool["add"] {
 		return runProviderAdd(args, client)
 	}
@@ -45,7 +45,7 @@ func runProvider(args *docopt.Args, client *controller.Client) error {
 	return nil
 }
 
-func runProviderAdd(args *docopt.Args, client *controller.Client) error {
+func runProviderAdd(args *docopt.Args, client controller.Client) error {
 	name := args.String["<name>"]
 	url := args.String["<url>"]
 

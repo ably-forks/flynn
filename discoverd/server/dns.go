@@ -9,10 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/miekg/dns"
-	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/vanillahsu/go_reuseport"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/pkg/keepalive"
 	"github.com/flynn/flynn/pkg/random"
+	"github.com/miekg/dns"
+	"github.com/vanillahsu/go_reuseport"
 )
 
 type DNSStore interface {
@@ -79,7 +80,7 @@ func (srv *DNSServer) ListenAndServe() error {
 	}
 
 	if srv.TCPAddr != "" {
-		l, err := reuseport.NewReusablePortListener("tcp4", srv.TCPAddr)
+		l, err := keepalive.ReusableListen("tcp4", srv.TCPAddr)
 		if err != nil {
 			return err
 		}
@@ -148,10 +149,12 @@ func (d dnsAPI) Recurse(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	for _, recursor := range d.Recursors {
+		req.Compress = true
 		res, _, err := client.Exchange(req, recursor)
 		if err != nil {
 			continue
 		}
+		res.Compress = true
 		w.WriteMsg(res)
 		return
 	}
@@ -172,6 +175,7 @@ func (d dnsAPI) ServiceLookup(w dns.ResponseWriter, req *dns.Msg) {
 
 	res := &dns.Msg{}
 	res.Authoritative = true
+	res.Compress = true
 	res.RecursionAvailable = len(d.Recursors) > 0
 	res.SetReply(req)
 	defer func() {
@@ -217,7 +221,7 @@ func (d dnsAPI) ServiceLookup(w dns.ResponseWriter, req *dns.Msg) {
 	if !leader {
 		a, err := d.GetStore().Instances(service)
 		if err != nil {
-			log.Println("discoverd: dns: cannot retrieve instances: %s", err)
+			log.Printf("discoverd: dns: cannot retrieve instances: %s", err)
 			nxdomain()
 			return
 		} else if a == nil {
@@ -233,7 +237,7 @@ func (d dnsAPI) ServiceLookup(w dns.ResponseWriter, req *dns.Msg) {
 		if leader {
 			sl, err := d.GetStore().ServiceLeader(service)
 			if err != nil {
-				log.Println("discoverd: dns: cannot retrieve service leader: %s", err)
+				log.Printf("discoverd: dns: cannot retrieve service leader: %s", err)
 				nxdomain()
 				return
 			}
