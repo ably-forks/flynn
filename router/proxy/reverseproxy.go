@@ -37,6 +37,7 @@ var (
 
 	serviceUnavailable = []byte("Service Unavailable\n")
 	gatewayTimeout     = []byte("Gateway Timeout\n")
+	badGateway         = []byte("Bad Gateway\n")
 )
 
 // A ProxyErrorer is a ResponseWriter passed to ReverseProxy.ServeHTTP which
@@ -133,6 +134,9 @@ func (p *ReverseProxy) ServeHTTP(ctx context.Context, rw http.ResponseWriter, re
 		if err == errTimeout {
 			rw.WriteHeader(http.StatusGatewayTimeout)
 			rw.Write(gatewayTimeout)
+		} else if err == errRefused {
+			rw.WriteHeader(http.StatusBadGateway)
+			rw.Write(badGateway)
 		} else {
 			rw.WriteHeader(http.StatusServiceUnavailable)
 			rw.Write(serviceUnavailable)
@@ -205,6 +209,8 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 		status, msg := http.StatusServiceUnavailable, serviceUnavailable
 		if err == errTimeout {
 			status, msg = http.StatusGatewayTimeout, gatewayTimeout
+		} else if err == errRefused {
+			status, msg = http.StatusBadGateway, badGateway
 		}
 		l.Error("error hijacking request", "err", err, "status", status)
 		if v, ok := rw.(ProxyErrorer); ok {

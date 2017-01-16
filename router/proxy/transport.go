@@ -23,9 +23,10 @@ type backendDialer interface {
 }
 
 var (
-	errNoBackends = proxyError{errors.New("router: no backends available")}
-	errTimeout    = proxyError{errors.New("router: timeout from all backends")}
-	errCanceled   = errors.New("router: backend connection canceled")
+	errOther    = proxyError{errors.New("router: some error response from all backends")}
+	errRefused  = proxyError{errors.New("router: all backends refused the connection")}
+	errTimeout  = proxyError{errors.New("router: timeout from all backends")}
+	errCanceled = errors.New("router: backend connection canceled")
 
 	httpTransport = &http.Transport{
 		Dial: customDial,
@@ -103,6 +104,7 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 	stickyBackend := t.getStickyBackend(req)
 	backends := t.getOrderedBackends(stickyBackend, req)
 	allTimeout := len(backends) > 0
+	allRefused := len(backends) > 0
 	for i, backend := range backends {
 		req.URL.Host = backend
 		res, err := httpTransport.RoundTrip(req)
@@ -113,11 +115,16 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 		if allTimeout && !strings.Contains(err.Error(), "timeout") {
 			allTimeout = false
 		}
+		if allRefused && !strings.Contains(err.Error(), "connection refused") {
+			allRefused = false
+		}
 		l.Error("retriable dial error", "backend", backend, "err", err, "attempt", i)
 	}
-	status, err := 503, errNoBackends
+	status, err := 503, errOther
 	if allTimeout {
 		status, err = 504, errTimeout
+	} else if allRefused {
+		status, err = 502, errRefused
 	}
 	l.Error("request failed", "status", status, "num_backends", len(backends))
 	return nil, err
@@ -166,6 +173,7 @@ func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, str
 	donec := ctx.Done()
 
 	allTimeout := len(addrs) > 0
+	allRefused := len(addrs) > 0
 	for i, addr := range addrs {
 		select {
 		case <-donec:
@@ -183,14 +191,19 @@ func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, str
 		if err == nil {
 			return conn, addr, nil
 		}
-		if allTimeout && !strings.Contains("timeout", err.Error()) {
+		if allTimeout && !strings.Contains(err.Error(), "timeout") {
 			allTimeout = false
+		}
+		if allRefused && !strings.Contains(err.Error(), "connection refused") {
+			allRefused = false
 		}
 		l.Error("retriable dial error", "backend", addr, "err", err, "attempt", i)
 	}
-	err := errNoBackends
+	err := errOther
 	if allTimeout {
 		err = errTimeout
+	} else if allRefused {
+		err = errRefused
 	}
 	return nil, "", err
 }
