@@ -96,7 +96,9 @@ func (t *transport) setStickyBackend(res *http.Response, originalStickyBackend s
 func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Logger) (*http.Response, error) {
 	// http.Transport closes the request body on a failed dial, issue #875
 	req.Body = &fakeCloseReadCloser{req.Body}
-	defer req.Body.(*fakeCloseReadCloser).RealClose()
+	//for Ably router, we close the body in the router after a possible retry
+	//attempt; we do not want Flynn to close it
+	//defer req.Body.(*fakeCloseReadCloser).RealClose()
 
 	// hook up CloseNotify to cancel the request
 	req.Cancel = ctx.Done()
