@@ -7,6 +7,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -14,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
@@ -40,12 +40,33 @@ var (
 	badGateway         = []byte("Bad Gateway\n")
 )
 
-// A ProxyErrorer is a ResponseWriter passed to ReverseProxy.ServeHTTP which
-// wants to be notified of proxying errors instead of just receiving them
-// as a HTTP status and body.
-type ProxyErrorer interface {
-	http.ResponseWriter
-	ProxyError(error)
+type ProxyAttempt struct {
+	ForwardedTo string
+	Err         error
+	Cancelled   bool
+	Timeout     bool
+	Refused     bool
+	Duration    time.Duration
+}
+
+type ProxyReport struct {
+	Err        error
+	Cancelled  bool
+	Attempts   []ProxyAttempt
+	AllTimeout bool
+	AllRefused bool
+	Duration   time.Duration
+}
+
+func (pr *ProxyReport) LastAttempt() *ProxyAttempt {
+	if len(pr.Attempts) == 0 {
+		return nil
+	}
+	return &pr.Attempts[len(pr.Attempts)-1]
+}
+
+type ProxyReporter interface {
+	SetProxyReport(*ProxyReport)
 }
 
 // ReverseProxy is an HTTP Handler that takes an incoming request and
@@ -96,40 +117,33 @@ func (p *ReverseProxy) ServeHTTP(ctx context.Context, rw http.ResponseWriter, re
 		return
 	}
 
-	// CloseNotify can trigger early with HTTP/1.1 pipelined requests. Since
-	// there is no way to detect if a request is pipelined, we instead check if
-	// the request was made over HTTP/2 or if the method is defined as
-	// idempotent. Pipelining is relatively rare in the wild, the most common
-	// client that uses pipelining is Safari on iOS, which also supports HTTP/2
-	// so this is only relevant when no TLS certificate is configured for the
-	// route. There may be obscure non-browser API clients that use
-	// POST/PUT/DELETE with pipelining. If this issue comes up again, we can add
-	// a route tunable to disable CloseNotify or suggest that the client stop
-	// using pipelining or switch to HTTP/2. The issue presents itself as
-	// request cancellations that result in 503s in response to random pipelined
-	// requests.
-	//
-	// https://golang.org/issue/13165
-	// https://golang.org/pkg/net/http/#CloseNotifier
-	if req.ProtoMajor == 2 || (req.Method != "GET" && req.Method != "HEAD") {
-		clientGone := rw.(http.CloseNotifier).CloseNotify()
-		var cancel func()
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel() // finish cancellation goroutine
-
-		go func() {
-			select {
-			case <-clientGone:
-				cancel() // client went away, cancel request
-			case <-ctx.Done():
+	var report *ProxyReport
+	resulter, _ := rw.(ProxyReporter)
+	setProxyReport := func() func() {
+		var set bool
+		return func() {
+			if set {
+				return
 			}
-		}()
+			if resulter != nil {
+				resulter.SetProxyReport(report)
+				set = true
+			}
+		}
+	}()
+	defer setProxyReport()
+	if resulter != nil {
+		report = &ProxyReport{}
 	}
 
-	res, err := transport.RoundTrip(ctx, outreq, l)
+	res, err := transport.RoundTrip(ctx, outreq, l, report)
+	if resulter != nil {
+		report.Err = err
+	}
 	if err != nil {
-		if v, ok := rw.(ProxyErrorer); ok {
-			v.ProxyError(err)
+		setProxyReport() // Before writing.
+		if err == errCancelled {
+			return
 		}
 		if err == errTimeout {
 			rw.WriteHeader(http.StatusGatewayTimeout)
@@ -157,21 +171,16 @@ func (p *ReverseProxy) ServeConn(ctx context.Context, dconn net.Conn) {
 	}
 	defer dconn.Close()
 
-	clientGone := dconn.(http.CloseNotifier).CloseNotify()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel() // finish cancellation goroutine
-
-	go func() {
-		select {
-		case <-clientGone:
-			cancel() // client went away, cancel request
-		case <-ctx.Done():
-		}
-	}()
-
 	l := p.Logger.New("client_addr", dconn.RemoteAddr(), "host_addr", dconn.LocalAddr(), "proxy", "tcp")
 
-	uconn, err := transport.Connect(ctx, l)
+	var report *ProxyReport
+	resulter, _ := dconn.(ProxyReporter)
+	if resulter != nil {
+		report = &ProxyReport{}
+		resulter.SetProxyReport(report) // Before writing.
+	}
+
+	uconn, err := transport.Connect(ctx, l, report)
 	if err != nil {
 		return
 	}
@@ -186,10 +195,27 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 		panic("router: nil transport for proxy")
 	}
 
-	res, uconn, err := transport.UpgradeHTTP(req, l)
+	var err error
+	var report *ProxyReport
+	resulter, _ := rw.(ProxyReporter)
+	if resulter != nil {
+		report = &ProxyReport{}
+		start := time.Now()
+		resulter.SetProxyReport(report) // Before writing.
+		defer func() {
+			report.Err = err
+			report.Duration = time.Since(start)
+			if a := report.LastAttempt(); a != nil {
+				a.Err = err
+				a.Duration = report.Duration
+			}
+		}()
+	}
+
+	res, uconn, err := transport.UpgradeHTTP(req, l, report)
 	if err != nil {
-		if v, ok := rw.(ProxyErrorer); ok {
-			v.ProxyError(err)
+		if report != nil {
+			report.Err = err
 		}
 		rw.WriteHeader(http.StatusServiceUnavailable)
 		rw.Write(serviceUnavailable)
@@ -213,19 +239,18 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 			status, msg = http.StatusBadGateway, badGateway
 		}
 		l.Error("error hijacking request", "err", err, "status", status)
-		if v, ok := rw.(ProxyErrorer); ok {
-			v.ProxyError(err)
-		}
 		rw.WriteHeader(status)
 		rw.Write(msg)
 		return
 	}
 	defer dconn.Close()
 
-	if err := res.Write(dconn); err != nil {
+	err = res.Write(dconn)
+	if err != nil {
 		l.Error("error proxying response to client", "err", err)
 		return
 	}
+
 	joinConns(uconn, &streamConn{bufrw.Reader, dconn})
 }
 
