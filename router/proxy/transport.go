@@ -11,11 +11,11 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ably-forks/flynn/pkg/random"
 	"golang.org/x/crypto/nacl/secretbox"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type backendDialer interface {
@@ -377,16 +377,44 @@ func decrypt(data []byte, key [32]byte) []byte {
 	return res
 }
 
+// cancelError wraps an error in a goroutine safe way, so that access to the
+// error doesn't cause a deadlock.
+type cancelError struct {
+	mtx sync.RWMutex
+	err error
+}
+
+// SetErr sets an error with locking semantics
+// If there already exists an error, this will over-write the existing error
+// with the new one.
+func (c *cancelError) SetErr(err error) {
+	c.mtx.Lock()
+	c.err = err
+	c.mtx.Unlock()
+}
+
+// Err retrives an error with locking semantics.
+// If no error exists, err will be nil
+func (c *cancelError) Err() (err error) {
+	c.mtx.RLock()
+	err = c.err
+	c.mtx.RUnlock()
+	return
+}
+
 func closeWhenCanceled(ctx context.Context, r io.ReadCloser) io.Reader {
-	var canceledErr error
-	readReqs := make(chan closeWhenCanceledRequest)
-	doneCh := make(chan struct{})
+	var (
+		canceledErr = new(cancelError)
+
+		readReqs = make(chan closeWhenCanceledRequest)
+		doneCh   = make(chan struct{})
+	)
 
 	go func() {
 		// Stop when the context is Done or a Read operation fails.
 		select {
 		case <-ctx.Done():
-			canceledErr = ctx.Err()
+			canceledErr.SetErr(ctx.Err())
 			r.Close() // This will cause the Read in the other goroutine to stop.
 		case <-doneCh:
 		}
@@ -397,13 +425,14 @@ func closeWhenCanceled(ctx context.Context, r io.ReadCloser) io.Reader {
 		// method.
 		for readReq := range readReqs {
 			i, err := r.Read(readReq.b)
-			if canceledErr != nil {
-				err = canceledErr
+			if e := canceledErr.Err(); e != nil {
+				err = e
 			}
 			readReq.response <- struct {
 				i   int
 				err error
 			}{i, err}
+
 			if err != nil {
 				close(doneCh)
 				return
