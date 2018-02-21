@@ -16,6 +16,7 @@ import (
 
 	"github.com/ably-forks/flynn/pkg/random"
 	"golang.org/x/crypto/nacl/secretbox"
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type backendDialer interface {
