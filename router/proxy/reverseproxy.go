@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/inconshreveable/log15.v2"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -186,7 +186,7 @@ func (p *ReverseProxy) ServeConn(ctx context.Context, dconn net.Conn) {
 	}
 	defer uconn.Close()
 
-	joinConns(uconn, dconn)
+	joinConns(l, uconn, dconn)
 }
 
 func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req *http.Request) {
@@ -251,7 +251,7 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 		return
 	}
 
-	joinConns(uconn, &streamConn{bufrw.Reader, dconn})
+	joinConns(l, uconn, &streamConn{bufrw.Reader, dconn})
 }
 
 func prepareResponseHeaders(res *http.Response) {
@@ -310,7 +310,9 @@ func (p *ReverseProxy) copyResponse(dst io.Writer, src io.Reader) {
 		}
 	}
 
-	io.Copy(dst, src)
+	if _, err := io.Copy(dst, src); err != nil {
+		p.Logger.Error("error copying from dst to src", "err", err.Error())
+	}
 }
 
 func copyHeader(dst, src http.Header) {
@@ -325,25 +327,33 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-func closeWrite(conn net.Conn) {
+func closeWrite(l log15.Logger, conn net.Conn) {
 	if cw, ok := conn.(closeWriter); ok {
-		cw.CloseWrite()
+		if err := cw.CloseWrite(); err != nil {
+			l.Error("error closing write", "err", err.Error())
+		}
 	} else {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			l.Error("error closing", "err", err.Error())
+		}
 	}
 }
 
-func joinConns(uconn, dconn net.Conn) {
+func joinConns(l log15.Logger, uconn, dconn net.Conn) {
 	done := make(chan struct{})
 
 	go func() {
-		io.Copy(uconn, dconn)
-		closeWrite(uconn)
+		if _, err := io.Copy(uconn, dconn); err != nil {
+			l.Error("error writing to upstream from downstream", "err", err.Error())
+		}
+		closeWrite(l, uconn)
 		done <- struct{}{}
 	}()
 
-	io.Copy(dconn, uconn)
-	closeWrite(dconn)
+	if _, err := io.Copy(dconn, uconn); err != nil {
+		l.Error("error writing to downstream from upstream", "err", err.Error())
+	}
+	closeWrite(l, dconn)
 	<-done
 }
 
