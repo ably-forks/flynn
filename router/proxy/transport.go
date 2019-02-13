@@ -39,7 +39,7 @@ var (
 	}
 
 	dialer backendDialer = &net.Dialer{
-		Timeout:   1 * time.Second,
+		Timeout:   2 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 )
